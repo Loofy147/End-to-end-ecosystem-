@@ -1,0 +1,1060 @@
+from typing import Callable, Dict, Any, List, Optional, Tuple # Import Callable
+import numpy as np # Import numpy as np inside the class definition
+import random # Import the random module
+import json # Import the json module
+import copy # Import copy for deepcopy
+
+
+# Re-define MetaCognitiveGA class with added logging/print statements for data collection
+class MetaCognitiveGA:
+    def __init__(
+        self,
+        objective_fn: Callable[[np.ndarray], List[float]],
+        config: MetaGAConfig,
+        initial_meta_w: Optional[np.ndarray] = None,
+        initial_attention: Optional[np.ndarray] = None,
+        initial_modules: Optional[List[Tuple[int,int]]] = None,
+        initial_crossover_name: str = "one_point_crossover",
+        initial_mutate_name: str = "gaussian_mutation"
+    ):
+        self.obj_fn = objective_fn
+        self.cfg = config
+        if self.cfg.random_seed is not None:
+            random.seed(self.cfg.random_seed)
+            np.random.seed(self.cfg.random_seed)
+
+        # Dimensions
+        self.chrom_len = self.cfg.chromosome_length
+
+        # Meta-cognitive state (managed internally)
+        self.meta_w = normalize(initial_meta_w) if initial_meta_w is not None else normalize(np.ones(len(self.obj_fn(np.zeros(self.chrom_len)))))
+        self.attention = initial_attention.copy() if initial_attention is not None else np.ones(self.chrom_len, dtype=float)
+        self.modules = initial_modules if initial_modules is not None else self._build_modules(self.chrom_len, self.cfg.module_count)
+
+        # Active operators (managed internally)
+        self._set_operators(initial_crossover_name, initial_mutate_name)
+
+        # Memo cache
+        self.memo = SmartMemo(self.cfg.memo_size) if self.cfg.use_memo else None
+
+        # Surrogate model and its state
+        self.surrogate = RandomForestRegressor(n_estimators=120, random_state=self.cfg.random_seed) if (_SURROGATE_OK and self.cfg.enable_surrogate) else None
+        self.surrogate_ready = False # Flag to indicate if the surrogate has been trained at least once
+        self.X_fit, self.y_fit = [], []   # training buffer for surrogate
+
+        # Book-keeping
+        self.eval_count = 0
+        self.best_track: List[float] = []
+        self.meta_history: List[Dict[str, Any]] = [] # To log meta-state changes
+
+        # Autonomous loop state (moved here)
+        self.baseline_config_dict: Dict[str, Any] = self._config_to_dict(config) # Store initial config as baseline
+        self.baseline_summary: Optional[Dict[str, Any]] = None
+        self.current_iteration = 0
+        self.experiment_history: List[Dict[str, Any]] = []
+        self.recent_scores = deque(maxlen=12) # For acceptance policy
+
+        # Autonomous loop constants (moved here)
+        self.max_iterations = 200
+        self.max_daily_experiments = 200
+        self.global_cpu_seconds_budget = 60 * 60 * 6
+        self.per_trial_cpu_seconds = 60 * 10 # For tracking/logging, not enforcement
+        self.per_trial_mem_bytes = 2 * 1024**3 # For tracking/logging, not enforcement
+        self.survival_criteria = {
+            "min_improvement_pct": 0.005,
+            "max_unacceptable_worse_pct": 0.02
+        }
+        # Assuming ALLOWED_OPERATOR_TEMPLATES is defined elsewhere
+
+    # -------------- modules --------------
+    def _build_modules(self, L: int, m_count: Optional[int]) -> List[Tuple[int,int]]:
+        if not m_count or m_count <= 1:
+            return [(0, L)]
+        base = L // m_count
+        modules = []
+        s = 0
+        for i in range(m_count-1):
+            modules.append((s, s+base)); s += base
+        modules.append((s, L))
+        return modules
+
+    # -------------- operator management --------------
+    def _set_operators(self, crossover_name: str, mutate_name: str):
+        """Sets the active crossover and mutation functions from the registry."""
+        if crossover_name in OPERATOR_REGISTRY:
+            # Handle module_crossover which needs the modules list
+            if crossover_name == "module_crossover":
+                self.crossover_fn = lambda a, b: OPERATOR_REGISTRY["module_crossover"](a, b, self.modules)
+            else:
+                self.crossover_fn = OPERATOR_REGISTRY[crossover_name]
+        else:
+            logging.warning(f"Crossover operator '{crossover_name}' not found in registry. Using default.")
+            self.crossover_fn = one_point_crossover # Default
+
+        if mutate_name in OPERATOR_REGISTRY:
+             # Handle mutation functions which need rate and attention
+             if mutate_name in ["gaussian_mutation", "swap_mutation"]:
+                 # Wrap mutation function to pass rate and attention from class state
+                 self.mutate_fn = lambda x: OPERATOR_REGISTRY[mutate_name](x, self.cfg.base_mutation, self.attention)
+             else:
+                 self.mutate_fn = OPERATOR_REGISTRY[mutate_name] # For mutations that don't need attention/rate explicitly passed here
+        else:
+            logging.warning(f"Mutation operator '{mutate_name}' not found in registry. Using default.")
+            self.mutate_fn = lambda x: gaussian_mutation(x, self.cfg.base_mutation, self.attention) # Default wrapped mutation
+
+    # -------------- population --------------
+    def _init_pop(self) -> List[np.ndarray]:
+        return [np.random.uniform(-5, 5, self.chrom_len) for _ in range(self.cfg.population_size)]
+
+    # -------------- evaluation --------------
+    def _eval_raw_objectives(self, x: np.ndarray) -> List[float]:
+        # memo key
+        key = None
+        if self.memo is not None:
+            key = tuple(np.round(x, 6))
+            cached = self.memo.get(key)
+            if cached is not None:
+                # Memo stores raw objectives as a list/tuple
+                return cached
+        vals = self.obj_fn(x)  # list of values (higher is better)
+        if self.memo is not None:
+            # store raw objs
+            self.memo.set(key, vals)
+        self.eval_count += 1
+        return vals
+
+    def _aggregate(self, raw_objs: List[float], w: Optional[np.ndarray] = None) -> float:
+        w = self.meta_w if w is None else w
+        # Ensure weights and objectives are numpy arrays for dot product
+        return float(np.dot(np.array(w), np.array(raw_objs, dtype=float)))
+
+    def _eval(self, x: np.ndarray, w: Optional[np.ndarray] = None) -> float:
+        objs = self._eval_raw_objectives(x)
+        return self._aggregate(objs, w)
+
+    def _maybe_use_surrogate(self, pop: List[np.ndarray], indices: List[int]) -> Dict[int, float]:
+        """Evaluate a subset of individuals using the surrogate model."""
+        # Check if surrogate is ready AND has been fitted (has estimators_)
+        if not (self.surrogate and self.surrogate_ready and hasattr(self.surrogate, 'estimators_')):
+            return {} # Surrogate not ready or disabled
+
+        X_predict = [pop[i] for i in indices]
+        try:
+            preds = self.surrogate.predict(np.array(X_predict, dtype=float))
+            return {indices[i]: float(preds[i]) for i in range(len(indices))}
+        except Exception as e:
+            logging.warning(f"Surrogate prediction failed: {e}")
+            return {} # Return empty if prediction fails
+
+    def _maybe_train_surrogate(self):
+        # Check conditions separately to avoid implicit __len__ call
+        if not self.cfg.enable_surrogate:
+            return
+        if not _SURROGATE_OK:
+            return
+        if self.surrogate is None:
+            return
+
+        # Train if we have enough new data since last train or if not yet trained
+        # Simple heuristic: train if accumulated more than 200 new data points or if X_fit is large enough for first train
+        # Added logging for training data size
+        logging.info(f"Attempting surrogate training. X_fit size: {len(self.X_fit)}, surrogate_ready: {self.surrogate_ready}")
+        min_samples_for_train = (self.surrogate.n_features_in_ + 1) * 10 if hasattr(self.surrogate, 'n_features_in_') else 200
+
+        if (len(self.X_fit) >= min_samples_for_train and not self.surrogate_ready) or \
+           (self.surrogate_ready and (len(self.X_fit) - (getattr(self.surrogate, 'n_samples_fit_', 0) if hasattr(self.surrogate, 'n_samples_fit_') else 0)) > 200):
+
+             X = np.array(self.X_fit, dtype=float)
+             y = np.array(self.y_fit, dtype=float)
+             try:
+                 self.surrogate.fit(X, y)
+                 if hasattr(self.surrogate, 'estimators_'):
+                     self.surrogate_ready = True
+                     logging.info("Surrogate trained successfully.")
+                 else:
+                     self.surrogate_ready = False
+                     logging.warning("Surrogate trained but 'estimators_' attribute missing.")
+             except Exception as e:
+                 logging.warning(f"Surrogate training failed: {e}")
+                 self.surrogate_ready = False
+
+    # -------------- GA operators (internal methods) --------------
+    def _tournament(self, pop: List[np.ndarray], fits: List[float], k: int = 3) -> np.ndarray:
+        """Selects a parent using tournament selection."""
+        # Can potentially use attention to bias selection here if desired
+        idxs = [random.randrange(len(pop)) for _ in range(k)]
+        best = max(idxs, key=lambda i: fits[i])
+        return pop[best]
+
+    def _crossover(self, p1: np.ndarray, p2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Performs crossover using the active crossover function."""
+        # The crossover_fn is already wrapped in _set_operators if needed (e.g., module_crossover)
+        return self.crossover_fn(p1, p2)
+
+    def _mutate(self, chrom: np.ndarray) -> np.ndarray:
+        """Performs mutation using the active mutation function."""
+        # The mutate_fn is already wrapped in _set_operators to include base_mutation and attention
+        return self.mutate_fn(chrom)
+
+    def _shrink(self, pop: List[np.ndarray]) -> List[np.ndarray]:
+        """ Applies shrinkage (weight decay) to the population. """
+        r = self.cfg.shrinkage_rate
+        if r <= 0:
+            return pop
+        return [p * (1.0 - r) for p in pop]
+
+
+    # -------------- Meta-cognitive adaptation (internal methods) --------------
+    def _update_attention(self, population: List[np.ndarray], fitnesses: List[float], top_k: int = 5):
+        """Updates the attention vector based on gene variance in top individuals."""
+        top_idxs = np.argsort(fitnesses)[-top_k:]
+        top_pop = [population[i] for i in top_idxs]
+        if not top_pop: return # Avoid error if top_k is larger than population
+
+        # compute position-wise variance: low variance -> high attention
+        arr = np.vstack(top_pop)
+        var = np.var(arr, axis=0)
+        inv_var = 1.0 / (var + 1e-6)
+        new_attention = inv_var / np.mean(inv_var)  # normalize around 1
+
+        # smooth update: exponential moving average
+        alpha = self.cfg.attention_ema
+        self.attention = (1 - alpha) * self.attention + alpha * new_attention
+
+    def _adapt_meta_weights(self, population: List[np.ndarray], fitnesses: List[float], raw_objectives: List[List[float]]):
+        """Adapts meta-weights based on elite performance across objectives."""
+        # Hill-climb on meta_weights: try small perturbation and keep if improvement of best fitness
+        # We need raw objectives for this, which should be available from the evaluation step
+        if not raw_objectives or not fitnesses:
+            return # Cannot adapt without raw objectives or fitnesses
+
+        current_best_agg = max(fitnesses) # Best fitness under current weights
+
+        # Propose a new weight vector (Dirichlet perturbation)
+        eps = 0.03 # Jitter magnitude
+        alpha_scale = 60.0 # Concentration around current weights
+        proposal_w = self.meta_w + np.random.normal(0, eps, size=self.meta_w.shape)
+        proposal_w = np.maximum(proposal_w, 1e-6) # Ensure positive
+        proposal_w = normalize(proposal_w)
+
+        # Evaluate top individuals under proposed weights using precomputed raw objectives
+        elite_k = max(2, int(self.cfg.elitism_rate * self.cfg.population_size))
+        elite_idxs = np.argsort(fitnesses)[-elite_k:]
+        elite_raw_objs = [raw_objectives[i] for i in elite_idxs if i < len(raw_objectives) and raw_objectives[i] is not None] # Filter out None raw objectives
+
+        if not elite_raw_objs: return # Cannot adapt if no valid raw objectives for elites
+
+        scores_prop = [np.dot(proposal_w, np.array(o)) for o in elite_raw_objs]
+
+        if scores_prop and max(scores_prop) > current_best_agg + 1e-8: # Check if the best elite score improves
+            # accept proposal
+            self.meta_w = proposal_w
+            # logging.info("[Meta] Accepted meta-weight proposal. New weights:", np.round(self.meta_w, 4)) # Log via meta_history
+            # Optionally update saved weights for rollback if needed (though rollback is currently on config/state)
+            # self.saved_weights = self.meta_w.copy()
+
+    def _stagnation_and_rollback(self) -> bool:
+        """Detects stagnation and potentially triggers perturbation of meta-state."""
+        # Stagnation detection based on best fitness history
+        w = self.cfg.stagnation_window
+        if len(self.best_track) < w + 1:
+            return False
+
+        # Calculate improvement over the stagnation window
+        recent_best = self.best_track[-w:]
+        # Ensure recent_best has valid numerical data
+        numeric_recent_best = [f for f in recent_best if isinstance(f, (int, float)) and not math.isnan(f)]
+        if len(numeric_recent_best) < 2: return False # Need at least two valid points to check for improvement
+
+        improvement = max(numeric_recent_best) - min(numeric_recent_best)
+
+        if abs(improvement) < self.cfg.stagnation_threshold:
+            # stagnation detected -> perturb attention and slightly perturb meta-weights
+            logging.info("[Meta] Stagnation detected. Perturbing meta-state.")
+
+            # Perturb attention slightly
+            att_noise = np.random.normal(0, 0.05, size=self.attention.shape)
+            self.attention = np.maximum(self.attention + att_noise, 1e-6)
+            self.attention = self.attention / np.mean(self.attention) # Re-normalize around 1
+
+            # Perturb meta weights slightly
+            w_noise = np.random.normal(0, 0.05, size=self.meta_w.shape)
+            self.meta_w = np.maximum(self.meta_w + w_noise, 1e-6)
+            self.meta_w = normalize(self.meta_w)
+
+            # Optionally perturb operator selection probability or switch operators
+            # This requires a more sophisticated operator management system
+
+            return True # Stagnation detected and state perturbed
+        return False # No stagnation detected
+
+
+    def evaluate_population(self, pop: List[np.ndarray], meta_w: Optional[np.ndarray] = None) -> Tuple[List[float], List[List[float]]]:
+         """Evaluates the entire population using true objectives."""
+         fits = []
+         raws = []
+         # Ensure meta_w is set
+         w = self.meta_w if meta_w is None else w
+         for x in pop:
+             raw = self._eval_raw_objectives(x) # Use the internal method with memoization
+             raws.append(raw)
+             fit = self._aggregate(raw, w)
+             fits.append(fit)
+         return fits, raws
+
+    # -------------- GA Run Loop (core optimization) --------------
+    def run(self, experiment_name: str = "meta_ga_run") -> Dict[str, Any]:
+        """
+        Runs the genetic algorithm with internal meta-cognitive adaptation.
+        This is the core GA engine for a single trial.
+        """
+        pop = self._init_pop()
+        pop = self._shrink(pop) # Apply initial shrinkage
+
+        # Full true evaluation for the first generation
+        raw_objs_pop = [self._eval_raw_objectives(x) for x in pop]
+        fits = [self._aggregate(o) for o in raw_objs_pop]
+
+        # Seed surrogate buffer if enabled and surrogate is available
+        # Data collection for surrogate training happens here if surrogate is enabled
+        if self.cfg.enable_surrogate and _SURROGATE_OK and self.surrogate is not None:
+             self.X_fit.extend([x.copy() for x in pop])
+             self.y_fit.extend([float(f) for f in fits])
+             # Attempt initial surrogate training if enough data
+             self._maybe_train_surrogate()
+
+
+        # Logging
+        log_dir = self.cfg.out_dir
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"{experiment_name}.csv")
+        csv_f = open(log_path, "w", newline="")
+        csv_writer = csv.writer(csv_f); csv_writer.writerow(["gen","best","avg","att_mean","weights","evals","meta_state_change"]) # Added meta_state_change column
+        start_time = now_ts()
+
+        best_fit = max(fits) if fits else None # Handle empty fits
+        avg_fit = float(np.mean(fits)) if fits else None # Handle empty fits
+        self.best_track = [best_fit] # Reset best_track for this run
+
+        # Initial meta-state log
+        if best_fit is not None: # Only log if initial evaluation was successful
+            csv_writer.writerow([0, round(best_fit,6), round(avg_fit,6),
+                                round(float(self.attention.mean()),6),
+                                json.dumps(list(map(float, np.round(self.meta_w, 6)))),
+                                self.eval_count, "initial"])
+            csv_f.flush()
+
+        # Added logging for data collection after initial eval
+        if self.cfg.enable_surrogate and _SURROGATE_OK and self.surrogate is not None:
+            logging.info(f"Initial population evaluated. Collected {len(self.X_fit)} data points for surrogate.")
+            if self.X_fit:
+                # Log range/std dev of X_fit and y_fit to check diversity
+                X_fit_np = np.array(self.X_fit)
+                logging.info(f"X_fit shape: {X_fit_np.shape}, Min: {np.min(X_fit_np):.4f}, Max: {np.max(X_fit_np):.4f}, Std Dev: {np.std(X_fit_np):.4f}")
+                y_fit_np = np.array(self.y_fit)
+                logging.info(f"y_fit shape: {y_fit_np.shape}, Min: {np.min(y_fit_np):.4f}, y Max: {np.max(y_fit_np):.4f}, y Std Dev: {np.std(y_fit_np):.4f}")
+
+
+        for gen in range(1, self.cfg.generations + 1):
+            meta_state_change_reason = "" # Log reason for meta state changes
+
+            # Selection + Variation
+            new_pop = []
+            # Fix: Use self.cfg.population_size
+            elite_n = max(1, int(self.cfg.elitism_rate * self.cfg.population_size))
+            # Ensure fits is not empty before selection
+            if not fits:
+                logging.warning(f"Gen {gen}: Fits list is empty, cannot perform selection/variation. Aborting run.")
+                break # Exit the generation loop
+            elite_idx = np.argsort(fits)[-elite_n:]
+            elites = [pop[i].copy() for i in elite_idx]
+
+            # Fix: Use self.cfg.population_size
+            while len(new_pop) < self.cfg.population_size - elite_n:
+                p1 = self._tournament(pop, fits)
+                p2 = self._tournament(pop, fits)
+                # Use internal crossover method
+                if random.random() < self.cfg.crossover_rate:
+                    c1, c2 = self._crossover(p1, p2)
+                else:
+                    c1, c2 = p1.copy(), p2.copy() # No crossover, just copy parents
+                # Use internal mutate method
+                c1 = self._mutate(c1)
+                # Fix: Use self.cfg.population_size
+                if len(new_pop) < self.cfg.population_size - elite_n - 1:
+                    c2 = self._mutate(c2)
+                    new_pop.extend([c1, c2])
+                else:
+                    new_pop.append(c1)
+
+            # Check if new_pop is empty before proceeding
+            # Fix: Use self.cfg.population_size
+            if not new_pop and len(elites) < self.cfg.population_size:
+                 logging.warning(f"Gen {gen}: Failed to generate new population. Aborting run.")
+                 break # Exit the generation loop
+
+
+            # Assemble new generation
+            pop = elites + new_pop
+            # Fix: Use self.cfg.population_size
+            pop = pop[:self.cfg.population_size] # Ensure population size is not exceeded
+            pop = self._shrink(pop) # Apply shrinkage
+
+            # Evaluate population with surrogate mix
+            fits = [None] * len(pop)
+            raw_objs_pop = [None] * len(pop) # Store raw objectives for adaptation
+
+            # Decide which to eval true vs surrogate
+            idx = list(range(len(pop)))
+            # Use surrogate if enabled, available, ready, and warmup is complete
+            use_surrogate_for_gen = self.surrogate_ready and (self.eval_count >= self.cfg.surrogate_warmup_evals)
+
+            if use_surrogate_for_gen:
+                true_quota = int((1.0 - self.cfg.surrogate_ratio) * len(pop))
+                # Greedy: always evaluate elites + some random true, rest surrogate
+                must_true = elite_n
+                rest_true = max(0, true_quota - must_true)
+                # Ensure elite_idx contains valid indices within the current population size
+                valid_elite_idx = [i for i in elite_idx if i < len(pop)]
+                true_idx_set = set(valid_elite_idx)
+                remain = [i for i in idx if i not in true_idx_set]
+                if remain: # Ensure there are remaining indices to sample from
+                     # Sample from remain indices, ensuring not to sample more than available
+                     true_idx_set.update(random.sample(remain, k=min(rest_true, len(remain))))
+                true_idx = sorted(list(true_idx_set))
+                surr_idx = [i for i in idx if i not in true_idx]
+            else:
+                true_idx = idx
+                surr_idx = []
+
+            # True evaluations
+            for i in true_idx:
+                raw = self._eval_raw_objectives(pop[i])
+                raw_objs_pop[i] = raw # Store raw objectives
+                fits[i] = self._aggregate(raw)
+                # Add data to surrogate training buffer if surrogate is enabled
+                if self.cfg.enable_surrogate and _SURROGATE_OK and self.surrogate is not None:
+                    self.X_fit.append(pop[i].copy()); self.y_fit.append(float(fits[i]))
+
+            # Surrogate predictions
+            if use_surrogate_for_gen and surr_idx:
+                preds_dict = self._maybe_use_surrogate(pop, surr_idx)
+                for i in surr_idx:
+                    if i in preds_dict:
+                        fits[i] = preds_dict[i]
+                        # Note: Raw objectives are not available for surrogate predictions.
+                        # This means meta-weight adaptation based on raw objectives
+                        # will only use data from true evaluations.
+                    else:
+                        # Fallback to true eval if surrogate prediction failed
+                        raw = self._eval_raw_objectives(pop[i])
+                        raw_objs_pop[i] = raw
+                        fits[i] = self._aggregate(raw)
+                        # Add data to surrogate training buffer if fallback to true eval
+                        if self.cfg.enable_surrogate and _SURROGATE_OK and self.surrogate is not None:
+                            self.X_fit.append(pop[i].copy()); self.y_fit.append(float(fits[i]))
+
+            # Train surrogate after evaluations if enabled
+            if self.cfg.enable_surrogate and _SURROGATE_OK and self.surrogate is not None:
+                self._maybe_train_surrogate()
+
+            # Meta-cognitive adaptation (internal)
+            # Only update attention and weights if we had successful evaluations in this generation
+            valid_fits = [f for f in fits if f is not None]
+            valid_raw_objs = [raw_objs_pop[i] for i, f in enumerate(fits) if f is not None and raw_objs_pop[i] is not None]
+
+            if valid_fits:
+                 # Fix: Use self.cfg.population_size for top_k calculation
+                 self._update_attention(pop, valid_fits, top_k=max(2, int(self.cfg.elitism_rate * self.cfg.population_size)))
+                 self._adapt_meta_weights(pop, valid_fits, valid_raw_objs)
+                 if self._stagnation_and_rollback():
+                      meta_state_change_reason = "stagnation_perturbed"
+                 else:
+                      meta_state_change_reason = "adapted" # Indicate weights/attention were adapted
+
+            # Book-keeping and Logging
+            current_best_fit = max(valid_fits) if valid_fits else (self.best_track[-1] if self.best_track else None) # Handle case where all evals failed
+            current_avg_fit = float(np.mean(valid_fits)) if valid_fits else (self.best_track[-1] if self.best_track else None)
+
+            if current_best_fit is not None:
+                 self.best_track.append(current_best_fit)
+                 # Log meta state changes only when best fitness is successfully recorded
+                 self.meta_history.append({
+                     "gen": gen,
+                     "meta_w": self.meta_w.tolist(),
+                     "attention_mean": float(self.attention.mean()),
+                     "change_reason": meta_state_change_reason
+                 })
+
+
+            elapsed = now_ts() - start_time
+            if gen % self.cfg.log_every == 0 or gen == 1 or gen == self.cfg.generations:
+                print(f"[{experiment_name}] Gen {gen}/{self.cfg.generations} | best={current_best_fit:.6f} avg={current_avg_fit:.6f} att={self.attention.mean():.3f} evals={self.eval_count} w={np.round(self.meta_w,3)} time={elapsed:.1f}s")
+                csv_writer.writerow([gen, round(current_best_fit,6), round(current_avg_fit,6),
+                            round(float(self.attention.mean()),6),
+                            json.dumps(list(map(float, np.round(self.meta_w, 6)))),
+                            self.eval_count, meta_state_change_reason])
+                csv_f.flush()
+
+            # Added logging for data collection after each generation
+            if self.cfg.enable_surrogate and _SURROGATE_OK and self.surrogate is not None:
+                logging.info(f"Gen {gen}: Collected {len(self.X_fit)} total data points for surrogate.")
+                if len(self.X_fit) > 0:
+                    X_fit_np = np.array(self.X_fit)
+                    y_fit_np = np.array(self.y_fit)
+                    logging.info(f"Gen {gen} Data Stats: X_fit shape: {X_fit_np.shape}, X Min: {np.min(X_fit_np):.4f}, X Max: {np.max(X_fit_np):.4f}, X Std Dev: {np.std(X_fit_np):.4f}")
+                    logging.info(f"Gen {gen} Data Stats: y_fit shape: {y_fit_np.shape}, y Min: {np.min(y_fit_np):.4f}, y Max: {np.max(y_fit_np):.4f}, y Std Dev: {np.std(y_fit_np):.4f}")
+
+
+
+        csv_f.close()
+
+        # Final evaluation to get the best genome and raw objectives from the final population
+        # Always use true evaluations for the final summary metrics
+        final_pop_evals = []
+        final_pop_raws = []
+        for p in pop:
+             raw = self._eval_raw_objectives(p)
+             final_pop_raws.append(raw)
+             final_pop_evals.append(self._aggregate(raw, self.meta_w))
+
+        best_idx = np.argmax(final_pop_evals) if final_pop_evals else None
+        final_best_genome = pop[best_idx].copy() if best_idx is not None else None
+        final_best_raw = final_pop_raws[best_idx] if best_idx is not None else None
+
+        return {
+            "best": max(self.best_track) if self.best_track else None, # Return the overall best recorded (can be from surrogate)
+            "avg": float(np.mean(final_pop_evals)) if final_pop_evals else None,   # Return the average from the final population (true eval)
+            "final_best_genome": final_best_genome,
+            "final_best_raw": final_best_raw,
+            "final_weights": self.meta_w.copy(),
+            "final_attention": self.attention.copy(), # Return the final attention vector
+            "total_evals": self.eval_count,
+            "log_csv": log_path,
+            "best_fitness_history": self.best_track, # History may include surrogate scores
+            "meta_state_history": self.meta_history,
+            "success": True # Indicate the run completed without critical errors
+        }
+
+    # -------------- Autonomous Optimization Loop (Orchestration) --------------
+
+    def _config_to_dict(self, config_obj: MetaGAConfig) -> Dict[str, Any]:
+        """Converts MetaGAConfig object to a dictionary."""
+        cfg_dict = {
+            "chromosome_length": config_obj.chromosome_length,
+            "ga": {
+                "population_size": config_obj.population_size,
+                "generations": config_obj.generations,
+                "crossover_rate": config_obj.crossover_rate,
+                "base_mutation": config_obj.base_mutation,
+                "elitism_rate": config_obj.elitism_rate
+            },
+            "advanced": {
+                "stagnation_window": config_obj.stagnation_window,
+                "stagnation_threshold": config_obj.stagnation_threshold,
+                "attention_ema": config_obj.attention_ema,
+                "shrinkage_rate": config_obj.shrinkage_rate,
+                "module_count": config_obj.module_count,
+                "use_memo": config_obj.use_memo,
+                "enable_surrogate": config_obj.enable_surrogate,
+                "surrogate_warmup_evals": config_obj.surrogate_warmup_evals,
+                "surrogate_ratio": config_obj.surrogate_ratio,
+                "random_seed": config_obj.random_seed
+            },
+            "log_every": config_obj.log_every,
+            "out_dir": config_obj.out_dir,
+            "memo_size": config_obj.memo_size # Include memo_size
+        }
+        return cfg_dict
+
+    def _dict_to_config(self, cfg_dict: Dict[str, Any]) -> MetaGAConfig:
+        """Converts a dictionary back to a MetaGAConfig object."""
+        cfg = MetaGAConfig(
+            chromosome_length=cfg_dict["chromosome_length"],
+            population_size=cfg_dict["ga"]["population_size"],
+            generations=cfg_dict["ga"]["generations"],
+            crossover_rate=cfg_dict["ga"]["crossover_rate"],
+            base_mutation=cfg_dict["ga"]["base_mutation"],
+            elitism_rate=cfg_dict["ga"]["elitism_rate"], # Corrected path
+            stagnation_window=cfg_dict["advanced"]["stagnation_window"],
+            stagnation_threshold=cfg_dict["advanced"]["stagnation_threshold"],
+            attention_ema=cfg_dict["advanced"]["attention_ema"],
+            shrinkage_rate=cfg_dict["advanced"].get("shrinkage_rate", 0.0),
+            module_count=cfg_dict["advanced"].get("module_count", None),
+            use_memo=cfg_dict["advanced"].get("use_memo", False),
+            enable_surrogate=cfg_dict["advanced"].get("enable_surrogate", False),
+            surrogate_warmup_evals=cfg_dict["advanced"].get("surrogate_warmup_evals", 0),
+            surrogate_ratio=cfg_dict["advanced"].get("surrogate_ratio", 0.0),
+            random_seed=cfg_dict["advanced"].get("random_seed", None),
+            log_every=cfg_dict.get("log_every", 10),
+            out_dir=cfg_dict.get("out_dir", "./meta_results"),
+            memo_size=cfg_dict.get("memo_size", 1000) # Include memo_size
+        )
+        return cfg
+
+    def propose_modification_internal(self, base_cfg: Dict[str, Any], rng: random.Random) -> Dict[str, Any]:
+        """Propose a modification (config or initial meta-state) in-memory."""
+        # This method replaces propose_config_modification_internal and propose_operator_tweak_internal
+        # It can propose changes to config hyperparameters OR the initial meta-state (weights, attention, operators)
+        # For simplicity, let's combine hyperparameter and meta-state initial value proposals here.
+        # Dynamic adaptation *during* a run is handled in the `run` method.
+
+        proposal_type = rng.choice(["hyper", "initial_weights", "initial_attention", "initial_modules", "initial_operators"])
+        cfg = json.loads(json.dumps(base_cfg)) # Deep copy of base config
+
+        change = None
+        desc = f"Propose {proposal_type}"
+
+        if proposal_type == "hyper":
+            hp_specs = {
+                ("ga","population_size") : (10, 1000, int),
+                ("ga","generations") : (10, 2000, int),
+                ("ga","crossover_rate") : (0.1, 1.0, float), # Added crossover_rate
+                ("ga","base_mutation") : (1e-5, 0.5, float),
+                ("ga","elitism_rate") : (0.0, 0.2, float), # Added elitism_rate
+                ("advanced","stagnation_window") : (5, 30, int),
+                ("advanced","stagnation_threshold") : (1e-7, 1e-4, float),
+                ("advanced","attention_ema") : (0.1, 0.8, float),
+                ("advanced","shrinkage_rate") : (0.0, 0.01, float),
+                ("advanced","module_count") : (1, 10, int),
+                ("advanced","surrogate_warmup_evals") : (100, 2000, int), # Added surrogate hps
+                ("advanced","surrogate_ratio") : (0.1, 0.9, float),
+                ("log_every") : (1, 100, int), # Added log_every
+                ("memo_size") : (100, 10000, int) # Added memo_size
+            }
+            keys = list(hp_specs.keys())
+            n_changes = rng.choice([1,1,2])
+            changed_hps = {}
+            for _ in range(n_changes):
+                k = rng.choice(keys)
+                lo, hi, typ = hp_specs[k]
+                parent = cfg
+                try:
+                    # Navigate through nested dictionaries
+                    if len(k) > 1:
+                        for p in k[:-1]:
+                            parent = parent[p]
+                        cur = parent.get(k[-1])
+                    else: # Top level key
+                        cur = parent.get(k[0])
+                        k = k[0] # Use the key directly for assignment
+
+
+                    if cur is None: # If key doesn't exist, initialize
+                        cur = (lo + hi) / 2 if typ is float else (lo + hi) // 2
+
+                except KeyError:
+                     continue # Skip if path doesn't exist
+
+                # propose multiplicative or additive mutation
+                if typ is int:
+                    factor = rng.uniform(0.6, 1.6)
+                    newv = int(max(lo, min(hi, int(cur * factor))))
+                else:
+                    factor = rng.uniform(0.5, 1.5)
+                    newv = max(lo, min(hi, float(cur) * factor))
+
+                if isinstance(k, tuple): # Nested key
+                     parent[k[-1]] = newv
+                     changed_hps[k[-1]] = newv # Track changed hps
+                else: # Top level key
+                     parent[k] = newv
+                     changed_hps[k] = newv # Track changed hps
+
+
+            # small random toggles
+            if "advanced" in cfg:
+                 if rng.random() < 0.2:
+                      cfg["advanced"]["use_memo"] = rng.choice([True, False])
+                      changed_hps["use_memo"] = cfg["advanced"]["use_memo"]
+                 if rng.random() < 0.2:
+                      cfg["advanced"]["enable_surrogate"] = rng.choice([True, False] if _SURROGATE_OK else [False]) # Only enable if available
+                      changed_hps["enable_surrogate"] = cfg["advanced"]["enable_surrogate"]
+
+
+            change = {"config_dict": cfg}
+            desc = f"Propose hyperparam changes: {changed_hps}"
+
+        elif proposal_type == "initial_weights":
+            change = {"initial_meta_w": normalize(np.random.rand(len(self.meta_w))).tolist()}
+            desc = f"Propose initial weights: {np.round(change['initial_meta_w'], 4).tolist()}"
+
+        elif proposal_type == "initial_attention":
+             # Propose a perturbed or different initial attention
+             if rng.random() < 0.5: # Perturb current attention
+                 att_noise = np.random.normal(0, 0.2, size=self.attention.shape)
+                 new_att = np.maximum(self.attention + att_noise, 1e-6)
+                 new_att = new_att / np.mean(new_att)
+                 change = {"initial_attention": new_att.tolist()}
+                 desc = f"Propose perturbed initial attention (mean: {np.mean(new_att):.3f})"
+             else: # Propose uniform attention
+                 change = {"initial_attention": np.ones(self.chrom_len).tolist()}
+                 desc = f"Propose uniform initial attention"
+
+        elif proposal_type == "initial_modules":
+             # Propose a different number of modules
+             new_module_count = rng.choice([2, 3, 4, 5, 6, 8])
+             change = {"initial_modules": self._build_modules(self.chrom_len, new_module_count)}
+             desc = f"Propose initial modules count: {new_module_count}"
+
+        elif proposal_type == "initial_operators":
+            c_name = rng.choice(list(OPERATOR_REGISTRY.keys())) # Choose from all registered
+            m_name = rng.choice(list(OPERATOR_REGISTRY.keys()))
+            change = {"initial_crossover_name": c_name, "initial_mutate_name": m_name}
+            desc = f"Propose initial operators: crossover='{c_name}', mutate='{m_name}'"
+
+        return {"type": proposal_type, "change": change, "desc": desc, "created": now_ts()}
+
+
+    def run_experiment_internal(self, proposal: Dict[str, Any], base_config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Run a single GA experiment trial with the configuration and initial state
+        derived from the base config and the proposal.
+        """
+        # Start with the base config dictionary
+        config_dict_for_run = copy.deepcopy(base_config_dict)
+
+        # Apply hyperparameter changes from the proposal if type is 'hyper'
+        if proposal["type"] == "hyper" and proposal["change"] is not None and "config_dict" in proposal["change"]:
+            config_dict_for_run = proposal["change"]["config_dict"] # Use the proposed config dict
+
+        # Determine initial meta-state for the run based on the proposal or defaults/current state
+        initial_meta_w = self.meta_w.copy() # Default to current controller state
+        initial_attention = self.attention.copy() # Default to current controller state
+        initial_modules = copy.deepcopy(self.modules) # Default to current controller state
+        # Get current operator names from the wrapped functions if possible, otherwise use defaults
+        initial_crossover_name = getattr(self.crossover_fn, '__name__', 'unknown_crossover')
+        if initial_crossover_name == '<lambda>':
+             initial_crossover_name = 'module_crossover' # Assume lambda is module crossover for now
+        initial_mutate_name = getattr(self.mutate_fn, '__name__', 'unknown_mutation')
+        if initial_mutate_name == '<lambda>':
+             initial_mutate_name = 'gaussian_mutation' # Assume lambda is gaussian mutation for now
+
+
+        if proposal["type"] == "initial_weights" and proposal["change"] is not None and "initial_meta_w" in proposal["change"]:
+            initial_meta_w = np.array(proposal["change"]["initial_meta_w"])
+        elif proposal["type"] == "initial_attention" and proposal["change"] is not None and "initial_attention" in proposal["change"]:
+            initial_attention = np.array(proposal["change"]["initial_attention"])
+        elif proposal["type"] == "initial_modules" and proposal["change"] is not None and "initial_modules" in proposal["change"]:
+            initial_modules = proposal["change"]["initial_modules"]
+        elif proposal["type"] == "initial_operators" and proposal["change"] is not None:
+            if "initial_crossover_name" in proposal["change"]:
+                 initial_crossover_name = proposal["change"]["initial_crossover_name"]
+            if "initial_mutate_name" in proposal["change"]:
+                 initial_mutate_name = proposal["change"]["initial_mutate_name"]
+
+        # Convert the config dictionary to a MetaGAConfig object for the GA instance
+        try:
+            cfg_obj = self._dict_to_config(config_dict_for_run)
+        except KeyError as e:
+            logging.error(f"Failed to create MetaGAConfig from dict: Missing key {e}")
+            return {"success": False, "error": f"Config creation failed: {e}", "runtime_s": 0.0}
+
+
+        logging.info(f"Running experiment with config: {config_dict_for_run} and initial state derived from proposal type: {proposal['type']}")
+        start_time = time.time()
+        try:
+            # Create a new MetaCognitiveGA instance with the specific config and initial meta-state
+            # This instance will run a single GA trial with internal adaptation
+            ga_trial = MetaCognitiveGA(
+                objective_fn=self.obj_fn, # Use the same objective function
+                config=cfg_obj,
+                initial_meta_w=initial_meta_w,
+                initial_attention=initial_attention,
+                initial_modules=initial_modules,
+                initial_crossover_name=initial_crossover_name,
+                initial_mutate_name=initial_mutate_name
+            )
+
+            # Run the single GA trial
+            run_result = ga_trial.run(
+                 experiment_name=f"autonomous_run_{self.current_iteration}_{random_suffix()}"
+             )
+            runtime = time.time() - start_time
+
+            # The run_result already contains the final state and history of the trial
+            summary = {
+                "best": run_result.get("best"), # Best fitness recorded during the run
+                "avg": run_result.get("avg"),   # Average fitness recorded during the run
+                "final_weights": run_result.get("final_weights").tolist(), # Final weights after adaptation
+                "final_attention_mean": float(run_result.get("final_attention").mean()), # Final attention mean
+                "final_attention_vector": run_result.get("final_attention").tolist(), # Include the final attention vector
+                "total_evals": run_result.get("total_evals"),
+                "log_csv": run_result.get("log_csv"),
+                "best_fitness_history": run_result.get("best_fitness_history"), # History from the run
+                "meta_state_history": run_result.get("meta_state_history") # Meta state history from the run
+            }
+            logging.info(f"Internal run finished. Best fitness: {summary.get('best')}")
+            return {"success": True, "summary": summary, "runtime_s": runtime, "config_used": config_dict_for_run} # Return config_used
+
+        except Exception as e:
+            runtime = time.time() - start_time
+            logging.error(f"Internal run failed: {e}")
+            return {"success": False, "error": str(e), "runtime_s": runtime}
+
+    def accept_candidate_internal(self, baseline_summary: Dict[str, Any], candidate_summary: Dict[str, Any]) -> Tuple[bool, str]:
+        """Decide to accept or reject candidate based on SURVIVAL_CRITERIA, internally."""
+        if candidate_summary.get("summary") is None:
+            return False, "no_summary"
+        cand = candidate_summary["summary"]
+        base_best = baseline_summary.get("best", None)
+        cand_best = cand.get("best", None)
+        if base_best is None or cand_best is None:
+            return False, "missing_values"
+
+        # Handle cases where baseline or candidate best fitness is 0 or very close to 0
+        # If baseline is effectively zero, require absolute improvement
+        if abs(base_best) < 1e-9:
+            if cand_best > base_best + self.survival_criteria["min_improvement_pct"]:
+                return True, "improved_absolute"
+            # If both are close to zero or cand_best is not better, reject
+            return False, "no_improve_absolute"
+
+        # Assuming higher fitness is better (less negative for minimization)
+        # The difference `cand_best - base_best` will be positive if candidate is better.
+        improvement = cand_best - base_best
+
+        # Calculate relative improvement based on the magnitude of the baseline (if negative)
+        # Or just the baseline value (if positive)
+        denominator = abs(base_best) if base_best < 0 else base_best
+        if abs(denominator) < 1e-9: denominator = 1e-9 # Avoid division by zero if not handled above
+
+        rel_improvement = improvement / denominator
+
+        if rel_improvement >= self.survival_criteria["min_improvement_pct"]:
+             return True, f"improved_relative_{rel_improvement:.4f}"
+
+        # reject if significantly worse
+        # If candidate is worse, improvement will be negative.
+        # Check if the degradation is beyond the acceptable threshold relative to baseline magnitude.
+        if improvement < 0 and abs(improvement) / abs(base_best) >= self.survival_criteria["max_unacceptable_worse_pct"]:
+             return False, f"worse_relative_{rel_improvement:.4f}"
+
+        # otherwise reject by default
+        return False, f"no_significant_improve_relative_{rel_improvement:.4f}"
+
+    def promote_candidate_internal(self, candidate_config: Dict[str, Any], candidate_summary: Dict[str, Any]):
+        """Promote the candidate config and summary, replacing the baseline."""
+        logging.info("Promoting candidate config and final meta-state as new baseline.")
+        self.baseline_config_dict = candidate_config # Promote the config
+        self.baseline_summary = candidate_summary # Promote the summary
+
+        # Promote the final meta-state from the successful run to become the starting state for the next iteration's baseline
+        self.meta_w = np.array(candidate_summary["final_weights"])
+        # Promote the final attention vector
+        self.attention = np.array(candidate_summary.get("final_attention_vector", np.ones(self.chrom_len))) # Use the vector if available, else uniform attention
+        # Note: Promoting operators would require adding final_crossover_name/final_mutate_name to the run result summary.
+
+        # In a real system, you might also save this baseline config/summary/meta-state to persistent storage here.
+
+
+    def run_autonomous(self, max_iterations: int = 200, autonomous_mode: bool = True):
+        """Entry point to run the autonomous optimization loop."""
+        logging.info("Starting Autonomous Meta-Cognitive GA Optimization.")
+        rng = random.Random(self.cfg.random_seed if self.cfg.random_seed is not None else int(time.time()))
+
+        # Initial baseline run (using the initial config and initial state from __init__)
+        if self.baseline_summary is None:
+            logging.info("Running initial baseline experiment...")
+            # Run the core GA logic once with the initial state to establish a baseline
+            # The initial state (meta_w, attention, modules, operators) is already set in __init__
+            # when the autonomous_ga_optimizer instance was created.
+            baseline_run_result = self.run(experiment_name="autonomous_baseline")
+            if not baseline_run_result or not baseline_run_result.get("success", True): # Check if run failed (e.g., due to error during run)
+                logging.error("Initial baseline run failed. Aborting autonomous loop.")
+                self.baseline_summary = None
+                return {"final_config": self.baseline_config_dict, "final_summary": None, "experiment_history": self.experiment_history, "success": False}
+
+            # Construct baseline summary from the run result
+            self.baseline_summary = {
+                "best": baseline_run_result.get("best"),
+                "avg": baseline_run_result.get("avg"),
+                "final_weights": baseline_run_result.get("final_weights").tolist(),
+                "final_attention_mean": float(baseline_run_result.get("final_attention").mean()),
+                "final_attention_vector": baseline_run_result.get("final_attention").tolist(), # Include the vector
+                "total_evals": baseline_run_result.get("total_evals"),
+                "log_csv": baseline_run_result.get("log_csv"),
+                "best_fitness_history": baseline_run_result.get("best_fitness_history"),
+                "meta_state_history": baseline_run_result.get("meta_state_history")
+            }
+            # Add baseline score to recent history, but only if it's a valid number
+            if isinstance(self.baseline_summary.get("best"), (int, float)) and not math.isnan(self.baseline_summary.get("best")):
+                 self.recent_scores.append(self.baseline_summary.get("best"))
+
+            logging.info("Baseline best fitness: %s", self.baseline_summary.get("best"))
+
+
+        start_time = now_ts()
+        daily_count = 0
+
+        while self.current_iteration < self.max_iterations and (daily_count < self.max_daily_experiments) and (now_ts() - start_time < self.global_cpu_seconds_budget):
+            self.current_iteration += 1
+            daily_count += 1
+            experiment_id = f"iter_{self.current_iteration}_{random_suffix()}"
+            logging.info("=== Iteration %d | Experiment %s ===", self.current_iteration, experiment_id)
+
+            # Propose modifications (to config or initial meta-state for the *next* trial)
+            # The proposal affects the parameters passed to the *new* GA instance in run_experiment_internal
+            proposal = self.propose_modification_internal(self.baseline_config_dict, rng)
+            logging.info(f"Proposed: {proposal['desc']}")
+
+            # Run experiment internally using the proposed configuration/initial state
+            # The run_experiment_internal method will create a new GA instance for this trial
+            candidate_run_result = self.run_experiment_internal(proposal, self.baseline_config_dict)
+
+            if not candidate_run_result["success"]:
+                logging.warning(f"Candidate run failed for experiment {experiment_id}. Skipping acceptance check.")
+                # Record failure
+                self.experiment_history.append({
+                    "id": experiment_id,
+                    "iteration": self.current_iteration,
+                    "status": "failed",
+                    "proposal": proposal,
+                    "error": candidate_run_result.get("error"),
+                    "runtime_s": candidate_run_result.get("runtime_s", 0.0)
+                })
+                if not autonomous_mode:
+                     ans = input(f"Candidate run failed ({candidate_run_result.get('error')}). Continue? (y/n): ").strip().lower()
+                     if ans != "y":
+                         logging.info("Human halted the loop.")
+                         break
+                continue
+
+            # Evaluate acceptance using the summary from the completed run
+            accepted, reason = self.accept_candidate_internal(self.baseline_summary, candidate_run_result)
+            logging.info(f"Acceptance decision for {experiment_id}: {accepted} ({reason})")
+
+            status = "rejected" # Default status
+            if accepted:
+                # Promote the candidate: update baseline config and summary
+                self.promote_candidate_internal(candidate_run_result["config_used"], candidate_run_result["summary"])
+                status = "promoted"
+                # Add new score to recent history ONLY if it was promoted and is valid
+                if isinstance(candidate_run_result.get("summary", {}).get("best"), (int, float)) and not math.isnan(candidate_run_result.get("summary", {}).get("best")):
+                    self.recent_scores.append(candidate_run_result["summary"]["best"])
+            else:
+                # If rejected, the baseline config and meta-state remain unchanged.
+                # Add the candidate's score to recent history for the median baseline calculation,
+                # but only if the run was successful, produced a valid score, AND it was rejected.
+                if isinstance(candidate_run_result.get("summary", {}).get("best"), (int, float)) and not math.isnan(candidate_run_result.get("summary", {}).get("best")):
+                    self.recent_scores.append(candidate_run_result["summary"]["best"])
+
+
+            # Record experiment history
+            self.experiment_history.append({
+                "id": experiment_id,
+                "iteration": self.current_iteration,
+                "status": status,
+                "proposal": proposal,
+                "summary": candidate_run_result["summary"],
+                "runtime_s": candidate_run_result["runtime_s"],
+                "acceptance_reason": reason,
+                "config_used": candidate_run_result["config_used"]
+            })
+
+            if not autonomous_mode:
+                 ans = input(f"Experiment {experiment_id} finished (Accepted: {accepted}, Reason: {reason}). Continue? (y/n): ").strip().lower()
+                 if ans != "y":
+                     logging.info("Human halted the loop.")
+                     break
+
+
+        logging.info("Autonomous loop ended after %d iterations.", self.current_iteration)
+        final_best_fitness = self.baseline_summary.get("best") if self.baseline_summary else None
+        logging.info("Final baseline best fitness: %s", final_best_fitness)
+
+        return {
+            "final_config": self.baseline_config_dict,
+            "final_summary": self.baseline_summary,
+            "experiment_history": self.experiment_history,
+            "success": self.baseline_summary is not None # Indicate if at least baseline run succeeded
+        }
+
+# Assuming MetaGAConfig and SmartMemo are defined in previous cells
+
+# Example usage (modified to use the refactored class)
+if __name__ == "__main__":
+    # Define your objective function (assuming composite_objectives is available)
+    CHROM_LEN = 24
+    def objectives_wrapper(x):
+        # Use the objectives from meta_meta_ga.py (assuming it was executed)
+        # Need to ensure these objectives are available in this execution scope
+        # Assuming they are defined before this cell
+        return composite_objectives(x)
+
+    # Define the initial configuration for the *first* baseline run
+    initial_config_dict = {
+        "chromosome_length": CHROM_LEN,
+        "ga": {
+            "population_size": 100, # Slightly smaller population for quicker test
+            "generations": 50, # Reduced generations for quicker test
+            "crossover_rate": 0.9,
+            "base_mutation": 0.03,
+            "elitism_rate": 0.06
+        },
+        "advanced": {
+            "stagnation_window": 10, # Slightly smaller window
+            "stagnation_threshold": 1e-5, # Slightly higher threshold
+            "attention_ema": 0.3,
+            "shrinkage_rate": 0.001,
+            "module_count": 4,
+            "use_memo": True, # Enable memo for faster re-evaluations
+            "enable_surrogate": True and _SURROGATE_OK, # Enable surrogate if sklearn is available
+            "surrogate_warmup_evals": 200, # Reduced for quicker test
+            "surrogate_ratio": 0.4, # Slightly higher surrogate ratio
+            "random_seed": 42 # Use a fixed seed for reproducibility of the initial state
+        },
+        "log_every": 10, # Log more frequently for test
+        "out_dir": "./autonomous_runs_results_refactored" # New directory for logs
+    }
+
+    # Convert dict to config object for the initial MetaCognitiveGA instance
+    # The Autonomous loop will be run *by* this instance.
+    initial_cfg = MetaGAConfig(
+        chromosome_length=initial_config_dict["chromosome_length"],
+        population_size=initial_config_dict["ga"]["population_size"],
+        generations=initial_config_dict["ga"]["generations"],
+        crossover_rate=initial_config_dict["ga"]["crossover_rate"],
+        base_mutation=initial_config_dict["ga"]["base_mutation"],
+        elitism_rate=initial_config_dict["ga"]["elitism_rate"],
+        stagnation_window=initial_config_dict["advanced"]["stagnation_window"],
+        stagnation_threshold=initial_config_dict["advanced"]["stagnation_threshold"],
+        attention_ema=initial_config_dict["advanced"]["attention_ema"],
+        shrinkage_rate=initial_config_dict["advanced"]["shrinkage_rate"],
+        module_count=initial_config_dict["advanced"]["module_count"],
+        use_memo=initial_config_dict["advanced"]["use_memo"],
+        enable_surrogate=initial_config_dict["advanced"]["enable_surrogate"],
+        surrogate_warmup_evals=initial_config_dict["advanced"]["surrogate_warmup_evals"],
+        surrogate_ratio=initial_config_dict["advanced"]["surrogate_ratio"],
+        random_seed=initial_config_dict["advanced"]["random_seed"],
+        log_every=initial_config_dict["log_every"],
+        out_dir=initial_config_dict["out_dir"],
+        memo_size=initial_config_dict.get("memo_size", 1000) # Get memo_size from dict
+    )
+
+    # Create the self-contained autonomous optimizer instance
+    # Pass initial state explicitly if needed, otherwise defaults will be used internally
+    autonomous_ga_optimizer = MetaCognitiveGA(
+        objective_fn=objectives_wrapper,
+        config=initial_cfg,
+        # Initial meta-state can be set here, otherwise defaults will be used internally
+        initial_meta_w=normalize(np.ones(len(objectives_wrapper(np.zeros(CHROM_LEN))))),
+        initial_attention=np.ones(CHROM_LEN),
+        initial_modules=None, # Use default module building from config
+        initial_crossover_name="module_crossover",
+        initial_mutate_name="gaussian_mutation"
+    )
+
+    # Run the autonomous loop
+    # The max_iterations here controls the number of *autonomous iterations* (trials),
+    # not the generations within a single GA run (which is in the config).
+    final_result = autonomous_ga_optimizer.run_autonomous(max_iterations=2, autonomous_mode=True) # Run 2 autonomous iterations for quicker check
+
+    print("\n=== AUTONOMOUS OPTIMIZATION FINAL RESULT ===")
+    # Ensure output is serializable (numpy arrays to lists)
+    # The final_config is already a dict
+    # The final_summary already has weights and attention vector as lists
+    print(json.dumps(final_result["final_summary"], ensure_ascii=False, indent=2))
+    print("\nFinal Config (Baseline for next run):")
+    print(json.dumps(final_result["final_config"], ensure_ascii=False, indent=2))
+    print(f"\nTotal experiments run: {len(final_result['experiment_history'])}")

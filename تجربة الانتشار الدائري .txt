@@ -1,0 +1,398 @@
+# ==============================================================================
+#  السكريبت الكامل والنهائي: المعركة الحاسمة بين Baseline و Circular Propagation
+#  المؤلفون: أنت و Manus
+#  التاريخ: 05 سبتمبر 2025
+# ==============================================================================
+
+import numpy as np
+import time
+import os
+import csv
+from tensorflow.keras.datasets import mnist
+
+# ==============================================================================
+#  القسم 1: النواة الأساسية - فئة Node
+# ==============================================================================
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=np.float32)
+        self.parents = set(parents)
+        self.op = op
+        self.grad = None
+        self._backward = lambda out_node: None
+
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=np.float32))
+
+    def __add__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value + other.value, (self, other), '+')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            if other.grad is None: other.grad = np.zeros_like(other.value)
+            self.grad += out_node.grad
+            other.grad += out_node.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value * other.value, (self, other), '*')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            if other.grad is None: other.grad = np.zeros_like(other.value)
+            self.grad += other.value * out_node.grad
+            other.grad += self.value * out_node.grad
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value @ other.value, (self, other), '@')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            if other.grad is None: other.grad = np.zeros_like(other.value)
+            self.grad += out_node.grad @ other.value.T
+            other.grad += self.value.T @ out_node.grad
+        out._backward = _backward
+        return out
+    
+    def __pow__(self, power):
+        out = Node(self.value ** power, (self,), f'**{power}')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            self.grad += (power * self.value**(power-1)) * out_node.grad
+        out._backward = _backward
+        return out
+
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-other)
+    def __truediv__(self, other): return self * (other**-1)
+
+    def relu(self):
+        out = Node(np.maximum(0, self.value), (self,), 'ReLU')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            self.grad += (self.value > 0) * out_node.grad
+        out._backward = _backward
+        return out
+
+    def log(self):
+        out = Node(np.log(np.maximum(self.value, 1e-10)), (self,), 'log')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            self.grad += (1 / np.maximum(self.value, 1e-10)) * out_node.grad
+        out._backward = _backward
+        return out
+
+    def sum(self, axis=None, keepdims=False):
+        out = Node(self.value.sum(axis=axis, keepdims=keepdims), (self,), 'sum')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            grad = out_node.grad
+            if not keepdims and axis is not None: grad = np.expand_dims(grad, axis)
+            self.grad += np.broadcast_to(grad, self.value.shape)
+        out._backward = _backward
+        return out
+
+    def exp(self):
+        val = np.exp(np.clip(self.value, -100, 100))
+        out = Node(val, (self,), 'exp')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            self.grad += val * out_node.grad
+        out._backward = _backward
+        return out
+
+    def reshape(self, *shape):
+        out = Node(self.value.reshape(*shape), (self,), 'reshape')
+        def _backward(out_node):
+            if self.grad is None: self.grad = np.zeros_like(self.value)
+            self.grad += out_node.grad.reshape(self.value.shape)
+        out._backward = _backward
+        return out
+
+    def build_topo(self):
+        topo, visited = [], set()
+        def build(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build(p)
+                topo.append(v)
+        build(self)
+        return topo
+
+    def backward(self):
+        topo = self.build_topo()
+        if self.grad is None:
+            self.grad = np.ones_like(self.value)
+        for v in reversed(topo):
+            v._backward(v)
+        return topo
+
+# ==============================================================================
+#  القسم 2: وحدة بناء الشبكات (nn)
+# ==============================================================================
+class nn:
+    class Module:
+        def train(self):
+            for layer in self.__dict__.values():
+                if isinstance(layer, nn.Module): layer.train()
+        def eval(self):
+            for layer in self.__dict__.values():
+                if isinstance(layer, nn.Module): layer.eval()
+        def parameters(self):
+            for layer in self.__dict__.values():
+                if isinstance(layer, nn.Module): yield from layer.parameters()
+                elif isinstance(layer, Node): yield layer
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+        def zero_grad(self):
+            for p in self.parameters(): p.grad = None
+
+    class Linear(Module):
+        def __init__(self, in_features, out_features):
+            limit = np.sqrt(2 / in_features)
+            self.weight = Node(np.random.randn(in_features, out_features) * limit)
+            self.bias = Node(np.zeros(out_features))
+        def forward(self, x): return x @ self.weight + self.bias
+        def parameters(self): yield from [self.weight, self.bias]
+
+    class ReLU(Module):
+        def forward(self, x): return x.relu()
+
+    class Flatten(Module):
+        def forward(self, x):
+            return x.reshape(x.value.shape[0], -1)
+
+    class Conv2d(Module):
+        # ... (الكود الكامل والمحسن لـ Conv2d من الخلية السابقة) ...
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+            self.in_channels, self.out_channels = in_channels, out_channels
+            self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+            self.stride = (stride, stride) if isinstance(stride, int) else stride
+            self.padding = (padding, padding) if isinstance(padding, int) else padding
+            limit = np.sqrt(2 / (in_channels * self.kernel_size[0] * self.kernel_size[1]))
+            self.weight = Node(np.random.randn(out_channels, in_channels, *self.kernel_size) * limit)
+            self.bias = Node(np.zeros(out_channels))
+        def _get_windows_view(self, x, is_grad=False):
+            N, C, H, W = x.shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            OH = (H + 2 * PH - KH) // SH + 1; OW = (W + 2 * PW - KW) // SW + 1
+            x_padded = np.pad(x, ((0,0), (0,0), (PH, PH), (PW, PW)), 'constant') if not is_grad else x
+            view_shape = (N, C, OH, OW, KH, KW)
+            strides = (x_padded.strides[0], x_padded.strides[1], x_padded.strides[2]*SH, x_padded.strides[3]*SW, x_padded.strides[2], x_padded.strides[3])
+            return np.lib.stride_tricks.as_strided(x_padded, view_shape, strides, writeable=is_grad)
+        def forward(self, x):
+            self.x_shape = x.value.shape
+            windows = self._get_windows_view(x.value)
+            out_val = np.einsum('ncoi,khij->nckh', windows, self.weight.value, optimize=True) + self.bias.value.reshape(1, -1, 1, 1)
+            out = Node(out_val, (x, self.weight, self.bias), 'conv2d')
+            def _backward(out_node):
+                if self.bias.grad is None: self.bias.grad = np.zeros_like(self.bias.value)
+                if self.weight.grad is None: self.weight.grad = np.zeros_like(self.weight.value)
+                if x.grad is None: x.grad = np.zeros_like(x.value)
+                self.bias.grad += out_node.grad.sum((0, 2, 3))
+                windows = self._get_windows_view(x.value)
+                self.weight.grad += np.einsum('nckh,ncoi->khij', out_node.grad, windows, optimize=True)
+                grad_windows = self._get_windows_view(np.zeros_like(x.value), is_grad=True)
+                np.einsum('nckh,khij->ncoi', out_node.grad, self.weight.value, out=grad_windows, optimize=True)
+                x.grad += grad_windows
+            out._backward = _backward
+            return out
+        def parameters(self): yield from [self.weight, self.bias]
+
+    class MaxPool2d(Module):
+        # ... (الكود الكامل والمحسن لـ MaxPool2d من الخلية السابقة) ...
+        def __init__(self, kernel_size, stride=None, padding=0):
+            self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+            self.stride = (stride, stride) if isinstance(stride, int) else (kernel_size, kernel_size) if stride is None else stride
+            self.padding = (padding, padding) if isinstance(padding, int) else padding
+        def _get_windows_view(self, x, is_grad=False):
+            N, C, H, W = x.shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            OH = (H + 2 * PH - KH) // SH + 1; OW = (W + 2 * PW - KW) // SW + 1
+            x_padded = np.pad(x, ((0,0), (0,0), (PH, PH), (PW, PW)), 'constant') if not is_grad else x
+            view_shape = (N, C, OH, OW, KH, KW)
+            strides = (x_padded.strides[0], x_padded.strides[1], x_padded.strides[2]*SH, x_padded.strides[3]*SW, x_padded.strides[2], x_padded.strides[3])
+            return np.lib.stride_tricks.as_strided(x_padded, view_shape, strides, writeable=is_grad)
+        def forward(self, x):
+            self.x_shape = x.value.shape
+            windows = self._get_windows_view(x.value)
+            out_val = np.max(windows, axis=(4, 5))
+            self.mask = (out_val[..., np.newaxis, np.newaxis] == windows)
+            out = Node(out_val, (x,), 'maxpool2d')
+            def _backward(out_node):
+                if x.grad is None: x.grad = np.zeros_like(x.value)
+                grad_x_padded = np.zeros((self.x_shape[0], self.x_shape[1], self.x_shape[2] + 2*self.padding[0], self.x_shape[3] + 2*self.padding[1]))
+                grad_windows = self._get_windows_view(grad_x_padded, is_grad=True)
+                grad_windows += self.mask * out_node.grad[..., np.newaxis, np.newaxis]
+                PH, PW = self.padding
+                x.grad += grad_x_padded[:, :, PH:self.x_shape[2]+PH, PW:self.x_shape[3]+PW]
+            out._backward = _backward
+            return out
+
+    class Sequential(Module):
+        def __init__(self, *layers): self.layers = layers
+        def forward(self, x):
+            for layer in self.layers: x = layer(x)
+            return x
+        def parameters(self):
+            for layer in self.layers: yield from layer.parameters()
+
+# ==============================================================================
+#  القسم 3: المُحسِّن المبتكر - AdamOptimizer مع الصدى
+# ==============================================================================
+class AdamOptimizer:
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 circular_strength=0.0, echo_freq=1, neumann_steps=1,
+                 echo_norm_clip=None):
+        self.params = list(params)
+        self.lr, self.eps = lr, eps
+        self.beta1, self.beta2 = betas
+        self.t = 0
+        self.m = {id(p): np.zeros_like(p.value) for p in self.params}
+        self.v = {id(p): np.zeros_like(p.value) for p in self.params}
+        self.circular_strength = circular_strength
+        self.echo_freq, self.neumann_steps = echo_freq, max(1, neumann_steps)
+        self.echo_norm_clip = echo_norm_clip
+
+    def zero_grad(self):
+        for p in self.params: p.grad = None
+
+    def step(self, topo_graph=None):
+        self.t += 1
+        for p in self.params:
+            p_grad = p.grad if p.grad is not None else np.zeros_like(p.value)
+            self.m[id(p)] = self.beta1 * self.m[id(p)] + (1 - self.beta1) * p_grad
+            self.v[id(p)] = self.beta2 * self.v[id(p)] + (1 - self.beta2) * (p_grad ** 2)
+            m_hat = self.m[id(p)] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[id(p)] / (1 - self.beta2 ** self.t)
+            p.value -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            p.original_grad = p_grad.copy()
+
+        if self.circular_strength > 0 and topo_graph is not None and (self.t % self.echo_freq == 0):
+            last_param = next((p for p in reversed(self.params) if p.value.ndim >= 2), self.params[-1])
+            echo = getattr(last_param, 'original_grad', np.zeros_like(last_param.value)).astype(np.float32)
+            param_scale = np.sqrt(np.prod(last_param.value.shape)).astype(np.float32)
+            echo = echo / (param_scale + 1e-12) * self.circular_strength
+            if self.echo_norm_clip:
+                norm = np.linalg.norm(echo.ravel())
+                if norm > self.echo_norm_clip: echo *= self.echo_norm_clip / (norm + 1e-12)
+            
+            for p in self.params: p.grad = np.zeros_like(p.value)
+            last_param.grad = echo
+            
+            for _ in range(self.neumann_steps):
+                for v in reversed(topo_graph): v._backward(v)
+            
+            for p in self.params:
+                if p.grad is not None: p.value -= self.lr * p.grad * self.circular_strength
+
+# ==============================================================================
+#  القسم 4: أدوات مساعدة للتدريب والتجريب
+# ==============================================================================
+def set_seed(seed=42):
+    np.random.seed(seed)
+    try: import random as _r; _r.seed(seed)
+    except: pass
+
+def batch_iterator(X, y, batch_size=256, shuffle=True):
+    n = X.shape[0]
+    idx = np.arange(n)
+    if shuffle: np.random.shuffle(idx)
+    for i in range(0, n, batch_size):
+        yield X[idx[i:i+batch_size]], y[idx[i:i+batch_size]]
+
+def init_model_weights(model):
+    for layer in model.layers:
+        if isinstance(layer, nn.Linear):
+            limit = np.sqrt(2 / layer.weight.value.shape[0])
+            layer.weight.value[:] = np.random.randn(*layer.weight.value.shape) * limit
+            layer.bias.value[:] = 0
+        elif isinstance(layer, nn.Conv2d):
+            in_ch, k, _ = layer.weight.value.shape[1:]
+            limit = np.sqrt(2 / (in_ch * k * k))
+            layer.weight.value[:] = np.random.randn(*layer.weight.value.shape) * limit
+            layer.bias.value[:] = 0
+
+def cross_entropy_loss_stable(logits_node, labels_numpy):
+    N, C = logits_node.value.shape
+    max_logits = Node(np.max(logits_node.value, axis=1, keepdims=True))
+    shifted = logits_node - max_logits
+    log_sum_exp = (shifted.exp().sum(axis=1, keepdims=True)).log()
+    log_probs = shifted - log_sum_exp
+    one_hot = np.zeros((N, C), dtype=np.float32)
+    one_hot[np.arange(N), labels_numpy] = 1.0
+    return -(Node(one_hot) * log_probs).sum() / N
+
+# ==============================================================================
+#  القسم 5: التجربة الحاسمة
+# ==============================================================================
+def run_final_experiment(model_factory, X_train, y_train, X_test, y_test, config, experiment_name):
+    print(f"\n🚀🚀🚀 بدء التجربة الحاسمة: {experiment_name} 🚀🚀🚀")
+    print(f"التكوين: {config}")
+    model = model_factory()
+    init_model_weights(model)
+    optimizer = AdamOptimizer(model.parameters(), **config['optimizer_params'])
+    for epoch in range(1, config['epochs'] + 1):
+        epoch_start_time = time.time()
+        model.train()
+        epoch_loss = 0.0
+        for xb, yb in batch_iterator(X_train, y_train, batch_size=config['batch_size']):
+            x_node = Node(xb)
+            logits = model(x_node)
+            loss = cross_entropy_loss_stable(logits, yb)
+            model.zero_grad(); optimizer.zero_grad()
+            topo = loss.backward()
+            optimizer.step(topo_graph=topo)
+            epoch_loss += loss.value * len(xb)
+        epoch_loss /= len(X_train)
+        epoch_duration = time.time() - epoch_start_time
+        model.eval()
+        val_logits = model(Node(X_test))
+        val_preds = np.argmax(val_logits.value, axis=1)
+        val_acc = np.mean(val_preds == y_test)
+        print(f"--- Epoch {epoch}/{config['epochs']} --- "
+              f"Train Loss: {epoch_loss:.4f} | "
+              f"Val Accuracy: {val_acc:.4f} | "
+              f"Time: {epoch_duration:.2f}s ---")
+    return val_acc
+
+if __name__ == '__main__':
+    print("1. تحميل ومعالجة بيانات MNIST الكاملة...")
+    (X_train_full, y_train_full), (X_test, y_test) = mnist.load_data()
+    X_train_full = X_train_full.reshape(-1, 1, 28, 28).astype(np.float32) / 255.0
+    X_test = X_test.reshape(-1, 1, 28, 28).astype(np.float32) / 255.0
+    print(f"تم تجهيز البيانات. حجم التدريب: {X_train_full.shape}, حجم الاختبار: {X_test.shape}")
+
+    def cnn_model_factory():
+        return nn.Sequential(
+            nn.Conv2d(1, 8, 5, padding=2), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Flatten(), nn.Linear(16 * 7 * 7, 128), nn.ReLU(), nn.Linear(128, 10)
+        )
+    print("2. تم تعريف مصنع نماذج CNN.")
+
+    common_config = {'epochs': 8, 'batch_size': 256}
+    baseline_config = {**common_config, 'optimizer_params': {'lr': 5e-4, 'circular_strength': 0.0}}
+    circular_config = {**common_config, 'optimizer_params': {'lr': 5e-4, 'circular_strength': 0.01, 'neumann_steps': 3, 'echo_freq': 1, 'echo_norm_clip': 3.0}}
+
+    set_seed(42)
+    baseline_accuracy = run_final_experiment(cnn_model_factory, X_train_full, y_train_full, X_test, y_test, baseline_config, "Baseline_CNN")
+    set_seed(42)
+    circular_accuracy = run_final_experiment(cnn_model_factory, X_train_full, y_train_full, X_test, y_test, circular_config, "Circular_Prop_CNN")
+
+    print("\n\n========================================")
+    print("          🏆 النتائج النهائية 🏆")
+    print("========================================")
+    print(f"الدقة النهائية للخط الأساسي (Baseline): {baseline_accuracy * 100:.2f}%")
+    print(f"الدقة النهائية للانتشار الدائري:       {circular_accuracy * 100:.2f}%")
+    print("----------------------------------------")
+    improvement = circular_accuracy - baseline_accuracy
+    if improvement > 0.0005:
+        print(f"🎉 نجاح! الانتشار الدائري أدى إلى تحسن في الدقة بمقدار {improvement * 100:.2f}%")
+    elif improvement < -0.0005:
+        print(f"⚠️ انتباه! الانتشار الدائري أدى إلى انخفاض في الدقة بمقدار {abs(improvement) * 100:.2f}%")
+    else:
+        print("⚖️ نتيجة محايدة. لم يكن للانتشار الدائري تأثير كبير على الدقة النهائية في هذا الإعداد.")
+    print("========================================")
