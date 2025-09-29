@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""
+نظام متقدم لإدارة المتجهات مع تحسينات رياضية وفيزيائية عميقة
+Advanced Vector Management System with Deep Mathematical & Physical Optimizations
+"""
+
+import numpy as np
+import pandas as pd
+import time
+import threading
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+from datetime import datetime, timedelta
+import hashlib
+import pickle
+import json
+import gc
+from abc import ABC, abstractmethod
+from enum import Enum
+import warnings
+warnings.filterwarnings('ignore')
+
+# Advanced mathematical libraries with fallbacks
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    print("⚠️ FAISS not available - using fallback implementations")
+
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("⚠️ Scikit-learn not available - using fallback implementations")
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+# Configure advanced logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class CompressionMethod(Enum):
+    """طرق الضغط المتقدمة"""
+    PCA = "pca"  # Principal Component Analysis
+    OPQ = "opq"  # Optimized Product Quantization
+    PQ = "pq"   # Product Quantization
+    LSH = "lsh"  # Locality Sensitive Hashing
+    IVF = "ivf"  # Inverted File Index
+    HNSW = "hnsw"  # Hierarchical Navigable Small World
+
+class IndexStrategy(Enum):
+    """استراتيجيات الفهرسة"""
+    FLAT = "flat"           # البحث الخطي
+    IVF_FLAT = "ivf_flat"   # مقلوب مسطح
+    IVF_PQ = "ivf_pq"       # مقلوب مع ضغط
+    HNSW = "hnsw"           # عالم صغير هرمي
+    LSH = "lsh"             # تجزئة محلية حساسة
+
+@dataclass
+class VectorMetrics:
+    """مقاييس شاملة للمتجهات"""
+    vector_id: str
+    dimension: int
+    norm_l2: float
+    sparsity: float
+    entropy: float
+    affection_score: float = 0.0  # نقاط التأثير
+    access_count: int = 0
+    last_accessed: datetime = field(default_factory=datetime.now)
+    compression_ratio: float = 1.0
+    search_latency_ms: List[float] = field(default_factory=list)
+
+@dataclass 
+class SystemKPIs:
+    """مؤشرات الأداء الرئيسية"""
+    batch_processing_time_ms: float = 0.0
+    search_response_time_ms: float = 0.0
+    processing_success_rate: float = 1.0
+    memory_usage_mb: float = 0.0
+    index_build_time_ms: float = 0.0
+    compression_efficiency: float = 0.0
+    throughput_vectors_per_sec: float = 0.0
+    
+class AdvancedMathOptimizer:
+    """محسّن رياضي متقدم للعمليات الخوارزمية"""
+    
+    def __init__(self):
+        self.optimization_cache = {}
+        self.numerical_precision = np.float32  # توازن بين الدقة والأداء
+        
+    def optimized_matrix_multiplication(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        """ضرب مصفوفات محسّن باستخدام تحليل الكتل"""
+        
+        # استخدام تحليل الكتل للمصفوفات الكبيرة
+        if A.shape[0] > 1000 or B.shape[1] > 1000:
+            return self._block_matrix_multiply(A, B, block_size=512)
+        
+        # استخدام BLAS المحسّن للمصفوفات الصغيرة
+        return np.dot(A.astype(self.numerical_precision), B.astype(self.numerical_precision))
+    
+    def _block_matrix_multiply(self, A: np.ndarray, B: np.ndarray, block_size: int = 512) -> np.ndarray:
+        """ضرب مصفوفات بتقسيم الكتل لتحسين استخدام الذاكرة التخزينية"""
+        
+        m, k = A.shape
+        k2, n = B.shape
+        
+        if k != k2:
+            raise ValueError("Matrix dimensions don't match")
+        
+        # تحضير المصفوفة الناتجة
+        C = np.zeros((m, n), dtype=self.numerical_precision)
+        
+        # تقسيم العمل إلى كتل
+        for i in range(0, m, block_size):
+            for j in range(0, n, block_size):
+                for k_idx in range(0, k, block_size):
+                    # حدود الكتلة
+                    i_end = min(i + block_size, m)
+                    j_end = min(j + block_size, n)
+                    k_end = min(k_idx + block_size, k)
+                    
+                    # ضرب الكتل
+                    A_block = A[i:i_end, k_idx:k_end].astype(self.numerical_precision)
+                    B_block = B[k_idx:k_end, j:j_end].astype(self.numerical_precision)
+                    
+                    C[i:i_end, j:j_end] += np.dot(A_block, B_block)
+        
+        return C
+    
+    def adaptive_precision_svd(self, matrix: np.ndarray, target_rank: int =             closest_distances = distances[closest_indices]
+            
+            all_distances.append(closest_distances)
+            all_indices.append(closest_indices)
+        
+        return np.array(all_distances), np.array(all_indices)
+    
+    def _estimate_memory_usage(self) -> float:
+        """تقدير استخدام الذاكرة بالميجابايت"""
+        
+        if FAISS_AVAILABLE and hasattr(self.index, 'ntotal'):
+            # تقدير تقريبي لذاكرة FAISS
+            num_vectors = self.index.ntotal
+            bytes_per_vector = self.dimension * 4  # float32
+            
+            if self.strategy == IndexStrategy.HNSW:
+                # HNSW يستخدم ذاكرة إضافية للروابط
+                overhead_factor = 2.5
+            elif self.strategy in [IndexStrategy.IVF_FLAT, IndexStrategy.IVF_PQ]:
+                # IVF يستخدم ذاكرة أقل
+                overhead_factor = 1.2
+            else:
+                overhead_factor = 1.0
+            
+            total_bytes = num_vectors * bytes_per_vector * overhead_factor
+            return total_bytes / (1024 * 1024)
+        
+        else:
+            # تقدير للفهرس البديل
+            num_vectors = len(self.index.get("vectors", []))
+            bytes_per_vector = self.dimension * 4
+            return (num_vectors * bytes_per_vector) / (1024 * 1024)
+
+class TelemetryCollector:
+    """جامع القياسات والإحصائيات لـ Prometheus/Grafana"""
+    
+    def __init__(self, export_interval: int = 60):
+        self.metrics_buffer = {}
+        self.export_interval = export_interval
+        self.last_export = time.time()
+        self.prometheus_metrics = []
+        
+    def record_metric(self, metric_name: str, value: float, labels: Dict[str, str] = None):
+        """تسجيل قياس جديد"""
+        
+        timestamp = time.time()
+        labels = labels or {}
+        
+        metric_key = f"{metric_name}_{hash(frozenset(labels.items()))}"
+        
+        if metric_key not in self.metrics_buffer:
+            self.metrics_buffer[metric_key] = []
+        
+        self.metrics_buffer[metric_key].append({
+            "timestamp": timestamp,
+            "value": value,
+            "labels": labels
+        })
+        
+        # تصدير دوري
+        if timestamp - self.last_export > self.export_interval:
+            self._export_to_prometheus()
+    
+    def _export_to_prometheus(self):
+        """تصدير القياسات لـ Prometheus"""
+        
+        current_time = time.time()
+        prometheus_data = []
+        
+        for metric_key, measurements in self.metrics_buffer.items():
+            if not measurements:
+                continue
+            
+            # حساب الإحصائيات
+            values = [m["value"] for m in measurements]
+            labels = measurements[0]["labels"]
+            
+            # إنشاء نص Prometheus
+            labels_str = ",".join([f'{k}="{v}"' for k, v in labels.items()])
+            
+            prometheus_data.extend([
+                f'vector_system_metric_avg{{{labels_str}}} {np.mean(values)}',
+                f'vector_system_metric_max{{{labels_str}}} {np.max(values)}',
+                f'vector_system_metric_min{{{labels_str}}} {np.min(values)}',
+                f'vector_system_metric_count{{{labels_str}}} {len(values)}'
+            ])
+        
+        # حفظ البيانات (في التطبيق الحقيقي، ترسل لـ Prometheus)
+        self.prometheus_metrics.extend(prometheus_data)
+        
+        # مسح المخزن المؤقت
+        self.metrics_buffer.clear()
+        self.last_export = current_time
+        
+        logger.info(f"تم تصدير {len(prometheus_data)} قياس إلى Prometheus")
+    
+    def get_prometheus_format(self) -> List[str]:
+        """الحصول على القياسات بصيغة Prometheus"""
+        return self.prometheus_metrics.copy()
+
+class AdvancedVectorSystem:
+    """النظام المتقدم الشامل لإدارة المتجهات"""
+    
+    def __init__(self, dimension: int, index_strategy: IndexStrategy = IndexStrategy.HNSW):
+        self.dimension = dimension
+        self.index_strategy = index_strategy
+        
+        # المكونات الأساسية
+        self.math_optimizer = AdvancedMathOptimizer()
+        self.memory_manager = PhysicalMemoryManager()
+        self.compression_engine = AdvancedCompressionEngine(self.math_optimizer)
+        self.faiss_index = IntelligentFAISSIndex(dimension, index_strategy)
+        self.telemetry = TelemetryCollector()
+        
+        # إدارة الدفعات والتخزين المؤقت
+        self.batch_queue = []
+        self.batch_size = 1000
+        self.batch_timeout = 5.0  # ثواني
+        self.last_batch_time = time.time()
+        
+        # متجهات التخزين والنسخ الاحتياطية
+        self.vector_storage = {}  # للمتجهات الأصلية
+        self.compressed_storage = {}  # للمتجهات المضغوطة
+        self.vector_metrics = {}
+        
+        # مؤشرات الأداء الرئيسية
+        self.kpis = SystemKPIs()
+        self.performance_history = []
+        
+        # خيوط المعالجة
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.batch_processor_active = True
+        self.batch_processor_thread = threading.Thread(target=self._batch_processor, daemon=True)
+        self.batch_processor_thread.start()
+        
+        logger.info(f"تم تهيئة النظام المتقدم - البعد: {dimension}, الاستراتيجية: {index_strategy.value}")
+    
+    async def add_vector_async(self, vector: np.ndarray, vector_id: str, 
+                              compress: bool = True, affection_score: float = 0.0) -> Dict[str, Any]:
+        """إضافة متجه بشكل غير متزامن مع ضغط اختياري"""
+        
+        start_time = time.time()
+        
+        try:
+            # التحقق من صحة البيانات
+            if vector.shape[0] != self.dimension:
+                raise ValueError(f"خطأ في البعد: متوقع {self.dimension}, وصل {vector.shape[0]}")
+            
+            # تحسين البيانات للذاكرة
+            optimized_vector = self.memory_manager.optimal_memory_layout(vector.reshape(1, -1))[0]
+            
+            # حساب المقاييس
+            vector_norm = float(np.linalg.norm(optimized_vector))
+            sparsity = float(np.sum(optimized_vector == 0) / len(optimized_vector))
+            entropy = self._calculate_entropy(optimized_vector)
+            
+            # إنشاء كائن المقاييس
+            metrics = VectorMetrics(
+                vector_id=vector_id,
+                dimension=self.dimension,
+                norm_l2=vector_norm,
+                sparsity=sparsity,
+                entropy=entropy,
+                affection_score=affection_score
+            )
+            
+            # تخزين المتجه الأصلي
+            self.vector_storage[vector_id] = optimized_vector.copy()
+            self.vector_metrics[vector_id] = metrics
+            
+            # الضغط الاختياري
+            compression_metadata = {}
+            if compress:
+                compressed_data, compression_metadata = await self._compress_vector_async(
+                    optimized_vector, vector_id
+                )
+                self.compressed_storage[vector_id] = compressed_data
+            
+            # إضافة للدفعة
+            self.batch_queue.append({
+                "vector": optimized_vector,
+                "vector_id": vector_id,
+                "timestamp": time.time()
+            })
+            
+            # تسجيل القياسات
+            processing_time = time.time() - start_time
+            self.telemetry.record_metric(
+                "vector_add_time_ms",
+                processing_time * 1000,
+                {"compress": str(compress), "vector_id": vector_id}
+            )
+            
+            return {
+                "status": "queued",
+                "vector_id": vector_id,
+                "processing_time_ms": processing_time * 1000,
+                "metrics": metrics.__dict__,
+                "compression": compression_metadata
+            }
+            
+        except Exception as e:
+            error_time = time.time() - start_time
+            logger.error(f"خطأ في إضافة المتجه {vector_id}: {e}")
+            
+            self.telemetry.record_metric(
+                "vector_add_error",
+                1,
+                {"error_type": type(e).__name__, "vector_id": vector_id}
+            )
+            
+            return {
+                "status": "error",
+                "error": str(e),
+                "processing_time_ms": error_time * 1000
+            }
+    
+    def _calculate_entropy(self, vector: np.ndarray) -> float:
+        """حساب الإنتروبيا للمتجه"""
+        
+        # تكميم المتجه لحساب الإنتروبيا
+        quantized = np.round(vector * 1000).astype(int)
+        
+        # حساب التوزيع الاحتمالي
+        unique_vals, counts = np.unique(quantized, return_counts=True)
+        probabilities = counts / len(quantized)
+        
+        # حساب الإنتروبيا
+        entropy = -np.sum(probabilities * np.log2(probabilities + 1e-10))
+        
+        return float(entropy)
+    
+    async def _compress_vector_async(self, vector: np.ndarray, vector_id: str) -> Tuple[Any, Dict]:
+        """ضغط المتجه بشكل غير متزامن"""
+        
+        # اختيار طريقة الضغط حسب خصائص المتجه
+        sparsity = np.sum(vector == 0) / len(vector)
+        vector_norm = np.linalg.norm(vector)
+        
+        if sparsity > 0.7:
+            # متجه متناثر - استخدام ضغط خاص
+            compressed_data = {"sparse_indices": np.nonzero(vector)[0],
+                             "sparse_values": vector[vector != 0],
+                             "shape": vector.shape}
+            metadata = {
+                "method": "sparse_compression",
+                "compression_ratio": len(compressed_data["sparse_values"]) / len(vector)
+            }
+        elif vector_norm > 100:
+            # متجه كبير القيم - استخدام PCA
+            vector_2d = vector.reshape(1, -1)
+            compressed_data, metadata = self.compression_engine.adaptive_pca_compression(
+                vector_2d, target_compression=0.7
+            )
+        else:
+            # ضغط عادي
+            compressed_data, metadata = self.compression_engine.adaptive_pca_compression(
+                vector.reshape(1, -1), target_compression=0.5
+            )
+        
+        return compressed_data, metadata
+    
+    def _batch_processor(self):
+        """معالج الدفعات في الخلفية"""
+        
+        while self.batch_processor_active:
+            try:
+                current_time = time.time()
+                
+                # فحص إذا كانت الدفعة جاهزة للمعالجة
+                batch_ready = (
+                    len(self.batch_queue) >= self.batch_size or
+                    (self.batch_queue and current_time - self.last_batch_time > self.batch_timeout)
+                )
+                
+                if batch_ready:
+                    self._process_batch()
+                    self.last_batch_time = current_time
+                
+                time.sleep(0.1)  # استراحة قصيرة
+                
+            except Exception as e:
+                logger.error(f"خطأ في معالج الدفعات: {e}")
+                time.sleep(1.0)  # استراحة أطول في حالة الخطأ
+    
+    def _process_batch(self):
+        """معالجة دفعة من المتجهات"""
+        
+        if not self.batch_queue:
+            return
+        
+        start_time = time.time()
+        
+        try:
+            # استخراج المتجهات والمعرفات
+            batch_data = self.batch_queue.copy()
+            self.batch_queue.clear()
+            
+            vectors = np.array([item["vector"] for item in batch_data])
+            vector_ids = [item["vector_id"] for item in batch_data]
+            
+            # إضافة للفهرس
+            index_metrics = self.faiss_index.add_vectors_batch(vectors, vector_ids)
+            
+            # تحديث مؤشرات الأداء
+            processing_time = time.time() - start_time
+            self.kpis.batch_processing_time_ms = processing_time * 1000
+            self.kpis.throughput_vectors_per_sec = len(vector_ids) / processing_time
+            
+            # تسجيل القياسات
+            self.telemetry.record_metric(
+                "batch_processing_time_ms",
+                processing_time * 1000,
+                {"batch_size": str(len(vector_ids))}
+            )
+            
+            self.telemetry.record_metric(
+                "throughput_vectors_per_sec",
+                len(vector_ids) / processing_time,
+                {"batch_size": str(len(vector_ids))}
+            )
+            
+            logger.info(f"تمت معالجة دفعة من {len(vector_ids)} متجه في {processing_time*1000:.2f} مللي ثانية")
+            
+        except Exception as e:
+            logger.error(f"فشل في معالجة الدفعة: {e}")
+            # إعادة المتجهات للطابور في حالة الفشل
+            self.batch_queue.extend(batch_data)
+    
+    async def search_vectors_async(self, query_vector: np.ndarray, k: int = 10, 
+                                  use_compressed: bool = False) -> Dict[str, Any]:
+        """البحث عن المتجهات المشابهة بشكل غير متزامن"""
+        
+        start_time = time.time()
+        
+        try:
+            # تحسين متجه الاستعلام
+            optimized_query = self.memory_manager.optimal_memory_layout(
+                query_vector.reshape(1, -1)
+            )
+            
+            # البحث في الفهرس
+            distances, indices, search_metrics = self.faiss_index.search_similar(
+                optimized_query, k
+            )
+            
+            # استخراج معرفات المتجهات
+            if FAISS_AVAILABLE and hasattr(self.faiss_index, 'vector_ids'):
+                result_ids = []
+                for idx_array in indices:
+                    batch_ids = []
+                    for idx in idx_array:
+                        if 0 <= idx < len(self.faiss_index.vector_ids):
+                            batch_ids.append(self.faiss_index.vector_ids[idx])
+                        else:
+                            batch_ids.append(f"unknown_{idx}")
+                    result_ids.append(batch_ids)
+            else:
+                result_ids = indices.tolist()
+            
+            # حساب نقاط التأثير
+            total_affection_score = 0
+            result_details = []
+            
+            for i, (distance_array, id_array) in enumerate(zip(distances, result_ids)):
+                query_results = []
+                for distance, vec_id in zip(distance_array, id_array):
+                    if vec_id in self.vector_metrics:
+                        metrics = self.vector_metrics[vec_id]
+                        # تحديث نقطة التأثير
+                        metrics.affection_score += 1.0 / (1.0 + distance)
+                        metrics.access_count += 1
+                        metrics.last_accessed = datetime.now()
+                        metrics.search_latency_ms.append(search_metrics["search_time_ms"])
+                        
+                        total_affection_score += metrics.affection_score
+                        
+                        query_results.append({
+                            "vector_id": vec_id,
+                            "distance": float(distance),
+                            "affection_score": metrics.affection_score,
+                            "access_count": metrics.access_count
+                        })
+                    else:
+                        query_results.append({
+                            "vector_id": vec_id,
+                            "distance": float(distance),
+                            "affection_score": 0.0,

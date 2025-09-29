@@ -1,0 +1,1179 @@
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Any, Optional, Tuple
+import json
+import torch
+import numpy as np
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from sentence_transformers import SentenceTransformer
+from tqdm.auto import tqdm
+import pdfplumber
+import docx
+from pptx import Presentation
+import re
+import pandas as pd
+from collections import defaultdict
+import os # Import os for file discovery
+
+# Redefine device to ensure it's accessible
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🔧 الجهاز: {device}")
+
+
+@dataclass
+class KnowledgeNode:
+    id: str
+    type: str  # 'concept', 'file', 'chunk', 'objective'
+    name: str
+    attributes: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class KnowledgeRelationship:
+    source_id: str
+    target_id: str
+    type: str # 'explains', 'part_of', 'prerequisite_for', 'covers', 'related_to', 'is_an_example_of', 'contrasts_with', 'requires_knowledge_from'
+    attributes: Dict[str, Any] = field(default_factory=dict)
+
+
+class KnowledgeGraph:
+    """Simple in-memory Knowledge Graph using dictionaries."""
+    def __init__(self):
+        self.nodes: Dict[str, KnowledgeNode] = {}
+        self.relationships: List[KnowledgeRelationship] = []
+        self._node_counter = 0
+
+    def add_node(self, node: KnowledgeNode):
+        if node.id not in self.nodes:
+            self.nodes[node.id] = node
+
+    def add_relationship(self, relationship: KnowledgeRelationship):
+        # Simple check to avoid duplicate relationships of the same type between the same nodes
+        is_duplicate = any(
+            r.source_id == relationship.source_id and
+            r.target_id == relationship.target_id and
+            r.type == relationship.type
+            for r in self.relationships
+        )
+        if relationship.source_id in self.nodes and relationship.target_id in self.nodes and not is_duplicate:
+            self.relationships.append(relationship)
+        else:
+            pass # Optionally log warning for missing nodes or duplicates
+
+    def get_node(self, node_id: str) -> Optional[KnowledgeNode]:
+        return self.nodes.get(node_id)
+
+    def get_relationships(self, node_id: str = None, rel_type: str = None) -> List[KnowledgeRelationship]:
+        filtered_rels = []
+        for rel in self.relationships:
+            if (node_id is None or rel.source_id == node_id or rel.target_id == node_id) and \
+               (rel_type is None or rel.type == rel_type):
+                filtered_rels.append(rel)
+        return filtered_rels
+
+    def query(self, start_node_id: str = None, relationship_type: str = None, target_node_type: str = None) -> List[Dict]:
+        results = []
+        for rel in self.relationships:
+            if (start_node_id is None or rel.source_id == start_node_id) and \
+               (relationship_type is None or rel.type == relationship_type):
+                target_node = self.get_node(rel.target_id)
+                if target_node and (target_node_type is None or target_node.type == target_node_type):
+                     results.append({
+                         'source': self.get_node(rel.source_id),
+                         'relationship': rel,
+                         'target': target_node
+                     })
+        return results
+
+    def _generate_node_id(self, node_type: str, name: str) -> str:
+        self._node_counter += 1
+        return f"{node_type}_{self._node_counter}_{abs(hash(name))}"
+
+
+class IntelligentTeacher:
+    """المعلم الذكي الذي يستخدم ملفاتك لتعليم النموذج مع Knowledge Graph و Meta-Learning"""
+
+    def __init__(self, teacher_model: str = "microsoft/DialoGPT-large"):
+
+        print(f"🧠 تحميل المعلم الذكي: {teacher_model}")
+
+        # Check if model weights exist locally, otherwise download (simplified)
+        # This check is still needed to avoid re-downloading large models if they persist
+        try:
+            # Try loading tokenizer first (smaller)
+            self.tokenizer = AutoTokenizer.from_pretrained(teacher_model)
+            # Then try loading model (larger) - this might fail if not cached
+            self.model = AutoModelForCausalLM.from_pretrained(
+                teacher_model,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            ).to(device) # Use the global device
+
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            print("✅ تم تحميل النموذج بنجاح.")
+
+        except Exception as e:
+            print(f"❌ خطأ في تحميل النموذج {teacher_model}: {e}")
+            print("⚠️ استخدام نموذج وهمي للمتابعة.")
+            # Define dummy tokenizer and model if loading fails
+            class DummyTokenizer:
+                def __call__(self, prompt, return_tensors, padding, truncation, max_length):
+                    print(f"DummyTokenizer called with prompt: {prompt[:50]}...")
+                    # Return dummy tensor structure
+                    return {'input_ids': torch.randint(0, 1000, (1, min(len(prompt), max_length))), 'attention_mask': torch.ones(1, min(len(prompt), max_length))}
+                @property
+                def eos_token_id(self):
+                    return 50000 # Dummy EOS token id
+                @property
+                def pad_token(self):
+                    return None # Dummy pad token
+
+            class DummyModel:
+                def generate(self, input_ids, attention_mask, max_new_tokens, num_return_sequences, pad_token_id, no_repeat_ngram_size, early_stopping, temperature, top_p):
+                    print("DummyModel generate called.")
+                    # Return a dummy output tensor
+                    dummy_output = torch.randint(0, 1000, (num_return_sequences, input_ids.shape[1] + max_new_tokens))
+                    return dummy_output
+
+            self.tokenizer = DummyTokenizer()
+            self.model = DummyModel()
+            self.device = 'cpu' # Ensure device is cpu for dummy model
+
+
+        self.teaching_memory = {
+            'concepts_taught': set(),
+            'student_profiles': {},
+            'strategy_performance_logs': [], # List of dicts: {'student_id': str, 'content_id': str, 'strategy_used': str, 'outcome': str, 'time_taken': float}
+            'curriculum_effectiveness_feedback': {},
+            'learning_progress': {}
+        }
+
+        self.teaching_strategies = self._init_strategies()
+
+        self.knowledge_graph = KnowledgeGraph()
+
+        self.meta_learning_insights = {
+            'strategy_effectiveness_patterns': {}, # e.g., 'conceptual' works well for 'technical' content for 'beginner' students
+            'common_prerequisite_issues': {}, # e.g., students struggle with concept X if they didn't master concept Y
+            'optimal_sequencing_patterns': {} # e.g., curriculum path A leads to better retention than path B
+        }
+
+    def _init_strategies(self):
+        return {
+            'conceptual': {
+                'name': 'التعليم المفاهيمي',
+                'approach': 'تعليم المفاهيم الأساسية أولاً',
+                'prompt_template': """
+                أنت معلم خبير. اشرح المفهوم التالي بطريقة واضحة ومتدرجة:
+
+                المحتوى من الملف: {content}
+                المفهوم المطلوب: {concept}
+
+                قدم:
+                1. تعريف واضح
+                2. أمثلة عملية من المحتوى
+                3. تطبيقات مختلفة
+                4. أسئلة للتحقق من الفهم
+
+                الشرح:
+                """
+            },
+            'practical': {
+                'name': 'التعليم التطبيقي',
+                'approach': 'التعلم من خلال التطبيق العملي',
+                'prompt_template': """
+                أنت معلم يركز على التطبيق العملي. استخدم هذا المحتوى:
+
+                المحتوى: {content}
+                الهدف: {objective}
+
+                صمم تمريناً عملياً يتضمن:
+                1. مشكلة واقعية
+                2. خطوات الحل باستخدام المحتوى
+                3. أمثلة متدرجة الصعوبة
+                4. معايير تقييم النجاح
+
+                التمرين:
+                """
+            },
+            'adaptive': {
+                'name': 'التعليم التكيفي',
+                'approach': 'التكيف مع مستوى ونمط التعلم',
+                'prompt_template': """
+                أنت معلم تكيفي ذكي. حلل أداء الطالب وقدم التعليم المناسب:
+
+                المحتوى: {content}
+                أداء الطالب السابق: {performance_history}
+                نقاط الضعف: {weaknesses}
+
+                قدم تعليماً مخصصاً يركز على:
+                1. تقوية نقاط الضعف
+                2. البناء على نقاط القوة
+                3. استخدام أسلوب التعلم المفضل
+                4. تدرج مناسب في الصعوبة
+
+                التعليم المخصص:
+                """
+            }
+        }
+
+    # Modify populate_knowledge_graph to add more granular relationships
+    def populate_knowledge_graph(self, knowledge_units: Dict[str, Dict]):
+        print("Building knowledge graph...")
+        file_nodes = {}
+        concept_nodes_map = {} # Map concept name to node ID for easier lookup
+        content_analysis_results = {} # To store deep analysis results needed for relationships
+
+
+        # First, perform deep content analysis to get potential relationships
+        print("Performing deep content analysis for relationship extraction...")
+        for filename, unit in knowledge_units.items():
+             # Use actual LLM call here if model is loaded, or keep simulation
+             content_analysis_results[filename] = self._deep_content_analysis(unit)
+             print(f"  🔍 تحليل عميق لـ: {filename} مكتمل.")
+
+        # Now, populate the graph using knowledge units and deep analysis results
+        print("Populating graph nodes and basic relationships...")
+        for filename, unit in knowledge_units.items():
+            file_node_id = self.knowledge_graph._generate_node_id('file', filename)
+            file_node = KnowledgeNode(id=file_node_id, type='file', name=filename, attributes={'difficulty': unit.get('difficulty_level', 0), 'content_type': unit.get('content_type', 'general'), 'total_length': unit.get('total_length', 0)})
+            self.knowledge_graph.add_node(file_node)
+            file_nodes[filename] = file_node_id
+
+            # Add Chunk nodes and relationships to File
+            chunk_nodes = []
+            for chunk in unit.get('chunks', []):
+                chunk_node_id = self.knowledge_graph._generate_node_id('chunk', f"{filename}_chunk_{chunk.get('chunk_id', 0)}")
+                chunk_node = KnowledgeNode(id=chunk_node_id, type='chunk', name=f"Chunk {chunk.get('chunk_id', 0)} from {filename}", attributes={'text_preview': chunk.get('text', '')[:100] + '...'})
+                self.knowledge_graph.add_node(chunk_node)
+                self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=chunk_node_id, target_id=file_node_id, type='part_of'))
+                chunk_nodes.append(chunk_node) # Keep track of chunk nodes for this file
+
+            # Add Concept nodes and relationships to File and Chunks
+            for concept in unit.get('concepts', []):
+                concept_node_id = concept_nodes_map.get(concept)
+                if concept_node_id is None:
+                    concept_node_id = self.knowledge_graph._generate_node_id('concept', concept)
+                    concept_node = KnowledgeNode(id=concept_node_id, type='concept', name=concept)
+                    self.knowledge_graph.add_node(concept_node)
+                    concept_nodes_map[concept] = concept_node_id
+
+                # Relate concept to the file
+                self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=file_node_id, target_id=concept_node_id, type='covers'))
+
+                # Relate concept to relevant chunks (simplified: relate to all chunks in the file for now)
+                for chunk_node in chunk_nodes:
+                     self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=chunk_node.id, target_id=concept_node_id, type='explains'))
+
+        print("Adding advanced relationships based on analysis...")
+        # --- Advanced Relationships based on Deep Analysis ---
+        # We need to iterate through all nodes (especially concepts and files)
+        # and the content_analysis_results to add relationships.
+
+        # Create reverse maps for easier lookup
+        file_name_to_id = {node.name: node.id for node in self.knowledge_graph.nodes.values() if node.type == 'file'}
+        concept_name_to_id = {node.name: node.id for node in self.knowledge_graph.nodes.values() if node.type == 'concept'}
+
+
+        for filename, analysis in content_analysis_results.items():
+             file_node_id = file_name_to_id.get(filename) # Use the reverse map
+             if not file_node_id:
+                  print(f"  ⚠️ File node not found for filename: {filename}")
+                  continue
+
+             # 1. Prerequisite Relationships
+             prereqs = analysis.get('prerequisites', [])
+             for prereq_text in prereqs:
+                 # Try to find nodes whose name matches or is similar to the prerequisite text.
+                 found_prereq_node_id = None
+
+                 # Check if it's a file name
+                 prereq_file_node_id = file_name_to_id.get(prereq_text)
+                 if prereq_file_node_id:
+                      found_prereq_node_id = prereq_file_node_id
+                 else:
+                      # Check if it's a concept name (simple exact match for now)
+                      prereq_concept_node_id = concept_name_to_id.get(prereq_text)
+                      if prereq_concept_node_id:
+                           found_prereq_node_id = prereq_concept_node_id
+
+                 if found_prereq_node_id and found_prereq_node_id != file_node_id: # Avoid self-loops
+                      self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=file_node_id, target_id=found_prereq_node_id, type='requires_knowledge_from'))
+                      # print(f"  🔗 Added prerequisite relationship: {filename} --(requires_knowledge_from)--> {prereq_text}") # Keep print optional
+                 elif not found_prereq_node_id:
+                      pass # print(f"  ⚠️ Could not link prerequisite '{prereq_text}' from {filename} to an existing graph node.") # Keep print optional
+
+
+             # 2. Related To relationships based on Connections
+             connections = analysis.get('connections', [])
+             for connection_text in connections:
+                  # Similar to prerequisites, try to link connection_text to existing nodes
+                  found_connection_node_id = None
+                  # Check files first
+                  connected_file_node_id = file_name_to_id.get(connection_text)
+                  if connected_file_node_id:
+                       found_connection_node_id = connected_file_node_id
+                  else:
+                       # Check concepts (simple exact match)
+                       connected_concept_node_id = concept_name_to_id.get(connection_text)
+                       if connected_concept_node_id:
+                            found_connection_node_id = connected_concept_node_id
+
+
+                  if found_connection_node_id and found_connection_node_id != file_node_id: # Avoid self-loops
+                       self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=file_node_id, target_id=found_connection_node_id, type='related_to'))
+                       # print(f"  🔗 Added related_to relationship: {filename} --(related_to)--> {connection_text}") # Keep print optional
+                  elif not found_connection_node_id:
+                       pass # print(f"  ⚠️ Could not link connection '{connection_text}' from {filename} to an existing graph node.") # Keep print optional
+
+
+             # 3. Example/Contrast Relationships (Simulated or Rule-Based)
+             # This is complex and would typically require LLM analysis of text or pattern matching within chunks.
+             # For demonstration, let's add 'is_an_example_of' relationships between the first chunk and the first concept in each file,
+             # but only if both exist and the concept node was successfully created.
+             current_file_chunks = [node for node in self.knowledge_graph.nodes.values() if node.type == 'chunk' and node.attributes.get('text_preview', '').startswith(f"Chunk 0 from {filename}")]
+             if current_file_chunks and unit.get('concepts'):
+                 example_chunk_node = current_file_chunks[0] # Pick the first chunk node created for this file
+                 first_concept = unit['concepts'][0] # Pick the first concept from the unit data
+                 first_concept_node_id = concept_name_to_id.get(first_concept) # Get the ID using the map
+
+                 if first_concept_node_id:
+                      self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=example_chunk_node.id, target_id=first_concept_node_id, type='is_an_example_of'))
+                      # print(f"  🔗 Added simulated relationship: {example_chunk_node.name} --(is_an_example_of)--> {first_concept}") # Keep print optional
+
+
+        print(f"Knowledge graph built with {len(self.knowledge_graph.nodes)} nodes and {len(self.knowledge_graph.relationships)} relationships.")
+
+
+    def analyze_knowledge_corpus(self, knowledge_units: Dict[str, Dict]) -> Dict:
+        print("📊 تحليل مجموعة المعرفة باستخدام Knowledge Graph...")
+        # The deep analysis and graph population are now integrated into populate_knowledge_graph
+        # We will call populate_knowledge_graph first.
+        self.populate_knowledge_graph(knowledge_units)
+
+
+        analysis = {
+            'content_map': {}, # Deep analysis results are generated within populate_knowledge_graph now
+            'difficulty_distribution': {},
+            'concept_hierarchy': {},
+            'learning_path': [],
+            'training_priorities': []
+        }
+
+        # Retrieve difficulty levels from file nodes in the populated graph
+        difficulty_levels = [node.attributes.get('difficulty', 0) for node in self.knowledge_graph.nodes.values() if node.type == 'file']
+        analysis['difficulty_distribution'] = {
+            'beginner': len([d for d in difficulty_levels if d < 0.3]),
+            'intermediate': len([d for d in difficulty_levels if 0.3 <= d < 0.7]),
+            'advanced': len([d for d in difficulty_levels if d >= 0.7])
+        }
+
+        # Analyze concept coverage and hierarchy from the populated graph
+        concept_coverage = {}
+        for concept_node in [node for node in self.knowledge_graph.nodes.values() if node.type == 'concept']:
+            # Query for relationships where this concept is the target and source is a file
+            covering_files_rels = self.knowledge_graph.query(start_node_id=None, relationship_type='covers', target_node_type='concept')
+            files_covering_this_concept = [res['source'] for res in covering_files_rels if res['target'] and res['target'].id == concept_node.id and res['source'].type == 'file']
+            concept_coverage[concept_node.name] = len(files_covering_this_concept)
+
+        sorted_concepts = sorted(concept_coverage.items(), key=lambda x: x[1], reverse=True)
+        analysis['concept_hierarchy'] = {
+            'core_concepts': [c[0] for c in sorted_concepts[:min(10, len(sorted_concepts))]],
+            'secondary_concepts': [c[0] for c in sorted_concepts[min(10, len(sorted_concepts)):min(20, len(sorted_concepts))]],
+            'advanced_concepts': [c[0] for c in sorted_concepts[min(20, len(sorted_concepts)):]]
+        }
+
+        # Generate learning path considering the new 'requires_knowledge_from' relationships
+        # This still uses a simple difficulty sort for demonstration, but prerequisites are from the graph
+        sorted_file_nodes = sorted(
+            [node for node in self.knowledge_graph.nodes.values() if node.type == 'file'],
+            key=lambda x: x.attributes.get('difficulty', 0)
+        )
+
+        learning_path = []
+        for i, file_node in enumerate(sorted_file_nodes):
+            filename = file_node.name
+            unit_info = knowledge_units.get(filename, {})
+
+            # Get concepts covered by this file from the graph
+            concepts_covered_by_this_file_rels = self.knowledge_graph.query(start_node_id=file_node.id, relationship_type='covers', target_node_type='concept')
+            key_concepts = [self.knowledge_graph.get_node(res['target'].id).name for res in concepts_covered_by_this_file_rels if res['target']][:5]
+
+            # Get prerequisites from the graph using the 'requires_knowledge_from' relationship type
+            prereqs_from_graph_rels = self.knowledge_graph.query(start_node_id=file_node.id, relationship_type='requires_knowledge_from', target_node_type=None) # Target can be file or concept
+            prereqs = [f"Requires knowledge from {self.knowledge_graph.get_node(res['target'].id).name}" for res in prereqs_from_graph_rels if res['target']]
+
+            # Note: _deep_content_analysis is called within populate_knowledge_graph now,
+            # its results are used to add relationships directly there.
+            # We don't need to re-extract prerequisites here, they are already in the graph.
+
+            step = {
+                'step_number': i + 1,
+                'filename': filename,
+                'content_type': file_node.attributes.get('content_type', 'general'),
+                'difficulty': file_node.attributes.get('difficulty', 0),
+                'key_concepts': key_concepts,
+                'estimated_time': self._estimate_learning_time(unit_info),
+                'prerequisites': prereqs,
+                'learning_objectives': self._generate_step_objectives(unit_info)
+            }
+            learning_path.append(step)
+
+        analysis['learning_path'] = learning_path
+
+        analysis['training_priorities'] = self._determine_training_priorities(analysis)
+
+        # Add learning path steps and objectives to the graph (using updated path)
+        for step in analysis['learning_path']:
+            step_node_id = self.knowledge_graph._generate_node_id('learning_step', f"Step {step['step_number']} - {step['filename']}")
+            step_node = KnowledgeNode(id=step_node_id, type='learning_step', name=f"Step {step['step_number']}", attributes=step)
+            self.knowledge_graph.add_node(step_node)
+
+            file_node_id = None
+            for nid, node in self.knowledge_graph.nodes.items():
+                if node.type == 'file' and node.name == step['filename']:
+                    file_node_id = nid
+                    break
+            if file_node_id:
+                self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=step_node_id, target_id=file_node_id, type='based_on_file'))
+
+            for obj_text in step.get('learning_objectives', []):
+                 obj_node_id = self.knowledge_graph._generate_node_id('objective', obj_text)
+                 obj_node = KnowledgeNode(id=obj_node_id, type='objective', name=obj_text)
+                 self.knowledge_graph.add_node(obj_node)
+                 self.knowledge_graph.add_relationship(KnowledgeRelationship(source_id=step_node_id, target_id=obj_node_id, type='achieves_objective'))
+
+        # Call the performance analysis method
+        self._analyze_performance_logs()
+
+        return analysis
+
+    def create_training_curriculum(self,
+                                   knowledge_analysis: Dict,
+                                   target_competencies: List[str] = None) -> Dict:
+        print("📚 إنشاء منهج التدريب باستخدام Knowledge Graph و Meta-Learning...")
+        curriculum = {
+            'phases': [],
+            'total_duration': 0,
+            'competency_map': {},
+            'assessment_strategy': {},
+            'personalization_rules': {}
+        }
+
+        learning_path = knowledge_analysis.get('learning_path', [])
+        concept_hierarchy = knowledge_analysis.get('concept_hierarchy', {})
+
+        # Phase 1: Foundation
+        foundation_phase_units = [
+            step for step in learning_path
+            if step['difficulty'] < 0.5
+        ]
+        # Meta-learning influence: Suggest initial strategy based on general patterns and meta-learning insights
+        suggested_foundation_strategy = self._suggest_teaching_strategy(
+            phase='foundation',
+            student_profile='general_student_profile', # Placeholder
+            key_concepts=concept_hierarchy.get('core_concepts', []),
+            avg_difficulty=0.3,
+            content_type='educational' # Assume foundational content is educational
+        )
+        foundation_phase = self._create_curriculum_phase(
+            name='الأساسيات والمفاهيم الرئيسية',
+            description='التركيز على فهم المفاهيم الأساسية والمتطلبات المسبقة.',
+            content_units=foundation_phase_units,
+            suggested_strategy=suggested_foundation_strategy,
+            assessment_type='quizzes',
+            key_concepts=concept_hierarchy.get('core_concepts', [])
+        )
+        curriculum['phases'].append(foundation_phase)
+
+        # Phase 2: Application
+        application_phase_units = [
+            step for step in learning_path
+            if 0.3 <= step['difficulty'] < 0.8
+        ]
+        suggested_application_strategy = self._suggest_teaching_strategy(
+            phase='application',
+            student_profile='general_student_profile', # Placeholder
+            key_concepts=concept_hierarchy.get('secondary_concepts', []),
+            avg_difficulty=0.6,
+            content_type='technical' # Assume application content is often technical/practical
+        )
+        application_phase = self._create_curriculum_phase(
+            name='التطبيق والتمارين العملية',
+            description='تطبيق المفاهيم المكتسبة من خلال تمارين عملية وحل مشاكل.',
+            content_units=application_phase_units,
+            suggested_strategy=suggested_application_strategy,
+            assessment_type='exercises',
+            key_concepts=concept_hierarchy.get('secondary_concepts', [])
+        )
+        curriculum['phases'].append(application_phase)
+
+
+        # Phase 3: Advanced/Specialization
+        advanced_phase_units = [
+            step for step in learning_path
+            if step['difficulty'] >= 0.6
+        ]
+        if target_competencies:
+             target_concept_ids = {node.id for node in self.knowledge_graph.nodes.values() if node.type == 'concept' and node.name in target_competencies}
+             relevant_file_ids = set()
+             for concept_id in target_concept_ids:
+                 files_covering_concept_rels = self.knowledge_graph.query(start_node_id=None, relationship_type='covers', target_node_type='concept')
+                 relevant_file_ids.update({res['source'].id for res in files_covering_concept_rels if res['target'] and res['target'].id == concept_id and res['source'].type == 'file'})
+
+             advanced_phase_units = [
+                 step for step in advanced_phase_units
+                 if any(self.knowledge_graph.get_node(node_id) and self.knowledge_graph.get_node(node_id).name == step['filename'] for node_id in relevant_file_ids)
+             ]
+
+        suggested_advanced_strategy = self._suggest_teaching_strategy(
+            phase='advanced',
+            student_profile='general_student_profile', # Placeholder
+            key_concepts=concept_hierarchy.get('advanced_concepts', []),
+            avg_difficulty=0.8,
+            content_type='technical' # Assume advanced content is often technical
+        )
+        advanced_phase = self._create_curriculum_phase(
+            name='التقدم والتخصص',
+            description='التعمق في المواضيع المتقدمة والتخصص في مجالات محددة.',
+            content_units=advanced_phase_units,
+            suggested_strategy=suggested_advanced_strategy,
+            assessment_type='projects_and_discussions',
+            key_concepts=concept_hierarchy.get('advanced_concepts', [])
+        )
+        curriculum['phases'].append(advanced_phase)
+
+        curriculum['assessment_strategy'] = self._design_assessment_strategy(knowledge_analysis)
+        curriculum['total_duration'] = sum(p.get('estimated_duration', 0) for p in curriculum['phases'])
+        curriculum['competency_map'] = self._map_competencies_graph(target_competencies)
+        curriculum['personalization_rules'] = self._define_personalization_rules_meta(knowledge_analysis)
+
+        return curriculum
+
+    def _create_curriculum_phase(self, name: str, description: str, content_units: List[Dict], suggested_strategy: str, assessment_type: str, key_concepts: List[str]) -> Dict:
+        estimated_duration = sum(unit.get('estimated_time', 0) for unit in content_units)
+        return {
+            'name': name,
+            'description': description,
+            'content_units': content_units,
+            'teaching_strategy': suggested_strategy,
+            'assessment_type': assessment_type,
+            'estimated_duration': estimated_duration,
+            'key_concepts': key_concepts
+        }
+
+    def _design_assessment_strategy(self, knowledge_analysis: Dict) -> Dict:
+        return {
+            'overall_approach': 'تقييم مستمر للتأكد من الفهم وإعادة التعليم عند الحاجة.',
+            'methods_per_phase': {
+                'الأساسيات والمفاهيم الرئيسية': 'اختبارات قصيرة وأسئلة فهم.',
+                'التطبيق والتمارين العملية': 'تقييم التمارين العملية وجودة الحلول.',
+                'التقدم والتخصص': 'تقييم المشاريع والمساهمة في المناقشات.'
+            },
+            'feedback_mechanism': 'تقديم ملاحظات تفصيلية على الأداء وتوجيهات للتحسين.',
+            'remediation_strategy': 'تحديد نقاط الضعف وتقديم مواد تعليمية إضافية أو تمارين موجهة.'
+        }
+
+    def _map_competencies_graph(self, target_competencies: List[str] = None) -> Dict:
+        competency_map = {}
+        if target_competencies:
+            for comp in target_competencies:
+                related_concepts = []
+                for concept_node in [node for node in self.knowledge_graph.nodes.values() if node.type == 'concept']:
+                    if comp.lower() in concept_node.name.lower() or concept_node.name.lower() in comp.lower():
+                        related_concepts.append(concept_node.name)
+                competency_map[comp] = related_concepts
+        return competency_map
+
+    # Modify _define_personalization_rules_meta to use meta_learning_insights
+    def _define_personalization_rules_meta(self, knowledge_analysis: Dict) -> Dict:
+        """تحديد قواعد تخصيص التدريب (يمكن تحسينها باستخدام Meta-Learning)"""
+        rules = {
+            'difficulty_adjustment': 'تعديل صعوبة المحتوى والتمارين بناءً على أداء الطالب.',
+            'strategy_selection': 'اختيار استراتيجية التعليم الأنسب بناءً على تفضيلات الطالب وأدائه السابق وأنماط فعالية الاستراتيجيات من بيانات Meta-Learning.',
+            'content_recommendation': 'اقتراح محتوى إضافي بناءً على اهتمامات الطالب ونقاط قوته/ضعفه (باستخدام Knowledge Graph لتحديد الروابط) واقتراحات من Meta-Learning.',
+            'pace_control': 'السماح للطالب بالتحكم في وتيرة التعلم.',
+            'feedback_style': 'تخصيص أسلوب التقييم والملاحظات ليناسب الطالب بناءً على ملفه الشخصي في الذاكرة التعليمية.'
+        }
+
+        # Add meta-learning based adjustments (illustrative)
+        if self.meta_learning_insights.get('strategy_effectiveness_patterns'):
+            rules['strategy_selection'] += " (مُعدّل بناءً على أنماط فعالية الاستراتيجيات المكتشفة: " + json.dumps(self.meta_learning_insights['strategy_effectiveness_patterns'], ensure_ascii=False) + ")"
+
+        if self.meta_learning_insights.get('common_prerequisite_issues'):
+             # Identify content/concepts from common prerequisite issues
+             struggling_items = list(self.meta_learning_insights['common_prerequisite_issues'].keys())
+             if struggling_items:
+                rules['prerequisite_reinforcement'] = f"تقديم مواد أو تمارين إضافية للمفاهيم/المحتوى التي تم تحديدها على أنها تسبب مشاكل متكررة بناءً على بيانات Meta-Learning ({', '.join(struggling_items)})."
+             else:
+                 rules['prerequisite_reinforcement'] = 'تقديم مواد أو تمارين إضافية للمفاهيم الأساسية التي تم تحديدها على أنها تسبب مشاكل متكررة بناءً على بيانات Meta-Learning.'
+
+
+        if self.meta_learning_insights.get('optimal_sequencing_patterns'):
+             rules['sequencing_adjustment'] = "تعديل تسلسل المحتوى بناءً على أنماط التسلسل المثلى المكتشفة من بيانات Meta-Learning."
+        else:
+             rules['sequencing_adjustment'] = "تعديل تسلسل المحتوى بناءً على أنماط التسلسل المثلى المكتشفة من بيانات Meta-Learning." # Default description
+
+        return rules
+
+    # Modify _suggest_teaching_strategy to use meta_learning_insights
+    def _suggest_teaching_strategy(self, phase: str, student_profile: str, key_concepts: List[str], avg_difficulty: float, content_type: str = 'general') -> str:
+        """Suggest a teaching strategy based on phase, student, content, and meta-learning insights."""
+        # print(f"\n🧐 اقتراح استراتيجية لـ: المرحلة '{phase}', نوع المحتوى '{content_type}', الصعوبة {avg_difficulty:.2f}, المفاهيم: {key_concepts[:3]}...") # Keep print optional
+
+        # Check meta-learning insights for patterns related to this content type/difficulty
+        effectiveness_patterns = self.meta_learning_insights.get('strategy_effectiveness_patterns', {})
+        # print(f"  أنماط فعالية الاستراتيجية المتاحة: {effectiveness_patterns}") # Keep print optional
+
+        # Simple logic: if meta-learning suggests a strategy is particularly effective for this content type, favor it.
+        # This is a simplified simulation; a real system would need more granular pattern matching.
+        suggested_strategy = None
+        best_strategy_from_meta = None
+        best_success_rate = -1
+
+        # Find the strategy with the highest success rate in meta-learning insights
+        for strategy, outcome_str in effectiveness_patterns.items():
+            match = re.search(r"معدل النجاح: (\d+\.\d+)", outcome_str)
+            if match:
+                success_rate = float(match.group(1))
+                # Prioritize strategies with higher success rates
+                if success_rate > best_success_rate:
+                    best_success_rate = success_rate
+                    best_strategy_from_meta = strategy
+                # If success rates are equal, prioritize certain strategies (e.g., conceptual for foundation) - simplified
+                elif success_rate == best_success_rate:
+                     if phase == 'foundation' and strategy == 'conceptual':
+                         best_strategy_from_meta = 'conceptual'
+                     elif phase == 'application' and strategy == 'practical':
+                         best_strategy_from_meta = 'practical'
+                     elif phase == 'advanced' and strategy == 'adaptive':
+                         best_strategy_from_meta = 'adaptive'
+
+
+        if best_strategy_from_meta and best_success_rate > 0.7: # Only use meta-learning suggestion if success rate is reasonably high (threshold 0.7)
+             # Further refine based on content type - simple mapping
+             if content_type in ['educational', 'academic'] and best_strategy_from_meta in ['conceptual', 'adaptive']:
+                  suggested_strategy = best_strategy_from_meta
+                  # print(f"  ➡️ Meta-Learning توصي باستراتيجية '{suggested_strategy}' بناءً على أنماط الفعالية ونوع المحتوى.") # Keep print optional
+             elif content_type == 'technical' and best_strategy_from_meta in ['practical', 'adaptive', 'conceptual']: # Technical can sometimes benefit from conceptual
+                  suggested_strategy = best_strategy_from_meta
+                  # print(f"  ➡️ Meta-Learning توصي باستراتيجية '{suggested_strategy}' بناءً على أنماط الفعالية ونوع المحتوى.") # Keep print optional
+             elif content_type == 'business' and best_strategy_from_meta == 'practical':
+                  suggested_strategy = best_strategy_from_meta
+                  # print(f"  ➡️ Meta-Learning توصي باستراتيجية '{suggested_strategy}' بناءً على أنماط الفعالية ونوع المحتوى.") # Keep print optional
+             elif content_type == 'reference' and best_strategy_from_meta == 'conceptual': # For reference material, conceptual might be best
+                  suggested_strategy = best_strategy_from_meta
+                  # print(f"  ➡️ Meta-Learning توصي باستراتيجية '{suggested_strategy}' بناءً على أنماط الفعالية ونوع المحتوى.") # Keep print optional
+             elif content_type == 'general' and best_strategy_from_meta in ['conceptual', 'practical']: # For general content, conceptual or practical might be good
+                  suggested_strategy = best_strategy_from_meta
+                  # print(f"  ➡️ Meta-Learning توصي باستراتيجية '{suggested_strategy}' بناءً على أنماط الفعالية ونوع المحتوى.") # Keep print optional
+             else:
+                 # If meta-learning strategy doesn't seem to fit content type, fall back to best meta strategy regardless
+                 suggested_strategy = best_strategy_from_meta
+                 # print(f"  ➡️ Meta-Learning توصي باستراتيجية '{suggested_strategy}' بناءً على أنماط الفعالية.") # Keep print optional
+
+
+        # Default to phase-based strategy if meta-learning doesn't provide a strong, relevant suggestion
+        if suggested_strategy is None:
+            if phase == 'foundation':
+                suggested_strategy = 'conceptual'
+                # print("  ➡️ لا توجد توصية قوية من Meta-Learning، الافتراضي هو 'conceptual'.") # Keep print optional
+            elif phase == 'application':
+                suggested_strategy = 'practical'
+                # print("  ➡️ لا توجد توصية قوية من Meta-Learning، الافتراضي هو 'practical'.") # Keep print optional
+            elif phase == 'advanced':
+                suggested_strategy = 'adaptive'
+                # print("  ➡️ لا توجد توصية قوية من Meta-Learning، الافتراضي هو 'adaptive'.") # Keep print optional
+            else:
+                suggested_strategy = 'conceptual' # Fallback
+                # print("  ➡️ لا توجد توصية قوية من Meta-Learning، الافتراضي العام هو 'conceptual'.") # Keep print optional
+
+
+        # Further refine based on difficulty (simple example) - can override meta-learning if needed
+        # If content is very hard, maybe adaptive is always preferred regardless of meta-learning patterns
+        if avg_difficulty > 0.8: # Higher threshold for this override
+             if 'adaptive' in self.teaching_strategies:
+                  suggested_strategy = 'adaptive'
+                  # print(f"  ⚠️ المحتوى صعب جداً ({avg_difficulty:.2f})، تم تعديل الاستراتيجية إلى '{suggested_strategy}'.") # Keep print optional
+             elif 'conceptual' in self.teaching_strategies: # If no adaptive, maybe conceptual for very hard
+                  suggested_strategy = 'conceptual'
+                  # print(f"  ⚠️ المحتوى صعب جداً ({avg_difficulty:.2f})، تم تعديل الاستراتيجية إلى '{suggested_strategy}'.") # Keep print optional
+
+
+        # print(f"  ✅ الاستراتيجية المقترحة النهائية: '{suggested_strategy}'") # Keep print optional
+        return suggested_strategy
+
+
+    def _generate_response(self, prompt: str, max_tokens: int) -> str:
+        # Check if using dummy model
+        if isinstance(self.model, DummyModel):
+            # print(f"Using DummyModel for response generation. Prompt: {prompt[:100]}...") # Keep print optional
+            # Simulate a response based on prompt keywords or just a generic response
+            if "الأهداف التعليمية" in prompt or "تحليل" in prompt:
+                 return "الأهداف التعليمية الرئيسية:\n- فهم المفاهيم الأساسية\n- القدرة على التطبيق\n\nالمتطلبات المسبقة للفهم:\n- مفاهيم سابقة\n\nروابط مع مواضيع أخرى:\n- مواضيع ذات صلة"
+            return "استجابة وهمية من النموذج."
+
+        # Original LLM call logic
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(self.device)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    no_repeat_ngram_size=3,
+                    early_stopping=True,
+                    temperature=0.7,
+                    top_p=0.9
+                )
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            if response.startswith(prompt):
+                response = response[len(prompt):].strip()
+            return response
+        except Exception as e:
+            print(f"❌ خطأ في توليد الاستجابة من النموذج: {e}")
+            return f"حدث خطأ في توليد الاستجابة: {e}"
+
+    # Method for deep content analysis - Using simulation for this subtask
+    def _deep_content_analysis(self, knowledge_unit: Dict) -> Dict:
+        """تحليل عميق لوحدة معرفة واحدة باستخدام LLM (يمكن استخدام LLM فعلي هنا)"""
+        content = knowledge_unit['raw_text'] # Not needed for simulation
+
+        # Simulate LLM analysis result structure, including slightly more varied prerequisites and connections
+        filename = knowledge_unit.get('filename', 'المحتوى')
+        concepts = knowledge_unit.get('concepts', []) # Use all concepts extracted by FileProcessor
+
+        simulated_analysis = {
+            'analysis_text': f"Simulated analysis for {filename}",
+            'teaching_objectives': [f"Understand {c}" for c in concepts[:3]], # Use top 3 concepts as objectives
+            'prerequisites': [], # Start with empty, add based on filename for simulation
+            'difficulty_points': [f"Complex concepts in {filename}"] if knowledge_unit.get('difficulty_level', 0) > 0.5 else [],
+            'connections': [] # Start with empty, add based on filename for simulation
+        }
+
+        # Simulate prerequisites and connections based on filename patterns and actual extracted concepts
+        # This helps ensure the simulated links can be matched to existing nodes.
+        if 'advanced_ml_concepts' in filename.lower():
+            # Try to use actual concepts from other files as prerequisites/connections
+            # Look for specific concepts expected to be in other files
+            if 'الذكاء الاصطناعي' in concepts: simulated_analysis['prerequisites'].append('الذكاء الاصطناعي')
+            if 'التعلم الآلي' in concepts: simulated_analysis['prerequisites'].append('التعلم الآلي')
+            # Simulate dependency on intro files - use exact filenames processed
+            simulated_analysis['prerequisites'].append('document_about_ai.txt')
+            simulated_analysis['prerequisites'].append('notes_on_data_science.txt')
+            # Connect to related concepts that might exist in the graph
+            simulated_analysis['connections'].append('الشبكات العصبية') # Should exist as concept
+            simulated_analysis['connections'].append('علم البيانات') # Should exist as concept
+        elif 'notes_on_data_science' in filename.lower():
+             # Use actual concepts from this file or related ones
+             if 'علم البيانات' in concepts: simulated_analysis['prerequisites'].append('علم البيانات') # Requires Data Science concept itself? Maybe basic stats
+             simulated_analysis['prerequisites'].append('الإحصاء الأساسي') # Simulate a generic prerequisite concept
+             # Connect to related concepts/files
+             simulated_analysis['connections'].append('الذكاء الاصطناعي')
+             simulated_analysis['connections'].append('التعلم الآلي')
+        elif 'document_about_ai' in filename.lower():
+             if 'الذكاء الاصطناعي' in concepts: simulated_analysis['prerequisites'].append('الذكاء الاصطناعي') # Requires AI concept itself?
+             # Connect to related concepts
+             simulated_analysis['connections'].append('معالجة اللغة الطبيعية') # NLP
+             simulated_analysis['connections'].append('الرؤية الحاسوبية') # Computer Vision
+             simulated_analysis['connections'].append('الروبوتات') # Robotics
+             simulated_analysis['connections'].append('التعلم الآلي') # AI relates to ML
+        elif 'business_report_summary' in filename.lower():
+             simulated_analysis['prerequisites'].append('مفاهيم الأعمال الأساسية') # Simulate generic business concept
+             simulated_analysis['connections'].append('التسويق')
+             simulated_analysis['connections'].append('التمويل')
+        # Add more specific simulations based on other file names and likely concepts
+        elif 'code_generation_techniques' in filename.lower():
+             simulated_analysis['prerequisites'].append('البرمجة') # Programming concept
+             simulated_analysis['connections'].append('الذكاء الاصطناعي التوليدي') # Generative AI concept
+        elif 'reinforcement learning' in filename.lower() or 'rlagent' in filename.lower(): # Assuming related to advanced_ml_concepts and agent files
+             if 'التعلم المعزز' in concepts: simulated_analysis['prerequisites'].append('التعلم المعزز')
+             simulated_analysis['prerequisites'].append('التعلم الآلي') # ML is prerequisite for RL
+             simulated_analysis['connections'].append('الوكلاء') # Agents concept
+        elif 'agent' in filename.lower() and 'herachitecal' in filename.lower(): # Assuming agent architecture
+             simulated_analysis['prerequisites'].append('وكلاء الذكاء الاصطناعي') # AI Agents concept
+             simulated_analysis['connections'].append('المعمارية') # Architecture concept
+        elif 'generator' in filename.lower(): # Assuming code generation related
+             simulated_analysis['prerequisites'].append('البرمجة')
+             simulated_analysis['connections'].append('توليد الكود')
+
+        # Filter out prerequisites/connections that are the file itself or its own concepts (might happen with broad matches)
+        simulated_analysis['prerequisites'] = [p for p in simulated_analysis['prerequisites'] if p != filename and p not in concepts]
+        simulated_analysis['connections'] = [c for c in simulated_analysis['connections'] if c != filename and c not in concepts and c not in simulated_analysis['prerequisites']]
+
+        # If using actual LLM, uncomment the following and implement parsing
+        # analysis_prompt = f"""أنت محلل محتوى تعليمي خبير. حلل هذا المحتوى بعمق:\n\nالمحتوى: {content[:2000]}\n...\nالتحليل:"""
+        # analysis_response = self._generate_response(analysis_prompt, max_tokens=800)
+        # simulated_analysis['analysis_text'] = analysis_response
+        # simulated_analysis['teaching_objectives'] = self._extract_objectives(analysis_response) # Need to implement parsing
+        # simulated_analysis['prerequisites'] = self._extract_prerequisites(analysis_response) # Need to implement parsing
+        # simulated_analysis['difficulty_points'] = self._extract_difficulties(analysis_response) # Need to implement parsing
+        # simulated_analysis['connections'] = self._extract_connections(analysis_response) # Need to implement parsing
+
+
+        return simulated_analysis # Return simulated analysis
+
+
+    def _extract_objectives(self, analysis_text: str) -> List[str]:
+        # These extraction methods are only needed if using real LLM analysis output
+        return []
+
+    def _extract_prerequisites(self, analysis_text: str) -> List[str]:
+        # These extraction methods are only needed if using real LLM analysis output
+        return []
+
+    def _extract_difficulties(self, analysis_text: str) -> List[str]:
+        # These extraction methods are only needed if using real LLM analysis output
+        return []
+
+    def _extract_connections(self, analysis_text: str) -> List[str]:
+        # These extraction methods are only needed if using real LLM analysis output
+        return []
+
+    def _estimate_learning_time(self, knowledge_unit: Dict) -> int:
+        length_factor = len(knowledge_unit.get('raw_text', '')) / 500
+        difficulty_factor = 1 + knowledge_unit.get('difficulty_level', 0) * 2
+        estimated_time = int(length_factor * difficulty_factor)
+        return max(estimated_time, 5)
+
+    def _generate_step_objectives(self, knowledge_unit: Dict) -> List[str]:
+        filename = knowledge_unit.get('filename', 'المحتوى')
+        concepts = knowledge_unit.get('concepts', [])[:3]
+        objectives = [f"فهم المفاهيم الرئيسية في {filename}"]
+        if concepts:
+             objectives.append(f"التعرف على المفاهيم: {', '.join(concepts)}")
+        objectives.append(f"القدرة على تلخيص المحتوى من {filename}")
+        return objectives
+
+    def _determine_training_priorities(self, analysis: Dict) -> List[Dict]:
+        priorities = []
+        for concept in analysis['concept_hierarchy'].get('core_concepts', []):
+            priorities.append({'item': concept, 'type': 'concept', 'priority': 'عالية'})
+        for step in analysis['learning_path']:
+            if step['difficulty'] >= 0.7:
+                priorities.append({'item': step['filename'], 'type': 'file', 'priority': 'عالية - صعوبة'})
+            if step.get('prerequisites'):
+                 # Prioritize steps with complex prerequisites
+                 priorities.append({'item': step['filename'], 'type': 'file', 'priority': f'متوسطة - يتطلب: {", ".join(step["prerequisites"])}'})
+
+        # Add priority for concepts/content with high failure rate from meta-learning (if any)
+        struggling_content = self.meta_learning_insights.get('common_prerequisite_issues', {})
+        for item, details in struggling_content.items():
+             priorities.append({'item': item, 'type': 'content/concept', 'priority': f'عالية - أظهر الطلاب صعوبة ({details})'})
+
+
+        return priorities
+
+    # Define the method for performance analysis (Simulated)
+    def _analyze_performance_logs(self):
+        """Analyzes performance logs to update meta-learning insights (Simulated)."""
+        # print("\n📈 تحليل سجلات أداء الطلاب (محاكاة)...") # Keep print optional
+
+        logs = self.teaching_memory.get('strategy_performance_logs', [])
+        if not logs:
+            # print("لا توجد سجلات أداء لتحليلها.") # Keep print optional
+            return
+
+        # Simulate Meta-Learning Insights based on some hardcoded logic or aggregated dummy data
+        # This replaces actual complex analysis
+        simulated_effectiveness = {
+            'conceptual': 'معدل النجاح: 0.85',
+            'practical': 'معدل النجاح: 0.60',
+            'adaptive': 'معدل النجاح: 0.75'
+        }
+        simulated_issues = {} # Simulate no common issues for now
+        simulated_sequencing = {'note': 'تحليل أنماط التسلسل المثلى يتطلب تتبع مسارات التعلم للطلاب وتقييم النتائج.'}
+        simulated_student_summary = {'note': 'تحليل أداء الطلاب يتطلب بيانات ملفات تعريف الطلاب وسجلات أكثر تفصيلاً.'}
+
+        # You could add simple aggregation here if needed, e.g., count outcomes per strategy
+        # For this subtask focused on KG, keeping this simple simulation is fine.
+
+
+        self.meta_learning_insights['strategy_effectiveness_patterns'] = simulated_effectiveness
+        self.meta_learning_insights['common_prerequisite_issues'] = simulated_issues
+        self.meta_learning_insights['optimal_sequencing_patterns'] = simulated_sequencing
+        self.meta_learning_insights['student_performance_summary'] = simulated_student_summary
+
+        # print("✅ تحليل سجلات أداء الطلاب (محاكاة) مكتمل. تم تحديث meta_learning_insights.") # Keep print optional
+
+    # New method for code generation
+    def _generate_code(self, request: str, context: Dict[str, Any]) -> str:
+        """
+        Generates code based on a specific request and relevant context.
+
+        Args:
+            request (str): A description of the code to generate.
+            context (Dict[str, Any]): Relevant knowledge from the graph or analysis,
+                                       e.g., {'concepts': [...], 'chunks': [...], 'relationships': [...]}
+
+        Returns:
+            str: The generated code snippet or a descriptive message if generation fails.
+        """
+        print(f"\n💻 Generating code based on request: '{request}'")
+        # This is a placeholder. Actual implementation would involve:
+        # 1. Crafting a detailed prompt for the LLM using the request and context.
+        # 2. Calling the LLM (_generate_response).
+        # 3. Parsing and potentially validating the LLM's response.
+        # 4. Returning the generated code.
+
+        # Simulate code generation based on the request
+        if "RL agent" in request.lower() or "reinforcement learning" in request.lower():
+            simulated_code = """
+import numpy as np
+
+class BasicRLAgent:
+    def __init__(self, state_space_size, action_space_size):
+        self.state_space_size = state_space_size
+        self.action_space_size = action_space_size
+        self.q_table = np.zeros((state_space_size, action_space_size))
+        self.epsilon = 1.0  # Exploration rate
+        self.alpha = 0.1    # Learning rate
+        self.gamma = 0.99   # Discount factor
+
+    def choose_action(self, state):
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(self.action_space_size) # Explore
+        else:
+            return np.argmax(self.q_table[state, :]) # Exploit
+
+    def learn(self, state, action, reward, next_state):
+        predict = self.q_table[state, action]
+        target = reward + self.gamma * np.max(self.q_table[next_state, :])
+        self.q_table[state, action] += self.alpha * (target - predict)
+
+# Example Usage (Simulated Environment)
+# agent = BasicRLAgent(state_space_size=10, action_space_size=4)
+# state = 0
+# action = agent.choose_action(state)
+# ... interact with environment, get reward, next_state ...
+# agent.learn(state, action, reward, next_state)
+"""
+            print("✅ Simulated RL Agent code generated.")
+            return simulated_code
+        elif "Python class" in request.lower():
+            simulated_code = f"""
+class MyGeneratedClass:
+    def __init__(self, name):
+        self.name = name
+        print(f"Class {{self.name}} created.")
+
+    def greet(self):
+        return f"Hello from {{self.name}}!"
+
+# Example Usage:
+# my_instance = MyGeneratedClass("Test")
+# print(my_instance.greet())
+"""
+            print("✅ Simulated Python class code generated.")
+            return simulated_code
+        elif "algorithm" in request.lower():
+            simulated_code = """
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]
+    left = [x for x in arr if x < pivot]
+    middle = [x for x in arr if x == pivot]
+    right = [x for x in arr if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+
+# Example Usage:
+# my_list = [3, 6, 8, 10, 1, 2, 1]
+# sorted_list = quicksort(my_list)
+# print("Sorted list:", sorted_list)
+"""
+            print("✅ Simulated algorithm code generated.")
+            return simulated_code
+        elif "equation" in request.lower() or "formula" in request.lower():
+            simulated_code = """
+# Pythagorean theorem: a^2 + b^2 = c^2
+# In Python:
+import math
+
+def calculate_hypotenuse(a, b):
+  return math.sqrt(a**2 + b**2)
+
+# Example:
+# side_a = 3
+# side_b = 4
+# hypotenuse = calculate_hypotenuse(side_a, side_b)
+# print(f"Hypotenuse of a right triangle with sides {side_a} and {side_b} is {hypotenuse}")
+"""
+            print("✅ Simulated equation/formula code generated.")
+            return simulated_code
+        elif "helper" in request.lower():
+             simulated_code = """
+def clean_text(text):
+    # Basic text cleaning helper function
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    return text.strip()
+
+# Example Usage:
+# dirty_string = "  Hello, World! 123 "
+# cleaned_string = clean_text(dirty_string)
+# print("Cleaned text:", cleaned_string)
+"""
+             print("✅ Simulated helper function code generated.")
+             return simulated_code
+        elif "vector" in request.lower() or "matrix" in request.lower():
+             simulated_code = """
+import numpy as np
+
+# Create a vector
+vector = np.array([1, 2, 3])
+print("Vector:", vector)
+
+# Create a matrix
+matrix = np.array([[1, 2], [3, 4], [5, 6]])
+print("Matrix:\\n", matrix)
+
+# Matrix multiplication
+# matrix_A = np.array([[1, 2], [3, 4]])
+# matrix_B = np.array([[5, 6], [7, 8]])
+# result = np.dot(matrix_A, matrix_B)
+# print("Matrix multiplication result:\\n", result)
+"""
+             print("✅ Simulated vector/matrix code generated.")
+             return simulated_code
+        else:
+            simulated_code = f"""
+# Simulated code snippet for: {request}
+# This is a generic placeholder.
+# The actual code generation would be done by an LLM.
+
+def generated_function():
+    pass # Implement the logic here
+"""
+            print(f"✅ Simulated generic code generated for '{request}'.")
+            return simulated_code
+
+
+# --- File Discovery and Processing ---
+# Define the directory path
+content_directory = '/content/'
+
+# Get a list of all files and directories in the path
+all_items = os.listdir(content_directory)
+
+# Filter to include only files
+all_files = [item for item in all_items if os.path.isfile(os.path.join(content_directory, item))]
+
+# Create an empty dictionary to store file contents
+uploaded_files = {}
+
+# Instantiate the FileProcessor class
+file_processor = FileProcessor()
+
+# Iterate through the files, read their content, and process them
+print(f"Scanning directory: {content_directory}")
+for filename in all_files:
+    file_path = os.path.join(content_directory, filename)
+    try:
+        # Read file content in binary mode
+        with open(file_path, 'rb') as f:
+            file_content_bytes = f.read()
+        # print(f"✅ Read file: {filename}") # Keep print optional
+        # Process the file content using the FileProcessor
+        # The FileProcessor's process_uploaded_files expects a dict of filename: content
+        # We process files one by one here, so create a temporary dict for each file
+        processed_unit = file_processor.process_uploaded_files({filename: file_content_bytes})
+        # Merge the processed unit into the main extracted_knowledge dictionary
+        # Ensure we only merge if processing was successful and returned a knowledge unit
+        if processed_unit:
+             if 'extracted_knowledge' not in locals():
+                  extracted_knowledge = {} # Initialize if it doesn't exist
+             extracted_knowledge.update(processed_unit)
+
+    except Exception as e:
+        print(f"❌ Error reading or processing file {filename}: {e}")
+
+print(f"\nFinished scanning and processing. Processed {len(extracted_knowledge) if 'extracted_knowledge' in locals() else 0} supported files.")
+
+
+# --- Knowledge Graph Enrichment ---
+# Instantiate the IntelligentTeacher class
+# Check if extracted_knowledge is already available from the previous step
+if 'extracted_knowledge' not in locals() or not extracted_knowledge:
+     print("\nNo supported files were processed. Cannot build Knowledge Graph.")
+else:
+    teacher = IntelligentTeacher()
+
+    # Populate the knowledge graph using the extracted_knowledge
+    # This will also trigger deep content analysis (simulated) and the addition of advanced relationships
+    teacher.populate_knowledge_graph(extracted_knowledge)
+
+    # Print graph statistics
+    print(f"\nKnowledge Graph Statistics:")
+    print(f"Number of Nodes: {len(teacher.knowledge_graph.nodes)}")
+    print(f"Number of Relationships: {len(teacher.knowledge_graph.relationships)}")
+
+    # Query the graph for specific relationships to confirm they were added
+    print("\nQuerying for 'requires_knowledge_from' relationships:")
+    prereq_rels = teacher.knowledge_graph.get_relationships(rel_type='requires_knowledge_from')
+    if prereq_rels:
+        for rel in prereq_rels:
+            source_node = teacher.knowledge_graph.get_node(rel.source_id)
+            target_node = teacher.knowledge_graph.get_node(rel.target_id)
+            if source_node and target_node:
+                print(f"- {source_node.name} --({rel.type})--> {target_node.name} (Type: {target_node.type})")
+    else:
+        print("No 'requires_knowledge_from' relationships found.")
+
+    print("\nQuerying for 'is_an_example_of' relationships:")
+    example_rels = teacher.knowledge_graph.get_relationships(rel_type='is_an_example_of')
+    if example_rels:
+        for rel in example_rels:
+            source_node = teacher.knowledge_graph.get_node(rel.source_id)
+            target_node = teacher.knowledge_graph.get_node(rel.target_id)
+            if source_node and target_node:
+                print(f"- {source_node.name} --({rel.type})--> {target_node.name}")
+    else:
+        print("No 'is_an_example_of' relationships found.")
+
+    print("\nQuerying for 'related_to' relationships:")
+    related_rels = teacher.knowledge_graph.get_relationships(rel_type='related_to')
+    if related_rels:
+        for rel in related_rels:
+            source_node = teacher.knowledge_graph.get_node(rel.source_id)
+            target_node = teacher.knowledge_graph.get_node(rel.target_id)
+            if source_node and target_node:
+                print(f"- {source_node.name} --({rel.type})--> {target_node.name} (Type: {target_node.type})")
+    else:
+        print("No 'related_to' relationships found.")
+
+    # --- Demonstrate Code Generation (Simulated) ---
+    print("\n--- Demonstrating Simulated Code Generation ---")
+
+    # Simulate a request for an RL agent
+    rl_agent_request = "generate a Python class for a basic RL agent"
+    # In a real scenario, we would gather relevant context (concepts, related files)
+    # For this simulation, we'll just pass an empty context or relevant concepts
+    rl_context = {'concepts': ['Reinforcement Learning', 'Agent', 'Q-Learning']}
+    generated_rl_code = teacher._generate_code(rl_agent_request, rl_context)
+    print(f"\nGenerated Code for RL Agent:\n```python\n{generated_rl_code}\n```")
+
+    # Simulate a request for a helper function
+    helper_request = "generate a Python helper function for text cleaning"
+    helper_context = {'concepts': ['Text Processing', 'Cleaning Data']}
+    generated_helper_code = teacher._generate_code(helper_request, helper_context)
+    print(f"\nGenerated Code for Text Helper:\n```python\n{generated_helper_code}\n```")
+
+    # Simulate a request for an algorithm
+    algorithm_request = "generate a Python implementation of the quicksort algorithm"
+    algorithm_context = {'concepts': ['Algorithm', 'Sorting']}
+    generated_algorithm_code = teacher._generate_code(algorithm_request, algorithm_context)
+    print(f"\nGenerated Code for Quicksort Algorithm:\n```python\n{generated_algorithm_code}\n```")
+
+    # Simulate a request for a mathematical equation
+    equation_request = "provide Python code for the Pythagorean theorem"
+    equation_context = {'concepts': ['Geometry', 'Pythagorean Theorem']}
+    generated_equation_code = teacher._generate_code(equation_request, equation_context)
+    print(f"\nGenerated Code for Pythagorean Theorem:\n```python\n{generated_equation_code}\n```")
+
+    # Simulate a request for a generic code snippet
+    generic_request = "generate a basic loop iterating 10 times"
+    generic_context = {}
+    generated_generic_code = teacher._generate_code(generic_request, generic_context)
+    print(f"\nGenerated Generic Code:\n```python\n{generated_generic_code}\n```")

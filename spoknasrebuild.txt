@@ -1,0 +1,574 @@
+
+---
+
+File: requirements.txt
+
+torch>=2.1 torchvision numpy scikit-learn tqdm pyyaml matplotlib pandas wandb transformers peft accelerate faiss-cpu safetensors pytest black isort
+
+
+---
+
+File: config.yaml
+
+defaults: profile: gpu16
+
+profiles: cpu_small: device: cpu pop_size: 8 generations: 10 num_islands: 2 migrate_every: 4 migration_k: 1 epochs_proxy: 1 epochs_full: 8 multi_fidelity: true surrogate_warmup: 40 batch_size: 64
+
+colab_8gb: device: cuda gpu_mem_gb: 8 pop_size: 12 generations: 12 num_islands: 2 migrate_every: 4 migration_k: 1 epochs_proxy: 2 epochs_full: 10 multi_fidelity: true surrogate_warmup: 50 batch_size: 64
+
+gpu16: device: cuda gpu_mem_gb: 16 pop_size: 24 generations: 20 num_islands: 4 migrate_every: 5 migration_k: 2 epochs_proxy: 3 epochs_full: 12 multi_fidelity: true surrogate_warmup: 80 batch_size: 128
+
+logging: wandb: true project: spoknas-experiments-v2 save_checkpoints_every_gen: 5 out_dir: results/
+
+fitness: w_accuracy: 1.0 w_params: 0.12 w_flops: 0.18 rf_bonus_coef: 0.25
+
+surrogate: enabled: true model: random_forest n_estimators: 200 acquisition: ei retrain_every: 5
+
+optimizer: mutation_rate: 0.06 crossover_rate: 0.6 elitism: 2 max_genome_len: 16 layer_library: - conv3x3-16 - conv3x3-32 - conv3x3-64 - sep_conv3x3-32 - sep_conv3x3-64 - pool-max - pool-avg - bn - relu - flatten - global_pool_avg - fc-64 - fc-128
+
+
+---
+
+File: src/spoknas/utils.py
+
+"""Utilities: vectorized helpers, pairwise distances, serialization, timing""" from future import annotations import numpy as np import time from typing import Tuple
+
+def now_ms() -> float: return time.time() * 1000.0
+
+def as_f32_contiguous(x: np.ndarray) -> np.ndarray: return np.ascontiguousarray(x, dtype=np.float32)
+
+def pairwise_sq_dists(X: np.ndarray, Y: np.ndarray) -> np.ndarray: """Compute pairwise squared euclidean distances between X (n,d) and Y (m,d).""" X = as_f32_contiguous(X) Y = as_f32_contiguous(Y) X2 = np.sum(X * X, axis=1).reshape(-1, 1) Y2 = np.sum(Y * Y, axis=1).reshape(1, -1) XY = X @ Y.T d2 = X2 + Y2 - 2.0 * XY return np.maximum(d2, 0.0)
+
+def cosine_sim_matrix(X: np.ndarray, Y: np.ndarray) -> np.ndarray: Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12) Yn = Y / (np.linalg.norm(Y, axis=1, keepdims=True) + 1e-12) return Xn @ Yn.T
+
+
+---
+
+File: src/spoknas/model_builder.py
+
+"""Robust genome -> PyTorch model builder. Improved: supports config-driven modules and optional dropouts.""" from dataclasses import dataclass from typing import List, Optional import torch import torch.nn as nn
+
+@dataclass class Genome: architecture: List[str] lr: float = 1e-3 wd: float = 5e-4 batch_size: int = 128 meta: Optional[dict] = None
+
+class SimpleNet(nn.Module): def init(self, layers: nn.Module): super().init() self.net = layers
+
+def forward(self, x):
+    return self.net(x)
+
+def _conv_layer(cin, cout, k=3, stride=1, padding=None): if padding is None: padding = k // 2 return nn.Conv2d(cin, cout, kernel_size=k, stride=stride, padding=padding)
+
+def build_model_from_genome(genome: Genome, in_channels=3, num_classes=10, use_dropout=False) -> nn.Module: modules = [] cur_c = in_channels is_flat = False used_lazy = False
+
+for token in genome.architecture:
+    t = token.lower().strip()
+    if is_flat and (t.startswith('conv') or t.startswith('pool') or t == 'bn'):
+        continue
+
+    if t.startswith('conv'):
+        parts = t.split('-')
+        k = 3
+        if '5' in parts[0]:
+            k = 5
+        out_ch = int(parts[1]) if len(parts) > 1 else cur_c
+        modules.append(_conv_layer(cur_c, out_ch, k=k))
+        modules.append(nn.ReLU(inplace=True))
+        cur_c = out_ch
+        is_flat = False
+
+    elif t.startswith('sep_conv'):
+        parts = t.split('-')
+        k = 3
+        out_ch = int(parts[1]) if len(parts) > 1 else cur_c
+        modules.append(nn.Conv2d(cur_c, cur_c, kernel_size=k, padding=k//2, groups=cur_c))
+        modules.append(nn.ReLU(inplace=True))
+        modules.append(nn.Conv2d(cur_c, out_ch, kernel_size=1))
+        modules.append(nn.ReLU(inplace=True))
+        cur_c = out_ch
+        is_flat = False
+
+    elif t == 'pool-max':
+        modules.append(nn.MaxPool2d(2))
+        is_flat = False
+
+    elif t == 'pool-avg':
+        modules.append(nn.AvgPool2d(2))
+        is_flat = False
+
+    elif t == 'global_pool_avg':
+        modules.append(nn.AdaptiveAvgPool2d((1, 1)))
+        modules.append(nn.Flatten())
+        is_flat = True
+
+    elif t == 'relu':
+        modules.append(nn.ReLU(inplace=True))
+
+    elif t == 'bn':
+        if not is_flat:
+            modules.append(nn.BatchNorm2d(cur_c))
+        else:
+            modules.append(nn.BatchNorm1d(cur_c if isinstance(cur_c, int) else 1))
+
+    elif t == 'flatten':
+        modules.append(nn.Flatten())
+        is_flat = True
+
+    elif t.startswith('fc'):
+        parts = t.split('-')
+        out_dim = int(parts[1]) if len(parts) > 1 else 128
+        if not is_flat:
+            modules.append(nn.AdaptiveAvgPool2d((1, 1)))
+            modules.append(nn.Flatten())
+            is_flat = True
+        modules.append(nn.LazyLinear(out_dim))
+        modules.append(nn.ReLU(inplace=True))
+        if use_dropout:
+            modules.append(nn.Dropout(0.2))
+        used_lazy = True
+        cur_c = out_dim
+
+    else:
+        # ignore unknown tokens but log could be added
+        continue
+
+if not is_flat:
+    modules.append(nn.AdaptiveAvgPool2d((1, 1)))
+    modules.append(nn.Flatten())
+    modules.append(nn.Linear(cur_c, num_classes))
+else:
+    last_mod = modules[-1] if modules else None
+    if not isinstance(last_mod, nn.Linear) and not isinstance(last_mod, nn.LazyLinear):
+        modules.append(nn.Linear(cur_c, num_classes))
+
+model = SimpleNet(nn.Sequential(*modules))
+model._meta = {'used_lazy_linear': used_lazy}
+return model
+
+
+---
+
+File: src/spoknas/fitness.py
+
+"""evaluate_multifidelity: rewritten to use batched evaluation on torch when possible and vectorized metrics.""" from future import annotations import math import warnings import numpy as np import torch from torch.utils.data import DataLoader, TensorDataset, Subset from .model_builder import build_model_from_genome, Genome from .utils import as_f32_contiguous
+
+def count_parameters(model: torch.nn.Module) -> int: return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def evaluate_model_quick_torch(model: torch.nn.Module, device: torch.device, loader: DataLoader): model.eval() total = 0 correct = 0 running_loss = 0.0 loss_fn = torch.nn.CrossEntropyLoss(reduction='sum') with torch.no_grad(): for xb, yb in loader: xb = xb.to(device, non_blocking=True) yb = yb.to(device, non_blocking=True) out = model(xb) loss = loss_fn(out, yb) running_loss += loss.item() preds = out.argmax(dim=1) correct += (preds == yb).sum().item() total += xb.size(0) if total == 0: return 0.0, 0.0 return running_loss / total, correct / total
+
+def estimate_receptive_field(genome: Genome, input_size=32) -> int: rf = 1 stride_acc = 1 for tok in genome.architecture: if tok.startswith('conv') or tok.startswith('sep_conv'): parts = tok.split('-') k = 3 if '5' in parts[0]: k = 5 rf = rf + (k - 1) * stride_acc elif tok.startswith('pool'): stride_acc *= 2 rf = rf + (2 - 1) * stride_acc return int(rf)
+
+def estimate_flops_params(genome: Genome, input_size=32, in_channels=3): # same as before (kept), returns flops, params flops = 0 params = 0 cur_c = in_channels h = w = input_size for tok in genome.architecture: if tok.startswith('conv'): parts = tok.split('-') k = 3 if '5' in parts[0]: k = 5 out_ch = int(parts[1]) if len(parts) > 1 else cur_c kernel_area = k * k fl = kernel_area * cur_c * out_ch * h * w * 2 pa = cur_c * out_ch * kernel_area flops += fl params += pa cur_c = out_ch elif tok.startswith('sep_conv'): parts = tok.split('-') k = 3 out_ch = int(parts[1]) if len(parts) > 1 else cur_c kernel_area = k * k fl = kernel_area * cur_c * h * w * 2 + cur_c * out_ch * h * w * 2 pa = cur_c * kernel_area + cur_c * out_ch flops += fl params += pa cur_c = out_ch elif tok.startswith('pool'): h = max(1, h // 2) w = max(1, w // 2) elif tok.startswith('fc'): parts = tok.split('-') out_dim = int(parts[1]) fl = cur_c * out_dim * 2 pa = cur_c * out_dim flops += fl params += pa cur_c = out_dim return flops, params
+
+def composite_fitness_from_metrics(val_acc, params_est, flops, rf, input_size=32, w_accuracy=1.0, w_params=0.12, w_flops=0.18, rf_bonus_coef=0.25): param_pen = 1.0 / (1.0 + math.log1p(params_est)) flops_pen = 1.0 / (1.0 + math.log1p(flops / 1e6 + 1.0)) rf_bonus = 1.0 + rf_bonus_coef * min(1.0, rf / (input_size // 2 + 1)) fitness = (val_acc ** w_accuracy) * (param_pen ** w_params) * (flops_pen ** w_flops) * rf_bonus return float(fitness)
+
+def evaluate_multifidelity(genome_dict, data_manager, train_idx, val_idx, device=None, epochs_proxy=2, epochs_full=12, use_full=False, verbose=False, fitness_cfg=None): device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')) try: genome = Genome(**genome_dict) if not isinstance(genome_dict, Genome) else genome_dict X = data_manager.x_full Y = data_manager.y_full X_arr = np.array(X) # convert to CHW if X_arr.ndim == 4 and X_arr.shape[-1] in (1, 3): X_t = torch.tensor(np.transpose(X_arr, (0, 3, 1, 2)), dtype=torch.float32) else: X_t = torch.tensor(X_arr, dtype=torch.float32) Y_t = torch.tensor(np.array(Y), dtype=torch.long)
+
+if len(train_idx) == 0 or len(val_idx) == 0:
+        return {'fitness': 0.0, 'val_acc': 0.0, 'params': 0, 'flops': 0, 'rf': 0}
+
+    train_loader = DataLoader(Subset(TensorDataset(X_t, Y_t), train_idx), batch_size=genome.batch_size, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(Subset(TensorDataset(X_t, Y_t), val_idx), batch_size=256, shuffle=False, pin_memory=True)
+
+    model = build_model_from_genome(genome, in_channels=X_t.shape[1], num_classes=int(Y_t.max().item()) + 1, use_dropout=True).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=genome.lr, weight_decay=genome.wd)
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    best_val_acc = 0.0
+    epochs = epochs_full if use_full else epochs_proxy
+    for epoch in range(epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            loss.backward()
+            optimizer.step()
+        val_loss, val_acc = evaluate_model_quick_torch(model, device, val_loader)
+        best_val_acc = max(best_val_acc, val_acc)
+        if verbose:
+            print(f"epoch {epoch+1}/{epochs} val_acc={val_acc:.4f}")
+
+    rf = estimate_receptive_field(genome, input_size=X_t.shape[-1])
+    flops, params_est = estimate_flops_params(genome, input_size=X_t.shape[-1], in_channels=X_t.shape[1])
+    cfg = fitness_cfg or {}
+    fitness = composite_fitness_from_metrics(best_val_acc, params_est, flops, rf, input_size=X_t.shape[-1], **cfg)
+
+    return {'fitness': float(fitness), 'val_acc': float(best_val_acc), 'params': int(params_est), 'flops': int(flops), 'rf': int(rf)}
+
+except Exception as e:
+    warnings.warn(f"fitness error: {e}")
+    return {'fitness': 0.0, 'val_acc': 0.0, 'params': 0, 'flops': 0, 'rf': 0}
+
+
+---
+
+File: src/spoknas/optimizer.py
+
+"""SpokNASOptimizer: vectorized surrogate training, islands, checkpoints, robust logging.""" from future import annotations import os import pickle import random import warnings from copy import deepcopy from typing import List import numpy as np from types import SimpleNamespace from .utils import as_f32_contiguous
+
+class SpokNASOptimizer: def init(self, layer_lib: List[str], fitness_fn, population_size: int = 24, elitism: int = 2, mutation_rate: float = 0.06, crossover_rate: float = 0.6, surrogate_enabled: bool = False, surrogate_model=None): self.layer_lib = layer_lib self.fitness_fn = fitness_fn self.population_size = population_size self.elitism = elitism self.mutation_rate = mutation_rate self.crossover_rate = crossover_rate self.best_individual = None self.surrogate_enabled = surrogate_enabled self.surrogate_model = surrogate_model self.surrogate_data_X = [] self.surrogate_data_y = []
+
+def _random_genome(self):
+    arch = [random.choice(self.layer_lib) for _ in range(random.randint(3, 10))]
+    if not any(t.startswith('fc') for t in arch):
+        arch += ['flatten', 'fc-128']
+    return {'genome': {'architecture': arch, 'lr': 10 ** random.uniform(-4, -2), 'wd': 10 ** random.uniform(-6, -3), 'batch_size': random.choice([64, 128])}, 'fitness': None}
+
+def _random_individual(self):
+    return self._random_genome()
+
+def _genome_to_feature_vector(self, genome_dict):
+    arch = genome_dict['architecture']
+    length = len(arch)
+    num_conv = sum(1 for t in arch if t.startswith('conv') or t.startswith('sep_conv'))
+    num_fc = sum(1 for t in arch if t.startswith('fc'))
+    counts = []
+    for t in arch:
+        if '-' in t:
+            try:
+                counts.append(float(t.split('-')[1]))
+            except:
+                pass
+    avg_channels = float(np.mean(counts)) if counts else 0.0
+    return [length, num_conv, num_fc, avg_channels, genome_dict['lr'], genome_dict['wd'], genome_dict['batch_size']]
+
+def _crossover(self, g1, g2):
+    a1 = g1['architecture']; a2 = g2['architecture']
+    if len(a1) < 2 or len(a2) < 2:
+        child_arch = a1
+    else:
+        p1 = random.randint(1, len(a1)-1); p2 = random.randint(1, len(a2)-1)
+        child_arch = a1[:p1] + a2[p2:]
+    child = {'architecture': child_arch[:16], 'lr': (g1['lr'] + g2['lr']) / 2.0, 'wd': g1['wd'], 'batch_size': random.choice([64,128])}
+    return child
+
+def _mutate(self, genome_dict):
+    arch = genome_dict['architecture'][:]
+    if random.random() < self.mutation_rate:
+        op = random.choice(['add', 'del', 'swap'])
+        if op == 'add' and len(arch) < 16:
+            arch.insert(random.randint(0, len(arch)), random.choice(self.layer_lib))
+        elif op == 'del' and len(arch) > 3:
+            del arch[random.randint(0, len(arch)-1)]
+        elif op == 'swap' and len(arch) > 1:
+            i, j = random.sample(range(len(arch)), 2); arch[i], arch[j] = arch[j], arch[i]
+    lr = genome_dict['lr'] * (10 ** random.uniform(-0.1, 0.1)) if random.random() < self.mutation_rate else genome_dict['lr']
+    return {'architecture': arch, 'lr': lr, 'wd': genome_dict['wd'], 'batch_size': genome_dict.get('batch_size', 64)}
+
+def _evaluate_individual(self, individual, *args, **kwargs):
+    try:
+        genome = individual['genome']
+        res = self.fitness_fn(genome, *args, **kwargs)
+        individual.update(res)
+        return individual
+    except Exception as e:
+        warnings.warn(f"eval failure: {e}")
+        individual.update({'fitness': 0.0, 'val_acc': 0.0, 'params': 0})
+        return individual
+
+def _batch_feature_matrix(self, individuals: List[dict]) -> np.ndarray:
+    feats = [self._genome_to_feature_vector(ind['genome']) for ind in individuals]
+    return as_f32_contiguous(np.vstack(feats))
+
+def run_with_controller(self, generations=20, num_islands=4, migrate_every=5, migration_k=2, controller=None, *args, **kwargs):
+    population = [self._random_individual() for _ in range(self.population_size)]
+    islands = [[] for _ in range(num_islands)]
+    for i, ind in enumerate(population):
+        islands[i % num_islands].append(ind)
+
+    # initial evaluation
+    for isl in islands:
+        for ind in isl:
+            self._evaluate_individual(ind, *args, **kwargs)
+    # store surrogate data
+    all_inds = [ind for isl in islands for ind in isl]
+    X = self._batch_feature_matrix(all_inds)
+    y = np.array([ind.get('fitness', 0.0) for ind in all_inds], dtype=np.float32)
+    self.surrogate_data_X.append(X)
+    self.surrogate_data_y.append(y)
+
+    history = []
+    best = None
+    for gen in range(1, generations + 1):
+        for i_idx, isl in enumerate(islands):
+            isl.sort(key=lambda x: x.get('fitness', -1e9), reverse=True)
+            elites = isl[:self.elitism]
+            new_pop = elites[:]
+            while len(new_pop) < len(isl):
+                p1 = max(random.sample(isl, min(3, len(isl))), key=lambda x: x.get('fitness', -1e9))
+                p2 = max(random.sample(isl, min(3, len(isl))), key=lambda x: x.get('fitness', -1e9))
+                child_genome = self._crossover(p1['genome'], p2['genome'])
+                child_genome = self._mutate(child_genome)
+                child = {'genome': child_genome}
+                child = self._evaluate_individual(child, *args, **kwargs)
+                new_pop.append(child)
+            islands[i_idx] = new_pop
+
+        # migration
+        if migrate_every and gen % migrate_every == 0 and num_islands > 1:
+            migrants = [sorted(isl, key=lambda x: x.get('fitness', -1e9), reverse=True)[:migration_k] for isl in islands]
+            for i_idx in range(len(islands)):
+                dest = (i_idx + 1) % len(islands)
+                islands[dest][-migration_k:] = [deepcopy(m) for m in migrants[i_idx]]
+
+        # update surrogate dataset every few gens
+        all_inds = [ind for isl in islands for ind in isl]
+        X = self._batch_feature_matrix(all_inds)
+        y = np.array([ind.get('fitness', 0.0) for ind in all_inds], dtype=np.float32)
+        self.surrogate_data_X.append(X)
+        self.surrogate_data_y.append(y)
+
+        if self.surrogate_enabled and self.surrogate_model is not None and len(self.surrogate_data_X) > 0:
+            Xall = np.vstack(self.surrogate_data_X)
+            yall = np.concatenate(self.surrogate_data_y)
+            try:
+                self.surrogate_model.fit(Xall, yall)
+            except Exception:
+                pass
+
+        # global snapshot
+        all_inds = [ind for isl in islands for ind in isl]
+        all_inds.sort(key=lambda x: x.get('fitness', -1e9), reverse=True)
+        best = deepcopy(all_inds[0])
+        history.append(best.get('fitness', 0.0))
+
+    self.best_individual = best
+    return best, history
+
+
+---
+
+File: src/grid_analysis/callbacks.py
+
+"""Improved GridAnalysisCallback: robust path handling, run on save/train_end, optional wandb/CSV push.""" import os import pandas as pd import numpy as np import matplotlib.pyplot as plt import scipy.stats as stats from transformers import TrainerCallback
+
+plt.rcParams.update({'figure.figsize': (8,5)})
+
+class GridAnalysisCallback(TrainerCallback): def init(self, raw_csv='grid_raw_results.csv', summary_csv='grid_summary.csv', run_on='train_end', push_to_wandb=False): self.raw_csv = raw_csv self.summary_csv = summary_csv assert run_on in ('train_end', 'on_save') self.run_on = run_on self.push_to_wandb = push_to_wandb
+
+def _get_path(self, args, fname):
+    if os.path.isabs(fname) or os.path.exists(fname):
+        return fname
+    return os.path.join(args.output_dir, fname)
+
+def _run_analysis(self, args):
+    RAW_CSV = self._get_path(args, self.raw_csv)
+    SUMMARY_CSV = self._get_path(args, self.summary_csv)
+    out_dir = args.output_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not os.path.exists(RAW_CSV):
+        print(f"[GridAnalysisCallback] {RAW_CSV} not found, skipping")
+        return
+
+    raw = pd.read_csv(RAW_CSV)
+    if os.path.exists(SUMMARY_CSV):
+        summary = pd.read_csv(SUMMARY_CSV)
+    else:
+        summary = raw.groupby(['cs', 'neumann_steps', 'echo_freq', 'lr']).agg(
+            mean_val_acc=('final_val_acc', 'mean'),
+            std_val_acc=('final_val_acc', 'std'),
+            mean_train_loss=('final_train_loss', 'mean'),
+            std_train_loss=('final_train_loss', 'std'),
+            n_runs=('final_val_acc', 'count'),
+            avg_time_s=('time_s', 'mean')
+        ).reset_index()
+
+    summary_sorted = summary.sort_values(['cs', 'neumann_steps', 'echo_freq', 'lr'])
+    xlabels = summary_sorted.apply(lambda r: f"cs={r.cs}\nN={int(r.neumann_steps)} f={int(r.echo_freq)}", axis=1)
+    means = summary_sorted['mean_val_acc']
+    stds = summary_sorted['std_val_acc'].fillna(0.0)
+
+    plt.figure()
+    plt.bar(range(len(means)), means, yerr=stds, capsize=4)
+    plt.xticks(range(len(means)), xlabels, rotation=45, ha='right')
+    plt.ylabel('Mean val accuracy')
+    plt.title('Mean val accuracy per config (errorbars = std)')
+    plt.tight_layout()
+    img1 = os.path.join(out_dir, 'mean_val_acc_by_config.png')
+    plt.savefig(img1, dpi=150)
+    plt.close()
+
+    baseline_mask = (summary['cs'] == 0.0)
+    baseline_mean = None
+    baseline_time = None
+    if baseline_mask.sum() > 0:
+        baseline_df = summary[baseline_mask].iloc[0]
+        baseline_mean = float(baseline_df['mean_val_acc'])
+        baseline_time = float(baseline_df['avg_time_s'])
+
+    def config_key(row):
+        return (row['cs'], int(row['neumann_steps']), int(row['echo_freq']), float(row['lr']))
+
+    groups = {}
+    for _, r in raw.iterrows():
+        k = config_key(r)
+        groups.setdefault(k, []).append(float(r['final_val_acc']))
+
+    baseline_vals = []
+    if baseline_mean is not None:
+        baseline_keys = [k for k in groups.keys() if k[0] == 0.0]
+        for k in baseline_keys:
+            baseline_vals += groups[k]
+
+    rows = []
+    for _, s in summary_sorted.iterrows():
+        k = (float(s.cs), int(s.neumann_steps), int(s.echo_freq), float(s.lr))
+        vals = np.array(groups.get(k, []))
+        mean_val = float(s['mean_val_acc'])
+        std_val = float(s['std_val_acc']) if not np.isnan(s['std_val_acc']) else 0.0
+        avg_time = float(s['avg_time_s'])
+        if len(vals) > 0 and len(baseline_vals) > 0:
+            tstat, pval = stats.ttest_ind(vals, baseline_vals, equal_var=False)
+            pooled_sd = np.sqrt(((vals.std(ddof=0) ** 2) + (np.std(baseline_vals, ddof=0) ** 2)) / 2.0)
+            cohen_d = (vals.mean() - np.mean(baseline_vals)) / (pooled_sd + 1e-12)
+        else:
+            pval = np.nan
+            cohen_d = np.nan
+        delta = (mean_val - baseline_mean) if baseline_mean is not None else np.nan
+        extra_time = (avg_time - baseline_time) if baseline_time is not None else np.nan
+        rel_gain_per_sec = (delta / extra_time) if (extra_time is not None and extra_time > 0) else np.nan
+        rows.append({
+            'cs': s.cs, 'neumann': s.neumann_steps, 'echo_freq': s.echo_freq, 'lr': s.lr,
+            'mean_val': mean_val, 'std_val': std_val, 'pval_vs_baseline': pval,
+            'cohens_d': cohen_d, 'delta': delta, 'avg_time_s': avg_time,
+            'extra_time_s': extra_time, 'gain_per_sec': rel_gain_per_sec
+        })
+
+    stats_df = pd.DataFrame(rows)
+    stats_df_sorted = stats_df.sort_values('mean_val', ascending=False).reset_index(drop=True)
+    out_csv = os.path.join(out_dir, 'grid_stats_detailed.csv')
+    stats_df_sorted.to_csv(out_csv, index=False)
+
+    plt.figure()
+    plt.scatter(stats_df['avg_time_s'], stats_df['mean_val'])
+    for i, row in stats_df.iterrows():
+        plt.text(row['avg_time_s'] + 0.5, row['mean_val'], f"cs={row['cs']},N={int(row['neumann'])}", fontsize=8)
+    plt.xlabel('avg time per run (s)')
+    plt.ylabel('mean val acc')
+    plt.title('Mean val acc vs avg runtime (trade-off)')
+    plt.tight_layout()
+    img2 = os.path.join(out_dir, 'valacc_vs_time.png')
+    plt.savefig(img2, dpi=150)
+    plt.close()
+
+    print(f"GridAnalysis: saved {out_csv}, {img1}, {img2}")
+
+def on_train_end(self, args, state, control, **kwargs):
+    if self.run_on == 'train_end':
+        self._run_analysis(args)
+
+def on_save(self, args, state, control, **kwargs):
+    if self.run_on == 'on_save':
+        self._run_analysis(args)
+
+
+---
+
+File: src/trainer_main.py
+
+"""Entry point: builds components, runs NAS optimizer OR trainer experiments. This script demonstrates integration and how to run end-to-end. """ import os import yaml import argparse from types import SimpleNamespace from transformers import TrainingArguments, Trainer from grid_analysis.callbacks import GridAnalysisCallback from spoknas.optimizer import SpokNASOptimizer from spoknas.fitness import evaluate_multifidelity from spoknas.controller import ExperimentController from sklearn.ensemble import RandomForestRegressor
+
+def build_args(): p = argparse.ArgumentParser() p.add_argument('--profile', default=None) p.add_argument('--run_nas', action='store_true') p.add_argument('--seed', type=int, default=42) return p.parse_args()
+
+def main(): args = build_args() cfg = yaml.safe_load(open('config.yaml')) profile = cfg['profiles'][cfg['defaults']['profile']] if args.profile is None else cfg['profiles'][args.profile]
+
+training_args = TrainingArguments(
+    output_dir=profile.get('out_dir', './results'),
+    per_device_train_batch_size=profile.get('batch_size', 64),
+    num_train_epochs=3,
+    logging_steps=100,
+    save_steps=500,
+    save_strategy='steps',
+    logging_dir='./logs',
+    seed=args.seed,
+    report_to=['tensorboard']
+)
+
+grid_cb = GridAnalysisCallback(raw_csv='grid_raw_results.csv', summary_csv='grid_summary.csv', run_on='train_end')
+
+layer_lib = cfg['optimizer']['layer_library']
+surrogate = RandomForestRegressor(n_estimators=cfg['surrogate']['n_estimators'])
+optimizer = SpokNASOptimizer(layer_lib, fitness_fn=evaluate_multifidelity, population_size=profile.get('pop_size', 24), elitism=cfg['optimizer']['elitism'], mutation_rate=cfg['optimizer']['mutation_rate'], surrogate_enabled=True, surrogate_model=surrogate)
+controller = ExperimentController()
+
+# Dummy data_manager placeholder
+class DummyDM:
+    x_full = []
+    y_full = []
+
+data_manager = DummyDM()
+
+if args.run_nas:
+    best, history = optimizer.run_with_controller(generations=profile.get('generations', 20), num_islands=profile.get('num_islands', 4), migrate_every=profile.get('migrate_every', 5), migration_k=profile.get('migration_k', 2), controller=controller, data_manager=data_manager, train_idx=list(range(100)), val_idx=list(range(100, 120)))
+    print('NAS done, best:', best)
+else:
+    print('Use Trainer for supervised experiments — example code omitted.')
+
+if name == 'main': main()
+
+
+---
+
+File: README.md
+
+SpokNAS — Rebuild v2
+
+هذا المشروع هو إعادة بناء كاملة لمشروع SpokNAS مع تحسينات مصفوفية وعملية:
+
+ميزات رئيسية:
+
+بنية NAS محمولة (islands, migration, speciation)
+
+تقييم متعدد الدقة (multifidelity) مع تنفيذ batched evaluation على PyTorch
+
+Vectorized utilities (pairwise distances, cosine similarity)
+
+Surrogate training vectorized وتجميع بيانات سريع
+
+GridAnalysis callback لحفظ صور وإحصاءات تلقائياً
+
+دعم لWandB وخرائط محفوظات التجارب
+
+متطلبات حديثة (transformers, peft, accelerate متاحة لاحقاً)
+
+
+بدأ سريع:
+
+1. إنشاء بيئة: python -m venv .venv && source .venv/bin/activate (Linux/Mac).
+
+
+2. تثبيت المكتبات: pip install -r requirements.txt.
+
+
+3. عدّل config.yaml ليتناسب مع جهازك.
+
+
+4. ضع بياناتك في واجهة data_manager (يوجد placeholder في trainer_main.py).
+
+
+5. شغّل بحث NAS: python -m src.trainer_main --run_nas.
+
+
+
+ملاحظات أداء:
+
+استخدم GPU وPyTorch 2.x للحصول على تسريع ملحوظ.
+
+اضبط batch_size وepochs_proxy في config.yaml حسب الذاكرة.
+
+
+
+---
+
+File: tests/test_utils.py
+
+import numpy as np from spoknas.utils import pairwise_sq_dists
+
+def test_pairwise(): a = np.array([[0.0, 0.0], [1.0, 0.0]]) b = np.array([[0.0, 0.0], [0.0, 1.0]]) d2 = pairwise_sq_dists(a, b) assert d2.shape == (2,2) assert d2[0,0] == 0.0 assert d2[1,1] == 2.0
+
+
+---
+
+End of bundle
+
