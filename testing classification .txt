@@ -1,0 +1,225 @@
+import numpy as np
+import time
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+
+# ==============================================================================
+#  Section 1: Core Autodiff Engine (Node Class with new Softmax method)
+# ==============================================================================
+
+def _sum_to_shape(grad, shape):
+    while grad.ndim > len(shape): grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1: grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float); self.parents = parents; self.op = op
+        self.grad = None; self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward; return out
+    def __pow__(self, power):
+        assert isinstance(power, (int, float)); out = Node(self.value ** power, (self,), f'**{power}')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (power * self.value**(power-1)) * out.grad
+        out._backward = _backward; return out
+    def __matmul__(self, other):
+        other = self._ensure(other); out = Node(self.value @ other.value, (self, other), '@')
+        def _backward():
+            if out.grad is None: return
+            A, B, G = self.value, other.value, out.grad
+            self.grad += _sum_to_shape(G @ B.T, self.value.shape)
+            other.grad += _sum_to_shape(A.T @ G, other.value.shape)
+        out._backward = _backward; return out
+    def relu(self):
+        out = Node(np.maximum(0, self.value), (self,), 'relu')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (self.value > 0) * out.grad
+        out._backward = _backward; return out
+    def log(self):
+        out = Node(np.log(self.value), (self,), 'log')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (1 / self.value) * out.grad
+        out._backward = _backward; return out
+    def sum(self, axis=None, keepdims=False):
+        out = Node(self.value.sum(axis=axis, keepdims=keepdims), (self,), 'sum')
+        def _backward():
+            if out.grad is None: return
+            grad = out.grad
+            if not keepdims and axis is not None:
+                grad = np.expand_dims(out.grad, axis)
+            self.grad += np.broadcast_to(grad, self.value.shape)
+        out._backward = _backward; return out
+    def exp(self):
+        out = Node(np.exp(self.value), (self,), 'exp')
+        def _backward():
+            if out.grad is None: return
+            self.grad += out.value * out.grad
+        out._backward = _backward; return out
+    
+    # --- NEW: Softmax Function for Classification ---
+    def softmax(self, axis=-1):
+        """Computes softmax activation for classification."""
+        # Shift values for numerical stability (prevents overflow)
+        shifted_self = self + (self.value.max(axis=axis, keepdims=True) * -1)
+        exp_x = shifted_self.exp()
+        sum_exp_x = exp_x.sum(axis=axis, keepdims=True)
+        return exp_x * (sum_exp_x**-1)
+
+    def backward(self):
+        topo, visited = [], set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo: v.grad = np.zeros_like(v.value)
+        self.grad = np.ones_like(self.value)
+        for v in reversed(topo): v._backward()
+
+# ==============================================================================
+#  Section 2: Model Definition and Training Logic
+# ==============================================================================
+
+# --- Using the 'nn' structure from our previous refactoring ---
+class nn:
+    class Module:
+        def parameters(self): yield from []
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+
+    class Linear(Module):
+        def __init__(self, in_features, out_features):
+            self.weight = Node(np.random.randn(in_features, out_features) * 0.1)
+            self.bias = Node(np.zeros(out_features))
+        def forward(self, x): return x @ self.weight + self.bias
+        def parameters(self): yield from [self.weight, self.bias]
+
+    class ReLU(Module):
+        def forward(self, x): return x.relu()
+
+    class Sequential(Module):
+        def __init__(self, *layers): self.layers = layers
+        def forward(self, x):
+            for layer in self.layers: x = layer(x)
+            return x
+        def parameters(self):
+            for layer in self.layers: yield from layer.parameters()
+
+# --- NEW: Cross-Entropy Loss Function ---
+def cross_entropy_loss(y_pred_probs, y_true_one_hot):
+    """Calculates the cross-entropy loss."""
+    # Clip probabilities to avoid log(0)
+    y_pred_clipped = Node(np.clip(y_pred_probs.value, 1e-10, 1 - 1e-10))
+    # Loss calculation
+    log_probs = y_pred_clipped.log()
+    loss = (y_true_one_hot * log_probs).sum(axis=1, keepdims=True) * -1
+    return loss.sum() * (1 / y_pred_probs.value.shape[0])
+
+# ==============================================================================
+#  Section 3: Main Execution Block - Iris Classification
+# ==============================================================================
+
+if __name__ == "__main__":
+    # 1. Load and Prepare the Iris Dataset
+    print("Loading and preparing Iris dataset...")
+    iris = load_iris()
+    X, y = iris.data, iris.target
+
+    # One-hot encode the labels (e.g., 2 -> [0, 0, 1])
+    encoder = OneHotEncoder(sparse_output=False)
+    y_one_hot = encoder.fit_transform(y.reshape(-1, 1))
+
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y_one_hot, test_size=0.2, random_state=42)
+    
+    # Convert to Node objects
+    X_train_node = Node(X_train)
+    y_train_node = Node(y_train)
+    
+    print(f"Data ready: {X_train.shape[0]} training samples, {X_test.shape[0]} testing samples.")
+    print(f"Input features: {X_train.shape[1]}, Output classes: {y_train.shape[1]}")
+
+    # 2. Define the Classification Model
+    np.random.seed(42)
+    model = nn.Sequential(
+        nn.Linear(in_features=4, out_features=16),
+        nn.ReLU(),
+        nn.Linear(in_features=16, out_features=16),
+        nn.ReLU(),
+        nn.Linear(in_features=16, out_features=3) # 3 output neurons for 3 classes
+    )
+    
+    # 3. Training Loop
+    print("\nStarting training...")
+    learning_rate = 0.1
+    epochs = 200
+    
+    params = list(model.parameters())
+    
+    start_time = time.time()
+    for epoch in range(epochs + 1):
+        # Forward pass
+        logits = model(X_train_node)
+        
+        # NEW: Apply Softmax to get probabilities
+        probabilities = logits.softmax()
+        
+        # NEW: Use Cross-Entropy Loss
+        loss = cross_entropy_loss(probabilities, y_train_node)
+        
+        # Backward pass
+        for p in params: p.grad = np.zeros_like(p.value) # Manual zero_grad
+        loss.backward()
+        
+        # Update weights (simple SGD)
+        for p in params:
+            p.value -= learning_rate * p.grad
+            
+        if epoch % 20 == 0:
+            print(f"Epoch {epoch:3d} | Loss: {loss.value.item():.6f}")
+
+    end_time = time.time()
+    print(f"--- Training Complete in {end_time - start_time:.2f}s ---")
+
+    # 4. Evaluation
+    print("\nEvaluating model performance...")
+    
+    # Get predictions on the test set
+    test_logits = model(Node(X_test))
+    test_probs = test_logits.softmax()
+    
+    # Convert probabilities to class predictions (the index of the max value)
+    y_pred_indices = np.argmax(test_probs.value, axis=1)
+    y_true_indices = np.argmax(y_test, axis=1)
+    
+    # Calculate accuracy
+    accuracy = np.mean(y_pred_indices == y_true_indices)
+    
+    print("\n--- FINAL RESULTS ---")
+    print(f"Test Accuracy: {accuracy * 100:.2f}%")
+
+    if accuracy > 0.95:
+        print("✅ Excellent! The model achieved high accuracy on the test set.")
+    else:
+        print("⚠️ Good, but could be improved. Try tuning hyperparameters.")
+

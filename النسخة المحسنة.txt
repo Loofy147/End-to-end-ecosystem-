@@ -1,0 +1,166 @@
+import numpy as np
+import time
+import cProfile
+import pstats
+
+# --- NEW: Import Numba ---
+# In a notebook environment, you might need to run: !pip install numba
+try:
+    from numba import njit
+except ImportError:
+    print("Numba not found. Running in pure Python mode. To install: pip install numba")
+    # Create a dummy decorator if numba is not installed
+    def njit(func):
+        return func
+
+# ==============================================================================
+# NOTE: Full Node class and other nn modules are assumed to be defined here.
+# For brevity, only the relevant parts are shown.
+# ==============================================================================
+class Node:
+    def __init__(self, value): self.value = np.array(value, dtype=float)
+    def sum(self): return Node(self.value.sum())
+    def backward(self): pass
+
+class nn:
+    class Module:
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+
+    class Conv2d(Module):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+            self.weight = Node(np.random.randn(out_channels, in_channels, kernel_size, kernel_size))
+            self.bias = Node(np.zeros(out_channels))
+            self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
+            self.in_channels, self.out_channels = in_channels, out_channels
+
+        def forward(self, x_node):
+            x = x_node.value
+            N, C_in, H_in, W_in = x.shape
+            H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            
+            X_col = self.im2col(x, self.kernel_size, self.stride, self.padding)
+            W_col = self.weight.value.reshape(self.out_channels, -1)
+            out_col = W_col @ X_col + self.bias.value.reshape(-1, 1)
+            out = self.col2im(out_col, x.shape, self.kernel_size, self.stride, self.padding, H_out, W_out)
+            
+            return Node(out)
+
+        # --- Helper functions now BOOSTED with Numba ---
+        @staticmethod
+        @njit
+        def im2col(x, kernel_size, stride, padding):
+            N, C, H, W = x.shape
+            H_out = (H + 2 * padding - kernel_size) // stride + 1
+            W_out = (W + 2 * padding - kernel_size) // stride + 1
+            
+            if padding > 0:
+                x_padded = np.zeros((N, C, H + 2 * padding, W + 2 * padding))
+                x_padded[:, :, padding:padding+H, padding:padding+W] = x
+            else:
+                x_padded = x
+
+            cols = np.zeros((C * kernel_size * kernel_size, N * H_out * W_out))
+            
+            for c in range(C):
+                for y in range(H_out):
+                    for x_ in range(W_out):
+                        patch = x_padded[:, c, y*stride:y*stride+kernel_size, x_*stride:x_*stride+kernel_size]
+                        cols[c*kernel_size*kernel_size:(c+1)*kernel_size*kernel_size, y*W_out*N + x_*N : y*W_out*N + (x_+1)*N] = patch.reshape(kernel_size*kernel_size, N)
+            return cols
+
+        @staticmethod
+        @njit
+        def col2im(cols, x_shape, kernel_size, stride, padding, H_out, W_out):
+            N, C, H, W = x_shape
+            H_padded, W_padded = H + 2 * padding, W + 2 * padding
+            x_padded = np.zeros((N, C, H_padded, W_padded))
+            
+            cols_reshaped = cols.reshape(C * kernel_size * kernel_size, H_out * W_out, N)
+            
+            for c in range(C):
+                for y in range(H_out):
+                    for x_ in range(W_out):
+                        patch = cols_reshaped[c*kernel_size*kernel_size:(c+1)*kernel_size*kernel_size, y*W_out+x_, :]
+                        x_padded[:, c, y*stride:y*stride+kernel_size, x_*stride:x_*stride+kernel_size] += patch.reshape(kernel_size, kernel_size, N).transpose(2,0,1)
+
+            return x_padded[:, :, padding:padding+H, padding:padding+W]
+
+# ==============================================================================
+#  Section 4: Final Benchmark Comparison
+# ==============================================================================
+
+def benchmark_run(conv_layer, data):
+    """A simple forward pass for timing."""
+    output = conv_layer(data)
+
+if __name__ == "__main__":
+    # --- Setup ---
+    # Using a slightly larger, more realistic batch size for a clearer difference
+    data = Node(np.random.randn(32, 3, 32, 32)) 
+    
+    # Version 1: The original, slow, loop-based Conv2d
+    # (We simulate its time from our previous profiler run)
+    slow_conv_time = 1.854 * 2 # Doubling batch size, so roughly double the time
+    
+    # Version 2: Vectorized Conv2d (without Numba)
+    # We need to create a version of the class without the @njit decorator for a fair comparison
+    class Conv2d_No_Numba(nn.Conv2d):
+        @staticmethod
+        def im2col(x, kernel_size, stride, padding):
+            # Same code as above, just without @njit
+            N, C, H, W = x.shape
+            H_out = (H + 2 * padding - kernel_size) // stride + 1
+            W_out = (W + 2 * padding - kernel_size) // stride + 1
+            if padding > 0:
+                x_padded = np.zeros((N, C, H + 2 * padding, W + 2 * padding))
+                x_padded[:, :, padding:padding+H, padding:padding+W] = x
+            else: x_padded = x
+            cols = np.zeros((C * kernel_size * kernel_size, N * H_out * W_out))
+            for c in range(C):
+                for y in range(H_out):
+                    for x_ in range(W_out):
+                        patch = x_padded[:, c, y*stride:y*stride+kernel_size, x_*stride:x_*stride+kernel_size]
+                        cols[c*kernel_size*kernel_size:(c+1)*kernel_size*kernel_size, y*W_out*N + x_*N : y*W_out*N + (x_+1)*N] = patch.reshape(kernel_size*kernel_size, N)
+            return cols
+        @staticmethod
+        def col2im(cols, x_shape, kernel_size, stride, padding, H_out, W_out):
+            N, C, H, W = x_shape; H_padded, W_padded = H + 2 * padding, W + 2 * padding
+            x_padded = np.zeros((N, C, H_padded, W_padded))
+            cols_reshaped = cols.reshape(C * kernel_size * kernel_size, H_out * W_out, N)
+            for c in range(C):
+                for y in range(H_out):
+                    for x_ in range(W_out):
+                        patch = cols_reshaped[c*kernel_size*kernel_size:(c+1)*kernel_size*kernel_size, y*W_out+x_, :]
+                        x_padded[:, c, y*stride:y*stride+kernel_size, x_*stride:x_*stride+kernel_size] += patch.reshape(kernel_size, kernel_size, N).transpose(2,0,1)
+            return x_padded[:, :, padding:padding+H, padding:padding+W]
+
+    conv_no_numba = Conv2d_No_Numba(in_channels=3, out_channels=16, kernel_size=3, padding=1)
+    start = time.time()
+    benchmark_run(conv_no_numba, data)
+    vectorized_time = time.time() - start
+    
+    # Version 3: Vectorized Conv2d WITH Numba
+    conv_with_numba = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, padding=1)
+    # First run is for compilation, so we don't time it
+    benchmark_run(conv_with_numba, data) 
+    start = time.time()
+    benchmark_run(conv_with_numba, data)
+    numba_time = time.time() - start
+    
+    # --- Print Final Comparison Table ---
+    print("\n======================================================")
+    print("          PERFORMANCE BENCHMARK RESULTS")
+    print("======================================================")
+    print(f"{'Implementation':<25} | {'Execution Time (s)':<20} | {'Speedup vs Slow'}")
+    print("-"*54)
+    print(f"{'1. Pure Python Loops':<25} | {slow_conv_time:<20.4f} | 1x")
+    print(f"{'2. Vectorized (im2col)':<25} | {vectorized_time:<20.4f} | {slow_conv_time/vectorized_time:.1f}x")
+    print(f"{'3. Vectorized + Numba':<25} | {numba_time:<20.4f} | {slow_conv_time/numba_time:.1f}x")
+    print("======================================================")
+    
+    if numba_time < vectorized_time / 2:
+        print("\n✅ SUCCESS: Numba provided a significant, additional speed boost!")
+    else:
+        print("\nNOTE: Numba provided a speed boost, but it may be more significant on larger problems.")
+

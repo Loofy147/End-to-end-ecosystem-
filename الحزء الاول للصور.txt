@@ -1,0 +1,132 @@
+import numpy as np
+
+# ==============================================================================
+#  Section 1: Core Autodiff Engine (Node Class - Unchanged)
+# ==============================================================================
+# The Node class remains the same. We will add the backward pass for Conv2d later.
+# ... (Full Node class code from previous steps would be here) ...
+# For brevity, we'll assume the Node class is defined as before.
+
+class Node:
+    # NOTE: This is a minimal placeholder for the full Node class.
+    # In a real script, the complete Node class would be here.
+    def __init__(self, value):
+        self.value = np.array(value, dtype=float)
+    def __add__(self, other): return Node(self.value + other.value)
+    def __mul__(self, other): return Node(self.value * other.value)
+
+# ==============================================================================
+#  Section 2: The New 'nn' Module with Conv2d
+# ==============================================================================
+
+class nn:
+    class Module:
+        def parameters(self): yield from []
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+
+    # --- NEW: Conv2d Layer ---
+    class Conv2d(Module):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+            """
+            Initializes the 2D Convolutional Layer.
+            - in_channels: Number of channels in the input image (e.g., 1 for grayscale, 3 for RGB).
+            - out_channels: Number of filters to apply, determines the depth of the output.
+            - kernel_size: The height and width of the filter (e.g., 3 for a 3x3 filter).
+            - stride: How many pixels the filter moves at a time.
+            - padding: How many pixels to add around the border of the image.
+            """
+            self.in_channels = in_channels
+            self.out_channels = out_channels
+            self.kernel_size = kernel_size
+            self.stride = stride
+            self.padding = padding
+            
+            # Initialize filter weights. Shape: (num_filters, input_depth, kernel_H, kernel_W)
+            # We use a standard initialization method for good performance.
+            weight_shape = (out_channels, in_channels, kernel_size, kernel_size)
+            self.weight = Node(np.random.randn(*weight_shape) * np.sqrt(2. / (in_channels * kernel_size * kernel_size)))
+            
+            # Each filter has a single bias term.
+            self.bias = Node(np.zeros(out_channels))
+
+        def parameters(self):
+            yield from [self.weight, self.bias]
+
+        def forward(self, x_node):
+            """
+            Performs the forward pass of the convolution.
+            Input x_node is expected to have shape: (N, C_in, H_in, W_in)
+            N: Batch size, C_in: Input channels, H_in: Input height, W_in: Input width
+            """
+            x = x_node.value
+            N, C_in, H_in, W_in = x.shape
+            
+            # Apply padding to the input image
+            if self.padding > 0:
+                x_padded = np.pad(x, ((0,0), (0,0), (self.padding, self.padding), (self.padding, self.padding)), mode='constant')
+            else:
+                x_padded = x
+
+            # Calculate output dimensions
+            H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            
+            # Initialize output volume
+            output = np.zeros((N, self.out_channels, H_out, W_out))
+
+            # Perform the convolution
+            for n in range(N): # For each image in the batch
+                for f in range(self.out_channels): # For each filter
+                    for h in range(H_out): # Slide vertically
+                        for w in range(W_out): # Slide horizontally
+                            # Define the current "window" of the input image
+                            h_start, w_start = h * self.stride, w * self.stride
+                            h_end, w_end = h_start + self.kernel_size, w_start + self.kernel_size
+                            window = x_padded[n, :, h_start:h_end, w_start:w_end]
+                            
+                            # Element-wise product and sum -> the convolution result for one pixel
+                            conv_val = np.sum(window * self.weight.value[f])
+                            
+                            # Add the bias term for this filter
+                            output[n, f, h, w] = conv_val + self.bias.value[f]
+            
+            # For now, we return a new Node. Later, we'll connect it for backprop.
+            return Node(output)
+
+# ==============================================================================
+#  Section 3: Demonstration of the Conv2d Forward Pass
+# ==============================================================================
+
+if __name__ == "__main__":
+    print("--- Demonstrating the Conv2d Forward Pass ---")
+    
+    # 1. Create a sample "image"
+    # Let's imagine a batch of 1 image (N=1), grayscale (C=1), 10x10 pixels
+    np.random.seed(0)
+    sample_image = Node(np.random.randn(1, 1, 10, 10))
+    print(f"Input image shape: {sample_image.value.shape}")
+
+    # 2. Create a Conv2d layer
+    # It will take 1 channel in, and apply 4 different filters (4 channels out)
+    # The filter size will be 3x3
+    conv_layer = nn.Conv2d(in_channels=1, out_channels=4, kernel_size=3, stride=1, padding=1)
+    print(f"Conv layer filter weights shape: {conv_layer.weight.value.shape}")
+    
+    # 3. Perform the forward pass
+    start_time = time.time()
+    feature_map = conv_layer(sample_image)
+    end_time = time.time()
+    
+    # 4. Check the output
+    print(f"\nForward pass completed in {end_time - start_time:.5f} seconds.")
+    print(f"Output feature map shape: {feature_map.value.shape}")
+
+    # Let's analyze the output shape:
+    # H_out = (10 + 2*1 - 3) / 1 + 1 = 10
+    # W_out = (10 + 2*1 - 3) / 1 + 1 = 10
+    # The output should be (1, 4, 10, 10) -> N=1, C_out=4, H_out=10, W_out=10
+    if feature_map.value.shape == (1, 4, 10, 10):
+        print("✅ Success! The output shape is correct.")
+    else:
+        print(f"❌ Failure! Expected shape (1, 4, 10, 10), but got {feature_map.value.shape}")
+

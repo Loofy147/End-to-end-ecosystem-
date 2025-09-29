@@ -1,0 +1,204 @@
+import numpy as np
+import time
+
+# ==============================================================================
+#  Section 1: Full Node Class (for reference)
+# ==============================================================================
+# This is the complete, working Node class needed for the experiment.
+def _sum_to_shape(grad, shape):
+    while grad.ndim > len(shape): grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1: grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float); self.parents = parents; self.op = op
+        self.grad = None; self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward; return out
+    def backward(self):
+        topo, visited = [], set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo: v.grad = np.zeros_like(v.value)
+        self.grad = np.ones_like(self.value)
+        for v in reversed(topo): v._backward()
+
+# ==============================================================================
+#  Section 2: The 'nn' Module with a COMPLETE Conv2d Layer
+# ==============================================================================
+
+class nn:
+    class Module:
+        def parameters(self): yield from []
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+
+    class Conv2d(Module):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+            self.in_channels, self.out_channels = in_channels, out_channels
+            self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
+            
+            # Initialize weights and bias as Node objects to track gradients
+            w_shape = (out_channels, in_channels, kernel_size, kernel_size)
+            self.weight = Node(np.random.randn(*w_shape) * np.sqrt(2. / (in_channels * kernel_size**2)))
+            self.bias = Node(np.zeros(out_channels))
+
+        def parameters(self):
+            yield from [self.weight, self.bias]
+
+        def forward(self, x_node):
+            # The forward pass now creates a computation graph
+            x = x_node.value
+            N, C_in, H_in, W_in = x.shape
+            H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            
+            # Using im2col for a fast, vectorized forward pass (instead of loops)
+            # This is a standard optimization in deep learning libraries
+            X_col = self.im2col(x)
+            W_col = self.weight.value.reshape(self.out_channels, -1)
+            b_col = self.bias.value.reshape(-1, 1)
+            
+            # Perform convolution as a single matrix multiplication
+            out_col = W_col @ X_col + b_col
+            
+            # Reshape the output back to the image format
+            out = out_col.reshape(self.out_channels, H_out, W_out, N).transpose(3, 0, 1, 2)
+            
+            # Create the output node and define its backward pass
+            output_node = Node(out, parents=(x_node, self.weight, self.bias), op='conv2d')
+
+            def _backward():
+                if output_node.grad is None: return
+                
+                # Reshape the output gradient
+                dout_col = output_node.grad.transpose(1, 2, 3, 0).reshape(self.out_channels, -1)
+                
+                # --- Gradient w.r.t. weights (d_weight) ---
+                # This is a convolution between the input and the output gradient
+                d_weight_col = dout_col @ X_col.T
+                d_weight = d_weight_col.reshape(self.weight.value.shape)
+                self.weight.grad += d_weight
+                
+                # --- Gradient w.r.t. bias (d_bias) ---
+                d_bias = np.sum(dout_col, axis=1)
+                self.bias.grad += d_bias
+                
+                # --- Gradient w.r.t. input (d_input) ---
+                # This is a "full convolution" between the output gradient and the rotated filter
+                dW_col = W_col.T @ dout_col
+                d_input = self.col2im(dW_col, x.shape)
+                x_node.grad += d_input
+
+            output_node._backward = _backward
+            return output_node
+
+        # Helper functions for fast convolution (im2col/col2im)
+        def im2col(self, x):
+            N, C, H, W = x.shape
+            H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
+            x_padded = np.pad(x, ((0,0),(0,0),(self.padding,self.padding),(self.padding,self.padding)),'constant')
+            cols = np.zeros((C * self.kernel_size * self.kernel_size, N * H_out * W_out))
+            for h in range(H_out):
+                for w in range(W_out):
+                    patch = x_padded[:, :, h*self.stride:h*self.stride+self.kernel_size, w*self.stride:w*self.stride+self.kernel_size]
+                    cols[:, (h*W_out+w)*N:(h*W_out+w+1)*N] = patch.reshape(C*self.kernel_size*self.kernel_size, N)
+            return cols
+
+        def col2im(self, cols, x_shape):
+            N, C, H, W = x_shape
+            H_padded, W_padded = H + 2 * self.padding, W + 2 * self.padding
+            x_padded = np.zeros((N, C, H_padded, W_padded))
+            H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
+            cols = cols.reshape(C * self.kernel_size * self.kernel_size, H_out * W_out, N).transpose(2,0,1)
+            for h in range(H_out):
+                for w in range(W_out):
+                    patch = cols[:, :, h*W_out+w].reshape(N, C, self.kernel_size, self.kernel_size)
+                    x_padded[:, :, h*self.stride:h*self.stride+self.kernel_size, w*self.stride:w*self.stride+self.kernel_size] += patch
+            return x_padded[:, :, self.padding:self.padding+H, self.padding:self.padding+W]
+
+# ==============================================================================
+#  Section 3: Gradient Check for the Conv2d Layer
+# ==============================================================================
+
+if __name__ == "__main__":
+    print("--- Performing Gradient Check for Conv2d Layer ---")
+    
+    # Setup a small convolution scenario
+    np.random.seed(0)
+    x_node = Node(np.random.randn(1, 1, 5, 5)) # 1 image, 1 channel, 5x5
+    conv_layer = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1)
+    
+    # --- 1. Analytical Gradient (our implementation) ---
+    # We'll check the gradient with respect to the input (x)
+    # To do this, we need a "downstream" operation, like sum, to get a scalar loss
+    output = conv_layer(x_node)
+    loss = output * output # A simple loss function: sum of squares
+    loss = Node(loss.value.sum()) # Final scalar loss
+    
+    # Manually link the backward pass for the sum
+    def loss_backward():
+        output.grad += 2 * output.value * loss.grad
+    loss._backward = loss_backward
+    
+    # Run the full backward pass
+    loss.backward()
+    analytical_grad = x_node.grad
+
+    # --- 2. Numerical Gradient (the "ground truth") ---
+    numerical_grad = np.zeros_like(x_node.value)
+    eps = 1e-5
+    
+    # Iterate over each element of the input x
+    it = np.nditer(x_node.value, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        
+        # Calculate f(x + eps)
+        x_plus = x_node.value.copy()
+        x_plus[idx] += eps
+        output_plus = conv_layer(Node(x_plus))
+        loss_plus = np.sum(output_plus.value**2)
+        
+        # Calculate f(x - eps)
+        x_minus = x_node.value.copy()
+        x_minus[idx] -= eps
+        output_minus = conv_layer(Node(x_minus))
+        loss_minus = np.sum(output_minus.value**2)
+        
+        # Central difference formula
+        numerical_grad[idx] = (loss_plus - loss_minus) / (2 * eps)
+        
+        it.iternext()
+
+    # --- 3. Compare the gradients ---
+    relative_error = np.linalg.norm(analytical_grad - numerical_grad) / (np.linalg.norm(analytical_grad) + np.linalg.norm(numerical_grad))
+    
+    print(f"\nRelative error between analytical and numerical gradients: {relative_error:.6e}")
+    
+    if relative_error < 1e-5:
+        print("✅ SUCCESS: The backward pass for Conv2d is likely correct!")
+    else:
+        print("❌ FAILURE: The gradients do not match. There is an error in the backward pass.")
+

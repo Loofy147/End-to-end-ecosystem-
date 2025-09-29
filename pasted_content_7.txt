@@ -1,0 +1,590 @@
+import React, { useState, useEffect } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+
+const HDDStrategyOptimizer = () => {
+  const [isRunning, setIsRunning] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [results, setResults] = useState(null);
+  const [bestStrategy, setBestStrategy] = useState(null);
+  const [equityCurve, setEquityCurve] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [currentGeneration, setCurrentGeneration] = useState(0);
+
+  // Parameters
+  const DAYS = 400;
+  const POP = 20;
+  const GEN = 4;
+  const ELITE_FRAC = 0.15;
+
+  // GARCH parameters
+  const mu = 0.0004;
+  const omega = 1e-8;
+  const alpha = 0.06;
+  const beta = 0.92;
+
+  const addLog = (message) => {
+    const timestamp = new Date().toLocaleTimeString();
+    setLogs(prev => [...prev.slice(-9), `[${timestamp}] ${message}`]);
+  };
+
+  // Fixed normal random function with better distribution
+  const normalRandom = () => {
+    // Use a simpler, more reliable method
+    let u = 0, v = 0;
+    while(u === 0) u = Math.random();
+    while(v === 0) v = Math.random();
+    
+    // Box-Muller transform
+    const z0 = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+    return z0;
+  };
+
+  // Helper function for normal random numbers (Box-Muller transform)
+  // Removed duplicate function and improved the implementation
+
+  // Technical indicator calculations
+  const rollingMean = (arr, n) => {
+    const result = new Array(arr.length);
+    for (let i = 0; i < arr.length; i++) {
+      if (i < n - 1) {
+        result[i] = NaN;
+      } else {
+        let sum = 0;
+        for (let j = 0; j < n; j++) {
+          sum += arr[i - j];
+        }
+        result[i] = sum / n;
+      }
+    }
+    return result;
+  };
+
+  const computeRSI = (arr, n = 14) => {
+    const result = new Array(arr.length);
+    result[0] = 50;
+    
+    let avgGain = 0;
+    let avgLoss = 0;
+    
+    for (let i = 1; i <= n && i < arr.length; i++) {
+      const change = arr[i] - arr[i-1];
+      if (change > 0) avgGain += change;
+      else avgLoss += Math.abs(change);
+    }
+    
+    avgGain /= n;
+    avgLoss /= n;
+    
+    for (let i = 1; i < arr.length; i++) {
+      if (i <= n) {
+        result[i] = 50;
+        continue;
+      }
+      
+      const change = arr[i] - arr[i-1];
+      const gain = change > 0 ? change : 0;
+      const loss = change < 0 ? Math.abs(change) : 0;
+      
+      avgGain = ((avgGain * (n-1)) + gain) / n;
+      avgLoss = ((avgLoss * (n-1)) + loss) / n;
+      
+      const rs = avgGain / (avgLoss + 1e-12);
+      result[i] = 100 - (100 / (1 + rs));
+    }
+    return result;
+  };
+
+  const computeATR = (high, low, close, n = 14) => {
+    const tr = new Array(high.length);
+    tr[0] = high[0] - low[0];
+    
+    for (let i = 1; i < high.length; i++) {
+      const hl = high[i] - low[i];
+      const hc = Math.abs(high[i] - close[i-1]);
+      const lc = Math.abs(low[i] - close[i-1]);
+      tr[i] = Math.max(hl, Math.max(hc, lc));
+    }
+    
+    return rollingMean(tr, n);
+  };
+
+  // Enhanced candidate generation with better parameter balance
+  const generateCandidate = () => {
+    const components_pool = ["sma_cross", "rsi_filter", "momentum", "atr_stop", "take_profit", "random_signal", "fft_like", "volatility_filter"];
+    
+    // Ensure balanced strategy components
+    const core_signals = ["sma_cross", "rsi_filter", "momentum"];
+    const risk_management = ["atr_stop", "take_profit"];
+    const auxiliary = ["random_signal", "fft_like", "volatility_filter"];
+    
+    const k = Math.floor(Math.random() * 3) + 2; // 2-4 components
+    const comps = [];
+    
+    // Always include at least one core signal
+    const coreChoice = core_signals[Math.floor(Math.random() * core_signals.length)];
+    comps.push(coreChoice);
+    
+    // Add risk management with high probability
+    if (Math.random() < 0.7) {
+      const riskChoice = risk_management[Math.floor(Math.random() * risk_management.length)];
+      comps.push(riskChoice);
+    }
+    
+    // Fill remaining slots
+    const remaining_pool = components_pool.filter(c => !comps.includes(c));
+    while (comps.length < k && remaining_pool.length > 0) {
+      const idx = Math.floor(Math.random() * remaining_pool.length);
+      comps.push(remaining_pool.splice(idx, 1)[0]);
+    }
+    
+    const params = {};
+    
+    // SMA Cross with realistic parameters
+    if (comps.includes("sma_cross")) {
+      const short_options = [5, 8, 10, 12, 15];
+      const long_options = [20, 30, 50, 100];
+      
+      params.sma_short = short_options[Math.floor(Math.random() * short_options.length)];
+      params.sma_long = long_options[Math.floor(Math.random() * long_options.length)];
+      
+      if (params.sma_short >= params.sma_long) {
+        params.sma_short = Math.max(3, Math.floor(params.sma_long / 3));
+      }
+    }
+    
+    // RSI with reasonable thresholds
+    if (comps.includes("rsi_filter")) {
+      params.rsi_buy = 25 + Math.floor(Math.random() * 20); // 25-44
+      params.rsi_sell = 60 + Math.floor(Math.random() * 15); // 60-74
+      
+      if (params.rsi_sell - params.rsi_buy < 15) {
+        params.rsi_sell = params.rsi_buy + 20;
+      }
+    }
+    
+    // Momentum with balanced parameters
+    if (comps.includes("momentum")) {
+      params.mom_period = [3, 5, 7, 10][Math.floor(Math.random() * 4)];
+      params.mom_thresh = [0.001, 0.002, 0.003, 0.005, 0.008][Math.floor(Math.random() * 5)];
+    }
+    
+    // ATR stop with reasonable multipliers
+    if (comps.includes("atr_stop")) {
+      params.atr_mult = [1.0, 1.2, 1.5, 1.8, 2.0, 2.5][Math.floor(Math.random() * 6)];
+    }
+    
+    // Take profit with conservative approach
+    if (comps.includes("take_profit")) {
+      params.tp_mult = [1.5, 2.0, 2.5, 3.0][Math.floor(Math.random() * 4)];
+    }
+    
+    // Random signal with low probability
+    if (comps.includes("random_signal")) {
+      params.rand_prob = [0.005, 0.01, 0.015, 0.02][Math.floor(Math.random() * 4)];
+    }
+    
+    // FFT window selection
+    if (comps.includes("fft_like")) {
+      params.fft_window = [16, 32][Math.floor(Math.random() * 2)];
+    }
+    
+    // Volatility filter with adaptive thresholds
+    if (comps.includes("volatility_filter")) {
+      params.vol_threshold = [0.001, 0.0015, 0.002, 0.003][Math.floor(Math.random() * 4)];
+    }
+    
+    // Position sizing with risk management
+    params.position_size = [0.05, 0.08, 0.1, 0.12, 0.15][Math.floor(Math.random() * 5)];
+    
+    return { components: comps, params: params };
+  };
+
+  // Enhanced backtest strategy with robust error handling
+  const backtestStrategy = (candidate, priceData, indicators, initial_equity = 100000) => {
+    try {
+      const { close_arr, open_arr, high_arr, low_arr, sigma2 } = priceData;
+      const { sma_cache, rsi_arr, atr_arr, fft_std } = indicators;
+      const { components, params } = candidate;
+      
+      if (!close_arr || close_arr.length === 0 || !components || components.length === 0) {
+        throw new Error("Invalid input data");
+      }
+      
+      let equity = initial_equity;
+      let position = 0;
+      let entry_price = 0;
+      let in_pos = false;
+      const trades = [];
+      const equity_curve = [];
+      
+      const commission = 0.0005;
+      const slippage = 0.0005;
+    
+    for (let i = 0; i < DAYS; i++) {
+      if (i >= close_arr.length) break;
+      
+      const openp = open_arr[i] || close_arr[i];
+      const closep = close_arr[i];
+      const highp = high_arr[i] || closep;
+      const lowp = low_arr[i] || closep;
+      
+      let buy = false;
+      let sell = false;
+      
+      try {
+        // SMA Cross with improved safety
+        if (components.includes("sma_cross")) {
+          const s = params.sma_short || 5;
+          const l = params.sma_long || 50;
+          
+          if (sma_cache[s] && sma_cache[l] && i < sma_cache[s].length && i < sma_cache[l].length) {
+            const sma_s = sma_cache[s][i];
+            const sma_l = sma_cache[l][i];
+            
+            if (!isNaN(sma_s) && !isNaN(sma_l) && sma_s > 0 && sma_l > 0) {
+              if (sma_s > sma_l) buy = true;
+              else if (sma_s < sma_l * 0.995) sell = true;
+            }
+          }
+        }
+        
+        // RSI Filter with bounds checking
+        if (components.includes("rsi_filter")) {
+          const r = (i < rsi_arr.length) ? rsi_arr[i] : 50;
+          if (!isNaN(r) && r >= 0 && r <= 100) {
+            const rsi_buy_level = params.rsi_buy || 40;
+            const rsi_sell_level = params.rsi_sell || 65;
+            
+            if (r < rsi_buy_level) buy = buy || true;
+            if (r > rsi_sell_level) sell = true;
+          }
+        }
+        
+        // Momentum with safety checks
+        if (components.includes("momentum")) {
+          const p = Math.max(1, Math.min(params.mom_period || 5, i));
+          const thresh = Math.abs(params.mom_thresh || 0.002);
+          
+          if (i >= p && close_arr[i-p] > 0) {
+            const mom = (closep - close_arr[i-p]) / close_arr[i-p];
+            if (!isNaN(mom)) {
+              if (mom > thresh) buy = buy || true;
+              if (mom < -thresh) sell = true;
+            }
+          }
+        }
+        
+        // Random Signal with controlled probability
+        if (components.includes("random_signal")) {
+          const prob = Math.min(0.05, Math.max(0.001, params.rand_prob || 0.02));
+          if (Math.random() < prob) buy = true;
+        }
+        
+        // FFT-like signal with improved calculation
+        if (components.includes("fft_like")) {
+          const w = params.fft_window || 16;
+          if (fft_std[w] && i < fft_std[w].length && i >= w) {
+            const power = fft_std[w][i];
+            if (!isNaN(power) && power > 0) {
+              const vol_baseline = Math.sqrt(sigma2.slice(Math.max(0, i-w+1), i+1).reduce((a,b) => a+b, 0) / w);
+              if (power < 0.7 * vol_baseline) buy = true;
+            }
+          }
+        }
+        
+        // Volatility Filter with better thresholds
+        if (components.includes("volatility_filter")) {
+          const vol = Math.sqrt(Math.max(1e-12, sigma2[Math.min(i, sigma2.length-1)]));
+          const threshold = params.vol_threshold || 0.002;
+          if (vol > threshold) buy = false;
+        }
+        
+      } catch (error) {
+        console.warn(`Error in signal generation at day ${i}:`, error);
+      }
+      
+      // Execute trades with improved logic
+      if (!in_pos && buy && equity > 1000) {
+        const pos_size = Math.min(0.2, Math.max(0.01, params.position_size || 0.1));
+        entry_price = openp * (1 + slippage);
+        const pos_value = equity * pos_size;
+        const units = pos_value / entry_price;
+        
+        if (units > 0 && entry_price > 0) {
+          equity -= pos_value * commission;
+          position = units;
+          in_pos = true;
+          trades.push({ type: "buy", day: i, price: entry_price, units: units, equity: equity });
+        }
+      } else if (in_pos && position > 0) {
+        let exit_flag = false;
+        let exit_price = null;
+        
+        try {
+          // ATR Stop with safety checks
+          if (components.includes("atr_stop") && i < atr_arr.length) {
+            const atr_val = atr_arr[i];
+            if (!isNaN(atr_val) && atr_val > 0 && entry_price > 0) {
+              const atr_mult = Math.min(5.0, Math.max(0.5, params.atr_mult || 2.0));
+              const stop_price = entry_price * (1 - atr_mult * (atr_val / entry_price));
+              if (lowp <= stop_price) {
+                exit_flag = true;
+                exit_price = Math.max(stop_price * (1 - slippage), lowp * 0.99);
+              }
+            }
+          }
+          
+          // Take Profit with safety checks
+          if (components.includes("take_profit") && !exit_flag) {
+            let tp;
+            if (i < atr_arr.length && !isNaN(atr_arr[i]) && atr_arr[i] > 0) {
+              const tp_mult = Math.min(5.0, Math.max(1.0, params.tp_mult || 2.0));
+              tp = entry_price * (1 + tp_mult * (atr_arr[i] / entry_price));
+            } else {
+              const tp_mult = Math.min(5.0, Math.max(1.0, params.tp_mult || 2.0));
+              tp = entry_price * (1 + tp_mult * 0.01);
+            }
+            
+            if (highp >= tp) {
+              exit_flag = true;
+              exit_price = Math.min(tp * (1 - slippage), highp * 0.99);
+            }
+          }
+          
+          // Regular sell signal
+          if (sell && !exit_flag) {
+            exit_flag = true;
+            exit_price = openp * (1 - slippage);
+          }
+          
+          // Emergency exit for large losses
+          if (!exit_flag && entry_price > 0) {
+            const unrealized_loss = (entry_price - closep) / entry_price;
+            if (unrealized_loss > 0.15) {
+              exit_flag = true;
+              exit_price = closep * (1 - slippage);
+            }
+          }
+          
+        } catch (error) {
+          console.warn(`Error in exit logic at day ${i}:`, error);
+          exit_flag = true;
+          exit_price = openp * (1 - slippage);
+        }
+        
+        if (exit_flag && position > 0) {
+          const final_exit_price = Math.max(0.01, exit_price || (openp * (1 - slippage)));
+          const proceeds = position * final_exit_price;
+          equity += proceeds - proceeds * commission;
+          trades.push({ type: "sell", day: i, price: final_exit_price, units: position, equity: equity });
+          position = 0;
+          in_pos = false;
+        }
+      }
+      
+      equity_curve.push(Math.max(0, equity));
+    }
+    
+    // Close final position if still open
+    if (in_pos && position > 0) {
+      const final_price = Math.max(0.01, close_arr[DAYS-1] * (1 - slippage));
+      const proceeds = position * final_price;
+      equity += proceeds - proceeds * commission;
+      trades.push({ type: "sell", day: DAYS-1, price: final_price, units: position, equity: equity });
+    }
+    
+    // Calculate metrics with improved safety
+    const final_equity = Math.max(0, equity);
+    const total_return = final_equity / initial_equity - 1.0;
+    
+    const years = DAYS / 252.0;
+    let cagr = 0;
+    if (final_equity > 0 && years > 0) {
+      cagr = Math.pow(final_equity / initial_equity, 1 / years) - 1.0;
+    } else {
+      cagr = -0.5;
+    }
+    
+    // Calculate Sharpe ratio
+    const returns = [];
+    let valid_returns = 0;
+    
+    for (let i = 1; i < equity_curve.length; i++) {
+      if (equity_curve[i-1] > 0) {
+        const daily_return = (equity_curve[i] / equity_curve[i-1]) - 1;
+        if (!isNaN(daily_return) && isFinite(daily_return)) {
+          returns.push(daily_return);
+          valid_returns++;
+        }
+      }
+    }
+    
+    let sharpe = 0;
+    if (valid_returns > 10) {
+      const avg_return = returns.reduce((a, b) => a + b, 0) / returns.length;
+      const variance = returns.reduce((acc, r) => acc + Math.pow(r - avg_return, 2), 0) / returns.length;
+      const std_return = Math.sqrt(variance);
+      
+      if (std_return > 0) {
+        sharpe = (avg_return / std_return) * Math.sqrt(252);
+      }
+    }
+    
+    // Calculate max drawdown
+    let peak = equity_curve[0] || initial_equity;
+    let max_dd = 0;
+    
+    for (const eq of equity_curve) {
+      if (eq > peak) peak = eq;
+      if (peak > 0) {
+        const dd = (peak - eq) / peak;
+        if (dd > max_dd) max_dd = dd;
+      }
+    }
+    
+    // Calculate trade statistics
+    let wins = 0;
+    let losses = 0;
+    let total_trades = 0;
+    let total_pnl = 0;
+    
+    for (let j = 0; j < trades.length - 1; j += 2) {
+      if (trades[j] && trades[j+1] && trades[j].type === "buy" && trades[j+1].type === "sell") {
+        total_trades++;
+        const pnl = (trades[j+1].price - trades[j].price) * trades[j+1].units;
+        total_pnl += pnl;
+        
+        if (pnl > 0) {
+          wins++;
+        } else {
+          losses++;
+        }
+      }
+    }
+    
+          const win_rate = total_trades > 0 ? wins / total_trades : 0;
+      
+      // Return validated metrics
+      return {
+        equity_curve: equity_curve,
+        final_equity: isNaN(final_equity) ? 0 : final_equity,
+        cagr: isNaN(cagr) ? -0.5 : Math.max(-0.99, Math.min(5.0, cagr)),
+        sharpe: isNaN(sharpe) ? -2 : Math.max(-5, Math.min(10, sharpe)),
+        max_dd: isNaN(max_dd) ? 1.0 : Math.max(0, Math.min(1.0, max_dd)),
+        total_trades: total_trades,
+        win_rate: isNaN(win_rate) ? 0 : win_rate,
+        total_return: isNaN(total_return) ? -1.0 : total_return,
+        total_pnl: total_pnl,
+        avg_trade: total_trades > 0 ? total_pnl / total_trades : 0
+      };
+    
+    } catch (error) {
+      console.error("Backtest error:", error);
+      // Return a safe default result for failed backtests
+      return {
+        equity_curve: new Array(DAYS).fill(initial_equity * 0.5),
+        final_equity: initial_equity * 0.5,
+        cagr: -0.5,
+        sharpe: -2,
+        max_dd: 0.5,
+        total_trades: 0,
+        win_rate: 0,
+        total_return: -0.5,
+        total_pnl: -initial_equity * 0.5,
+        avg_trade: 0
+      };
+    }
+  };
+
+  // Simplified test function for debugging
+  const runSimpleTest = async () => {
+    setIsRunning(true);
+    setLogs([]);
+    addLog("Running simple test...");
+    
+    try {
+      // Test data generation
+      const testReturns = [];
+      for (let i = 0; i < 10; i++) {
+        testReturns.push(normalRandom() * 0.01);
+      }
+      addLog(`Generated ${testReturns.length} test returns`);
+      
+      // Test candidate generation
+      const testCandidate = generateCandidate();
+      addLog(`Generated candidate: ${testCandidate.components.join(',')}`);
+      
+      addLog("Simple test completed successfully!");
+      
+    } catch (error) {
+      addLog(`Test failed: ${error.message}`);
+      console.error("Test error:", error);
+    } finally {
+      setIsRunning(false);
+    }
+  };
+  const runOptimization = async () => {
+    setIsRunning(true);
+    setProgress(0);
+    setResults(null);
+    setBestStrategy(null);
+    setEquityCurve([]);
+    setLogs([]);
+    
+    try {
+      addLog("Starting HDD optimization...");
+      
+      // Simple seeded random for reproducibility
+      let seed = 42;
+      const seededRandom = () => {
+        seed = (seed * 9301 + 49297) % 233280;
+        return seed / 233280;
+      };
+      
+      // Override Math.random temporarily
+      const originalRandom = Math.random;
+      Math.random = seededRandom;
+      
+      // Generate synthetic price data
+      addLog("Generating synthetic price data...");
+      const sigma2 = new Array(DAYS);
+      const eps = new Array(DAYS);
+      const returns = new Array(DAYS);
+      
+      sigma2[0] = 0.0001;
+      eps[0] = Math.sqrt(sigma2[0]) * normalRandom();
+      returns[0] = 0;
+      
+      for (let t = 1; t < DAYS; t++) {
+        sigma2[t] = omega + alpha * (eps[t-1] ** 2) + beta * sigma2[t-1];
+        eps[t] = Math.sqrt(Math.max(1e-12, sigma2[t])) * normalRandom();
+        returns[t] = mu + eps[t];
+      }
+      
+      // Generate OHLC data
+      const price0 = 30000.0;
+      const logprice = new Array(DAYS);
+      const close_arr = new Array(DAYS);
+      const high_arr = new Array(DAYS);
+      const low_arr = new Array(DAYS);
+      const open_arr = new Array(DAYS);
+      
+      logprice[0] = Math.log(price0);
+      for (let i = 1; i < DAYS; i++) {
+        logprice[i] = logprice[i-1] + returns[i];
+      }
+      
+      for (let i = 0; i < DAYS; i++) {
+        close_arr[i] = Math.exp(logprice[i]);
+        const volSpread = 0.003 + 2 * Math.sqrt(sigma2[i]);
+        high_arr[i] = close_arr[i] * (1 + Math.abs(normalRandom()) * volSpread);
+        low_arr[i] = close_arr[i] * (1 - Math.abs(normalRandom()) * volSpread);
+        
+        if (i === 0) {
+          open_arr[i] = price0;
+        } else {
+          open_arr[i] = close_arr[i-1] * (1 + normalRandom() * 0.001);
+        }
+      }
+      
+      const priceData = { close_arr, open_arr, high_arr, low_arr, sig

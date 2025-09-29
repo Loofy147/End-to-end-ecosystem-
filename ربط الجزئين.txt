@@ -1,0 +1,224 @@
+import numpy as np
+import time
+
+# ==============================================================================
+#  Section 1: Core Autodiff Engine (Node Class - Unchanged)
+# ==============================================================================
+# The full Node class from the previous step is assumed to be here.
+# For brevity, only the class definition is shown.
+class Node:
+    # ... (Full implementation from previous step)
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float); self.parents = parents; self.op = op
+        self.grad = None; self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward; return out
+    def backward(self):
+        topo, visited = [], set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo: v.grad = np.zeros_like(v.value)
+        self.grad = np.ones_like(self.value)
+        for v in reversed(topo): v._backward()
+
+# ==============================================================================
+#  Section 2: The 'nn' Module with all CNN layers
+# ==============================================================================
+
+class nn:
+    class Module:
+        def parameters(self): yield from []
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+
+    class Conv2d(Module):
+        # ... (Full implementation from previous step)
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+            self.in_channels, self.out_channels = in_channels, out_channels
+            self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
+            w_shape = (out_channels, in_channels, kernel_size, kernel_size)
+            self.weight = Node(np.random.randn(*w_shape) * np.sqrt(2. / (in_channels * kernel_size**2)))
+            self.bias = Node(np.zeros(out_channels))
+        def parameters(self): yield from [self.weight, self.bias]
+        def forward(self, x_node):
+            # ... (Full forward and backward implementation from previous step)
+            x = x_node.value; N, C_in, H_in, W_in = x.shape
+            H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+            X_col = self.im2col(x); W_col = self.weight.value.reshape(self.out_channels, -1)
+            b_col = self.bias.value.reshape(-1, 1); out_col = W_col @ X_col + b_col
+            out = out_col.reshape(self.out_channels, H_out, W_out, N).transpose(3, 0, 1, 2)
+            output_node = Node(out, parents=(x_node, self.weight, self.bias), op='conv2d')
+            def _backward():
+                if output_node.grad is None: return
+                dout_col = output_node.grad.transpose(1, 2, 3, 0).reshape(self.out_channels, -1)
+                d_weight_col = dout_col @ X_col.T
+                self.weight.grad += d_weight_col.reshape(self.weight.value.shape)
+                self.bias.grad += np.sum(dout_col, axis=1)
+                dW_col = W_col.T @ dout_col
+                x_node.grad += self.col2im(dW_col, x.shape)
+            output_node._backward = _backward; return output_node
+        def im2col(self, x):
+            N, C, H, W = x.shape; H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
+            x_padded = np.pad(x, ((0,0),(0,0),(self.padding,self.padding),(self.padding,self.padding)),'constant')
+            cols = np.zeros((C * self.kernel_size * self.kernel_size, N * H_out * W_out))
+            for h in range(H_out):
+                for w in range(W_out):
+                    patch = x_padded[:, :, h*self.stride:h*self.stride+self.kernel_size, w*self.stride:w*self.stride+self.kernel_size]
+                    cols[:, (h*W_out+w)*N:(h*W_out+w+1)*N] = patch.reshape(C*self.kernel_size*self.kernel_size, N)
+            return cols
+        def col2im(self, cols, x_shape):
+            N, C, H, W = x_shape; H_padded, W_padded = H + 2 * self.padding, W + 2 * self.padding
+            x_padded = np.zeros((N, C, H_padded, W_padded))
+            H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
+            W_out = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
+            cols = cols.reshape(C * self.kernel_size * self.kernel_size, H_out * W_out, N).transpose(2,0,1)
+            for h in range(H_out):
+                for w in range(W_out):
+                    patch = cols[:, :, h*W_out+w].reshape(N, C, self.kernel_size, self.kernel_size)
+                    x_padded[:, :, h*self.stride:h*self.stride+self.kernel_size, w*self.stride:w*self.stride+self.kernel_size] += patch
+            return x_padded[:, :, self.padding:self.padding+H, self.padding:self.padding+W]
+
+    # --- NEW: MaxPool2d Layer ---
+    class MaxPool2d(Module):
+        def __init__(self, kernel_size, stride=None):
+            self.kernel_size = kernel_size
+            self.stride = stride if stride is not None else kernel_size
+            self.cache = {} # To store the index of the max value for backprop
+
+        def forward(self, x_node):
+            x = x_node.value
+            N, C, H, W = x.shape
+            H_out = (H - self.kernel_size) // self.stride + 1
+            W_out = (W - self.kernel_size) // self.stride + 1
+            
+            output = np.zeros((N, C, H_out, W_out))
+            # Store the indices of the max values for the backward pass
+            max_indices = np.zeros_like(output, dtype=int)
+
+            for n in range(N):
+                for c in range(C):
+                    for h in range(H_out):
+                        for w in range(W_out):
+                            h_start, w_start = h * self.stride, w * self.stride
+                            h_end, w_end = h_start + self.kernel_size, w_start + self.kernel_size
+                            window = x[n, c, h_start:h_end, w_start:w_end]
+                            output[n, c, h, w] = np.max(window)
+                            # Find the index of the max value within the window
+                            max_idx_flat = np.argmax(window)
+                            max_indices[n, c, h, w] = max_idx_flat
+
+            self.cache['max_indices'] = max_indices
+            self.cache['input_shape'] = x.shape
+            
+            output_node = Node(output, parents=(x_node,), op='maxpool2d')
+
+            def _backward():
+                if output_node.grad is None: return
+                dx = np.zeros(self.cache['input_shape'])
+                dout = output_node.grad
+                max_indices = self.cache['max_indices']
+                
+                N, C, H_out, W_out = dout.shape
+                
+                for n in range(N):
+                    for c in range(C):
+                        for h in range(H_out):
+                            for w in range(W_out):
+                                h_start, w_start = h * self.stride, w * self.stride
+                                # Get the flat index of the max value
+                                max_idx_flat = max_indices[n, c, h, w]
+                                # Convert flat index to 2D index within the window
+                                max_h, max_w = np.unravel_index(max_idx_flat, (self.kernel_size, self.kernel_size))
+                                # Add the gradient only to the position of the max value
+                                dx[n, c, h_start + max_h, w_start + max_w] += dout[n, c, h, w]
+                
+                x_node.grad += dx
+
+            output_node._backward = _backward
+            return output_node
+
+    # --- NEW: Flatten Layer ---
+    class Flatten(Module):
+        def __init__(self):
+            self.cache = {}
+
+        def forward(self, x_node):
+            x = x_node.value
+            # Reshape from (N, C, H, W) to (N, C*H*W)
+            N = x.shape[0]
+            output_val = x.reshape(N, -1)
+            self.cache['input_shape'] = x.shape
+            
+            output_node = Node(output_val, parents=(x_node,), op='flatten')
+
+            def _backward():
+                if output_node.grad is None: return
+                # Reshape the gradient back to the original input shape
+                x_node.grad += output_node.grad.reshape(self.cache['input_shape'])
+
+            output_node._backward = _backward
+            return output_node
+
+# ==============================================================================
+#  Section 3: Demonstration of the New Layers
+# ==============================================================================
+
+if __name__ == "__main__":
+    print("--- Demonstrating MaxPool2d and Flatten Layers ---")
+    
+    # 1. Create a sample feature map (output from a conv layer)
+    np.random.seed(0)
+    feature_map = Node(np.random.randn(1, 2, 4, 4)) # Batch=1, Channels=2, 4x4
+    print(f"Input feature map shape: {feature_map.value.shape}")
+    print("Input feature map (first channel):\n", feature_map.value[0, 0])
+
+    # 2. Apply Max Pooling
+    pool_layer = nn.MaxPool2d(kernel_size=2, stride=2)
+    pooled_output = pool_layer(feature_map)
+    print(f"\nShape after MaxPool2d: {pooled_output.value.shape}")
+    print("Pooled output (first channel):\n", pooled_output.value[0, 0])
+    # Expected shape: (1, 2, 2, 2) - height and width are halved.
+    if pooled_output.value.shape == (1, 2, 2, 2):
+        print("✅ Success: MaxPool2d output shape is correct.")
+    else:
+        print("❌ Failure: MaxPool2d output shape is incorrect.")
+
+    # 3. Apply Flatten
+    flatten_layer = nn.Flatten()
+    flattened_output = flatten_layer(pooled_output)
+    print(f"\nShape after Flatten: {flattened_output.value.shape}")
+    # Expected shape: (1, 8) -> 1 * 2 * 2 * 2 = 8
+    if flattened_output.value.shape == (1, 8):
+        print("✅ Success: Flatten output shape is correct.")
+    else:
+        print("❌ Failure: Flatten output shape is incorrect.")
+        
+    # 4. Gradient Check for MaxPool2d (as a quick verification)
+    loss = (pooled_output * pooled_output).sum() # Dummy loss
+    loss.backward()
+    print("\nGradient check for MaxPool2d (should not be all zeros):")
+    print("Gradient w.r.t. input (first channel):\n", feature_map.grad[0, 0])
+    if np.any(feature_map.grad != 0):
+        print("✅ Success: Gradients flowed through MaxPool2d.")
+    else:
+        print("❌ Failure: Gradients did not flow through MaxPool2d.")
+
