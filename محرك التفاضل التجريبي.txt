@@ -1,0 +1,1202 @@
+# ==============================================================================
+# Manus DL Framework — Final improved script
+# Authors: You & Manus (reviewed)
+# Date: 2025-09-06
+# Features:
+#  - Safe autograd Node with broadcasting-aware grad accumulation
+#  - nn module with Conv2d (im2col/col2im), MaxPool2d, Linear, ReLU, Flatten
+#  - Adam optimizer with circular/echo propagation and Neumann steps
+#  - Train / eval for MNIST or CIFAR-10 and unit-tests (finite-diff)
+#  - MemoryManager for checkpointing and recomputation
+# ==============================================================================
+
+import numpy as np
+import time
+from typing import Callable
+import os
+import csv
+import sys # For estimating object size
+
+# Optional MNIST dataset for demo
+try:
+    from tensorflow.keras.datasets import mnist
+    _HAS_MNIST = True
+except Exception:
+    _HAS_MNIST = False
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def _sum_to_shape(grad: np.ndarray, shape: tuple):
+    """Reduce grad to `shape` by summing over extra axes (broadcast inverse)."""
+    if grad.shape == tuple(shape):
+        return grad.copy()
+    g = grad
+    # sum leading axes
+    while g.ndim > len(shape):
+        g = g.sum(axis=0)
+    # sum axes where target dim == 1
+    for axis, dim in enumerate(shape):
+        if dim == 1 and g.shape[axis] != 1:
+            g = g.sum(axis=axis, keepdims=True)
+    if g.shape != tuple(shape):
+        g = g.reshape(shape)
+    return g
+
+def global_norm(tensors):
+    s = 0.0
+    for t in tensors:
+        if t is None: continue
+        s += np.sum(t ** 2)
+    return np.sqrt(s)
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    try:
+        import random as _r
+        _r.seed(seed)
+    except Exception:
+        pass
+
+# ----------------------------
+# Core Node / Tensor + Autograd
+# ----------------------------
+class Node:
+    """
+    Lightweight tensor with autograd:
+    - value: np.ndarray (float32 or float16 depending on config)
+    - parents: tuple of parent Nodes
+    - op: operation name
+    - grad: gradient array (same shape as value) or None
+    - _backward: function(out_node, memory_manager=None) applying gradient propagation to parents
+    Extra:
+    - mark `is_param=True` for trainable params (convenience, not required)
+    - 'is_constant' to avoid including node in pruned topo
+    """
+    def __init__(self, value, parents=(), op='', is_param=False, is_constant=False):
+        self.value = np.array(value, dtype=np.float32)
+        self.parents = tuple(parents)
+        self.op = op
+        self.grad = None
+        self._backward = lambda out_node, memory_manager=None: None
+        self.is_param = is_param
+        self.is_constant = is_constant
+        self.name = op
+
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=np.float32))
+
+    def _accumulate(self, param, grad):
+        if not isinstance(param, Node):
+            raise TypeError("param must be Node")
+        if param.grad is None:
+            param.grad = np.zeros_like(param.value, dtype=param.value.dtype)
+        g_reduced = _sum_to_shape(grad, param.value.shape)
+        param.grad += g_reduced
+
+    # arithmetic ops (vectorized)
+    def __add__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value + other.value, (self, other), '+')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, out_node.grad)
+            self._accumulate(other, out_node.grad)
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value * other.value, (self, other), '*')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, other.value * out_node.grad)
+            self._accumulate(other, self.value * out_node.grad)
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value @ other.value, (self, other), '@')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, out_node.grad @ other.value.T)
+            self._accumulate(other, self.value.T @ out_node.grad)
+        out._backward = _backward
+        return out
+
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-self._ensure(other))
+    def __pow__(self, p):
+        out = Node(self.value ** p, (self,), f'**{p}')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, (p * (self.value ** (p - 1))) * out_node.grad)
+        out._backward = _backward
+        return out
+    def __truediv__(self, other): return self * (self._ensure(other) ** -1)
+
+    # elementwise
+    def relu(self):
+        out = Node(np.maximum(0, self.value), (self,), 'ReLU')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, (self.value > 0).astype(np.float32) * out_node.grad)
+        out._backward = _backward
+        return out
+
+    def log(self):
+        eps = 1e-12
+        out = Node(np.log(np.maximum(self.value, eps)), (self,), 'log')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, (1.0 / np.maximum(self.value, eps)) * out_node.grad)
+        out._backward = _backward
+        return out
+
+    def exp(self):
+        val = np.exp(np.clip(self.value, -100, 100))
+        out = Node(val, (self,), 'exp')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, val * out_node.grad)
+        out._backward = _backward
+        return out
+
+    def sum(self, axis=None, keepdims=False):
+        out_val = self.value.sum(axis=axis, keepdims=keepdims)
+        out = Node(out_val, (self,), 'sum')
+        def _backward(out_node, memory_manager=None):
+            grad = out_node.grad
+            if axis is not None and not keepdims:
+                grad = np.expand_dims(grad, axis)
+            self._accumulate(self, np.broadcast_to(grad, self.value.shape))
+        out._backward = _backward
+        return out
+
+    def reshape(self, *shape):
+        out = Node(self.value.reshape(*shape), (self,), 'reshape')
+        def _backward(out_node, memory_manager=None):
+            self._accumulate(self, out_node.grad.reshape(self.value.shape))
+        out._backward = _backward
+        return out
+
+    # topo & backward
+    def build_topo(self, prune_minimal=False):
+        """
+        Build topo (forward order). If prune_minimal=True, prune nodes marked is_constant or leaves without
+        meaningful backward (heuristic). This reduces memory for stored topo used in Neumann.
+        """
+        topo = []
+        visited = set()
+        def build(v):
+            vid = id(v)
+            if vid in visited: return
+            visited.add(vid)
+            for p in v.parents: build(p)
+            topo.append(v)
+        build(self)
+        if not prune_minimal:
+            return topo
+        # prune: keep nodes that are params or not is_constant or have non-trivial parents
+        pruned = []
+        for v in topo:
+            # Keep if it's a parameter, or not marked as constant, or has parents (implies it's an intermediate op output)
+            if v.is_param or not v.is_constant or len(v.parents) > 0:
+                 pruned.append(v)
+        return pruned
+
+
+    def backward(self, prune_topo=False, memory_manager=None):
+        """
+        Run backward and RETURN topo (optionally pruned).
+        Usage:
+            topo = loss.backward(prune_topo=True, memory_manager=manager)
+            optimizer.step(topo_graph=topo)
+        """
+        topo = self.build_topo(prune_minimal=prune_topo)
+        # reset grads
+        for v in topo:
+            v.grad = None
+        # root grad
+        self.grad = np.ones_like(self.value)
+        # reversed
+        for v in reversed(topo):
+            if v.grad is None:
+                v.grad = np.zeros_like(v.value)
+            v._backward(v, memory_manager=memory_manager) # Pass memory_manager
+        return topo
+
+# ----------------------------
+# Softmax & stable CE
+# ----------------------------
+def softmax(node: Node, axis=-1):
+    # returns Node; attach stable backward that uses output stored value
+    maxv = Node(np.max(node.value, axis=axis, keepdims=True))
+    shifted = node - maxv
+    expn = shifted.exp()
+    sumexp = expn.sum(axis=axis, keepdims=True)
+    out = expn / sumexp
+
+    # override backward to use softmax-Jacobian form (more accurate)
+    def _backward(out_node, memory_manager=None):
+        if node.grad is None:
+            node.grad = np.zeros_like(node.value)
+        g = out_node.grad
+        s = (g * out_node.value).sum(axis=axis, keepdims=True)
+        node.grad += out_node.value * (g - s)
+    out._backward = _backward
+    return out
+
+def cross_entropy_loss_stable(logits_node: Node, labels_numpy: np.ndarray):
+    # logits_node: Node (N, C)
+    N, C = logits_node.value.shape
+    max_logits = Node(np.max(logits_node.value, axis=1, keepdims=True))
+    shifted = logits_node - max_logits
+    lse = (shifted.exp().sum(axis=1, keepdims=True)).log()
+    log_probs = shifted - lse
+    one_hot = np.zeros((N, C), dtype=np.float32)
+    one_hot[np.arange(N), labels_numpy] = 1.0
+    one_hot_node = Node(one_hot, is_constant=True)
+
+    loss = -(one_hot_node * log_probs).sum() / N
+
+    # Override backward for the loss node to directly compute dL/d(logits)
+    def _backward(out_node, memory_manager=None):
+         predicted_probs = softmax(logits_node, axis=-1).value
+         true_probs = one_hot_node.value
+         grad_logits = (predicted_probs - true_probs) / N
+         if logits_node.grad is None:
+              logits_node.grad = np.zeros_like(logits_node.value)
+         logits_node.grad += grad_logits * out_node.grad
+
+    loss._backward = _backward
+    return loss
+
+# ----------------------------
+# im2col / col2im
+# ----------------------------
+def im2col(x, KH, KW, SH=1, SW=1, PH=0, PW=0):
+    # x: (N, C, H, W)
+    N, C, H, W = x.shape
+    H_p = H + 2*PH; W_p = W + 2*PW
+    OH = (H_p - KH)//SH + 1; OW = (W_p - KW)//SW + 1
+    x_p = np.pad(x, ((0,0),(0,0),(PH,PH),(PW,PW)), mode='constant')
+    cols = np.zeros((N, OH, OW, C*KH*KW), dtype=x.dtype)
+    idx = 0
+    for i in range(0, H_p - KH + 1, SH):
+        for j in range(0, W_p - KW + 1, SW):
+            patch = x_p[:, :, i:i+KH, j:j+KW]
+            cols[:, idx//OW, idx%OW, :] = patch.reshape(N, -1)
+            idx += 1
+    return cols, OH, OW
+
+def col2im(cols, x_shape, KH, KW, SH=1, SW=1, PH=0, PW=0):
+    N, C, H, W = x_shape
+    H_p = H + 2*PH; W_p = W + 2*PW
+    OH = (H_p - KH)//SH + 1; OW = (W_p - KW)//SW + 1
+    x_p = np.zeros((N, C, H_p, W_p), dtype=cols.dtype)
+    idx = 0
+    for i in range(0, H_p - KH + 1, SH):
+        for j in range(0, W_p - KW + 1, SW):
+            patch = cols[:, idx//OW, idx%OW, :].reshape(N, C, KH, KW)
+            x_p[:, :, i:i+KH, j:j+KW] += patch
+            idx += 1
+    return x_p[:, :, PH:PH+H, PW:PW+W]
+
+# ----------------------------
+# nn modules
+# ----------------------------
+class nn:
+    class Module:
+        def train(self):
+            self._is_training = True
+            for v in self.__dict__.values():
+                if isinstance(v, nn.Module): v.train()
+        def eval(self):
+            self._is_training = False
+            for v in self.__dict__.values():
+                if isinstance(v, nn.Module): v.eval()
+        def parameters(self):
+            for v in self.__dict__.values():
+                if isinstance(v, nn.Module):
+                    yield from v.parameters()
+                elif isinstance(v, Node):
+                    yield v
+        def __call__(self, *args, **kwargs): return self.forward(*args, **kwargs)
+        def zero_grad(self):
+            for p in self.parameters(): p.grad = None
+        def estimate_cache_bytes(self, input_shape):
+            return 0
+        def free_cache(self):
+            pass
+        def recompute_from_input(self, input_arr):
+            raise NotImplementedError(f"Recompute not implemented for {self.__class__.__name__}")
+
+
+    class Linear(Module):
+        def __init__(self, in_features, out_features):
+            self.in_features = in_features
+            self.out_features = out_features
+            limit = np.sqrt(2 / in_features)
+            self.weight = Node(np.random.randn(in_features, out_features).astype(np.float32) * limit, (), 'linear_weight', is_param=True)
+            self.bias = Node(np.zeros(out_features, dtype=np.float32), (), 'linear_bias', is_param=True)
+        def forward(self, x: Node):
+            out_val = x.value @ self.weight.value + self.bias.value
+            out = Node(out_val, (x, self.weight, self.bias), 'linear')
+            def _backward(out_node, memory_manager=None):
+                if self.bias.grad is None: self.bias.grad = np.zeros_like(self.bias.value)
+                if self.weight.grad is None: self.weight.grad = np.zeros_like(self.weight.value)
+                if x.grad is None: x.grad = np.zeros_like(x.value)
+                self.bias.grad += out_node.grad.sum(axis=0)
+                if x.value.ndim == 1:
+                    self.weight.grad += np.outer(x.value, out_node.grad)
+                    x.grad += self.weight.value @ out_node.grad
+                else:
+                    self.weight.grad += x.value.T @ out_node.grad
+                    x.grad += out_node.grad @ self.weight.value.T
+            out._backward = _backward
+            return out
+        def parameters(self): yield from [self.weight, self.bias]
+
+    class ReLU(Module):
+        def forward(self, x: Node):
+            return x.relu()
+
+    class Flatten(Module):
+        def forward(self, x: Node):
+            return x.reshape(x.value.shape[0], -1)
+
+    class Conv2d(Module):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+            self.in_channels = in_channels; self.out_channels = out_channels
+            self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+            self.stride = (stride, stride) if isinstance(stride, int) else stride
+            self.padding = (padding, padding) if isinstance(padding, int) else padding
+            KH, KW = self.kernel_size
+            limit = np.sqrt(2 / (in_channels * KH * KW))
+            self.weight = Node(np.random.randn(out_channels, in_channels, KH, KW).astype(np.float32) * limit, (), 'conv_weight', is_param=True)
+            self.bias = Node(np.zeros(out_channels, dtype=np.float32), (), 'conv_bias', is_param=True)
+            self.x_shape = None; self.x_cols = None; self.OH = None; self.OW = None
+        def forward(self, x: Node):
+            x_arr = x.value
+            self.x_shape = x_arr.shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            cols, OH, OW = im2col(x_arr, KH, KW, SH, SW, PH, PW)
+            self.x_cols = cols
+            self.OH, self.OW = OH, OW
+            W_flat = self.weight.value.reshape(self.out_channels, -1)
+            out = cols @ W_flat.T
+            out = out.transpose(0,3,1,2)
+            out += self.bias.value.reshape(1, -1, 1, 1)
+            node_out = Node(out, (x, self.weight, self.bias), 'conv2d')
+
+            def _backward(out_node, memory_manager=None):
+                x_cols = None
+                # Check if memory_manager is provided and can get the cache
+                if memory_manager:
+                    # Need the input array (x.value) to potentially recompute
+                    x_cols = memory_manager.get_cache(self, 'x_cols', x.value)
+                # If not retrieved from memory_manager, fall back to layer's own cache (if exists)
+                if x_cols is None:
+                    x_cols = self.x_cols
+
+                if x_cols is None:
+                     raise RuntimeError(f"Conv2d cache (x_cols) not available for layer {self.name} during backward.")
+
+
+                N, C_out, OH2, OW2 = out_node.grad.shape
+                KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+                if self.bias.grad is None: self.bias.grad = np.zeros_like(self.bias.value)
+                if self.weight.grad is None: self.weight.grad = np.zeros_like(self.weight.value)
+                if x.grad is None: x.grad = np.zeros_like(x.value)
+                self.bias.grad += out_node.grad.sum(axis=(0,2,3))
+                out_grad_flat = out_node.grad.transpose(0,2,3,1).reshape(N * self.OH * self.OW, -1)
+                x_col_flat = x_cols.reshape(N * self.OH * self.OW, -1)
+                weight_grad_flat = x_col_flat.T @ out_grad_flat
+                self.weight.grad += weight_grad_flat.T.reshape(self.weight.value.shape)
+                W_flat = self.weight.value.reshape(self.out_channels, -1)
+                x_grad_col_flat = out_grad_flat @ W_flat
+                x_grad_cols = x_grad_col_flat.reshape(N, self.OH, self.OW, -1)
+                x_grad = col2im(x_grad_cols, self.x_shape, KH, KW, SH, SW, PH, PW)
+                x.grad += x_grad
+            node_out._backward = _backward
+            return node_out
+
+        def parameters(self): yield from [self.weight, self.bias]
+
+        def estimate_cache_bytes(self, input_shape):
+            N, C, H, W = input_shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            H_p = H + 2*PH; W_p = W + 2*PW
+            OH = (H_p - KH)//SH + 1; OW = (W_p - KW)//SW + 1
+            cache_size = N * OH * OW * (C * KH * KW) * np.dtype(np.float32).itemsize
+            return cache_size
+
+        def free_cache(self):
+            self.x_cols = None
+            self.x_shape = None
+            self.OH = None; self.OW = None
+
+        def recompute_from_input(self, input_arr):
+            self.x_shape = input_arr.shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            self.x_cols, self.OH, self.OW = im2col(input_arr, KH, KW, SH, SW, PH, PW)
+
+
+    class MaxPool2d(Module):
+        def __init__(self, kernel_size, stride=None, padding=0):
+            self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+            self.stride = (stride, stride) if isinstance(stride, int) else (kernel_size, kernel_size) if stride is None else stride
+            self.padding = (padding, padding) if isinstance(padding, int) else padding
+            self.x_shape = None; self.max_mask = None
+        def forward(self, x: Node):
+            x_arr = x.value
+            self.x_shape = x_arr.shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            cols, OH, OW = im2col(x_arr, KH, KW, SH, SW, PH, PW)
+            N = x_arr.shape[0]
+            C = x_arr.shape[1]
+            cols_resh = cols.reshape(N, OH, OW, C, KH*KW)
+            max_idx = np.argmax(cols_resh, axis=4)
+            out = np.max(cols_resh, axis=4).transpose(0,3,1,2)
+            mask = np.zeros_like(cols_resh, dtype=np.float32)
+            n,h,w,c = max_idx.shape
+            for i in range(n):
+                for h_idx in range(h):
+                    for w_idx in range(w):
+                         mask[i, h_idx, w_idx, :, max_idx[i, h_idx, w_idx, :]] = 1.0
+            self.max_mask = mask
+            node_out = Node(out, (x,), 'maxpool2d')
+            def _backward(out_node, memory_manager=None):
+                max_mask = None
+                if memory_manager:
+                     max_mask = memory_manager.get_cache(self, 'max_mask', x.value)
+                if max_mask is None:
+                     max_mask = self.max_mask
+
+                if max_mask is None:
+                     raise RuntimeError(f"MaxPool2d cache (max_mask) not available for layer {self.name} during backward.")
+
+
+                if x.grad is None: x.grad = np.zeros_like(x.value)
+                g = out_node.grad
+                g_exp = g.transpose(0,2,3,1)[..., np.newaxis]
+                grad_cols = (g_exp * max_mask).reshape(x.value.shape[0], max_mask.shape[1], max_mask.shape[2], -1)
+                KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+                x_grad = col2im(grad_cols, self.x_shape, KH, KW, SH, SW, PH, PW)
+                x.grad += x_grad
+            node_out._backward = _backward
+            return node_out
+        def parameters(self): yield from []
+
+        def estimate_cache_bytes(self, input_shape):
+            N, C, H, W = input_shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            H_p = H + 2*PH; W_p = W + 2*PW
+            OH = (H_p - KH)//SH + 1; OW = (W_p - KW)//SW + 1
+            cache_size = N * OH * OW * C * KH * KW * np.dtype(np.float32).itemsize
+            return cache_size
+
+        def free_cache(self):
+            self.max_mask = None
+            self.x_shape = None
+
+        def recompute_from_input(self, input_arr):
+            self.x_shape = input_arr.shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            cols, OH, OW = im2col(input_arr, KH, KW, SH, SW, PH, PW)
+            N = input_arr.shape[0]
+            C = input_arr.shape[1]
+            cols_resh = cols.reshape(N, OH, OW, C, KH*KW)
+            max_idx = np.argmax(cols_resh, axis=4)
+            mask = np.zeros_like(cols_resh, dtype=np.float32)
+            n,h,w,c = max_idx.shape
+            for i in range(n):
+                for h_idx in range(h):
+                    for w_idx in range(w):
+                         mask[i, h_idx, w_idx, :, max_idx[i, h_idx, w_idx, :]] = 1.0
+            self.max_mask = mask
+
+
+    class AvgPool2d(Module):
+        def __init__(self, kernel_size, stride=None, padding=0):
+            self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+            self.stride = (stride, stride) if isinstance(stride, int) else (kernel_size, kernel_size) if stride is None else stride
+            self.padding = (padding, padding) if isinstance(padding, int) else padding
+            self.x_shape = None; self.OH = None; self.OW = None
+        def forward(self, x: Node):
+            x_arr = x.value
+            self.x_shape = x_arr.shape
+            N, C, H, W = self.x_shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+
+            H_padded = H + 2 * PH; W_padded = W + 2 * PW
+            OH = (H_padded - KH)//SH + 1; OW = (W_padded - KW)//SW + 1
+            self.OH, self.OW = OH, OW
+
+            x_padded = np.pad(x_arr, ((0,0),(0,0),(PH,PH),(PW,PW)), mode='constant')
+            view_shape = (N, C, OH, OW, KH, KW)
+            strides = (x_padded.strides[0], x_padded.strides[1],
+                       x_padded.strides[2]*SH, x_padded.strides[3]*SW,
+                       x_padded.strides[2], x_padded.strides[3])
+            patches = np.lib.stride_tricks.as_strided(x_padded, shape=view_shape, strides=strides, writeable=False)
+            out_val = np.mean(patches, axis=(4,5))
+            out = Node(out_val, (x,), 'avgpool2d')
+            def _backward(out_node, memory_manager=None):
+                if x.grad is None: x.grad = np.zeros_like(x.value)
+                N, C, H_out, W_out = out_node.grad.shape
+                N_in, C_in, H_in, W_in = self.x_shape
+                KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+
+                grad_x_padded = np.zeros((N_in, C_in, H_in + 2*PH, W_in + 2*PW), dtype=out_node.grad.dtype)
+                out_grad_expanded = out_node.grad[:, :, :, :, np.newaxis, np.newaxis]
+                grad_per_element = out_grad_expanded / (KH * KW)
+
+                view_shape = (N, C, H_out, W_out, KH, KW)
+                strides = (grad_x_padded.strides[0], grad_x_padded.strides[1],
+                           grad_x_padded.strides[2]*SH, grad_x_padded.strides[3]*SW,
+                           grad_x_padded.strides[2], grad_x_padded.strides[3])
+                grad_windows_view = np.lib.stride_tricks.as_strided(grad_x_padded, view_shape, strides, writeable=True)
+                grad_windows_view += grad_per_element
+                x.grad += grad_x_padded[:, :, PH:H_in+PH, PW:W_in+PW]
+            out._backward = _backward
+            return out
+        def parameters(self): yield from []
+
+        def estimate_cache_bytes(self, input_shape):
+            return 0
+
+        def free_cache(self):
+            self.x_shape = None
+            self.OH = None
+            self.OW = None
+
+        def recompute_from_input(self, input_arr):
+            self.x_shape = input_arr.shape
+            N, C, H, W = self.x_shape
+            KH, KW = self.kernel_size; SH, SW = self.stride; PH, PW = self.padding
+            H_padded = H + 2*PH; W_padded = W + 2*PW
+            self.OH = (H_padded - KH)//SH + 1; self.OW = (W_padded - KW)//SW + 1
+
+
+    class Sequential(Module):
+        def __init__(self, *layers):
+            self.layers = layers
+            for i, layer in enumerate(self.layers):
+                 if not hasattr(layer, 'name') or not layer.name:
+                     layer.name = f"{layer.__class__.__name__}_{i}"
+
+        def forward(self, x: Node):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+        def parameters(self):
+            for layer in self.layers:
+                yield from layer.parameters()
+
+# ----------------------------
+# MemoryManager Class
+# ----------------------------
+class MemoryManager:
+    def __init__(self, model, budget_bytes: float, segment_size: int = 2, compression: str = None, spill_to_disk: bool = False):
+        self.model = model
+        self.budget_bytes = budget_bytes
+        self.segment_size = segment_size
+        self.compression = compression
+        self.spill_to_disk = spill_to_disk
+
+        self.segment_inputs = {}
+        self.layer_caches = {}
+        self.cache_metadata = {}
+
+        self._current_memory_usage = 0.0
+
+        if self.spill_to_disk:
+            self._disk_cache_dir = "./_memory_cache"
+            os.makedirs(self._disk_cache_dir, exist_ok=True)
+            print(f"Disk cache enabled. Storing temporary files in {self._disk_cache_dir}")
+
+    def estimate_layer_cache_size(self, layer, input_shape):
+        if hasattr(layer, 'estimate_cache_bytes'):
+            return layer.estimate_cache_bytes(input_shape)
+        return 0
+
+    def checkpoint_forward(self, topo, input_node):
+        self.segment_inputs = {}
+        self.layer_caches = {}
+        self.cache_metadata = {}
+        self._current_memory_usage = 0.0
+
+        current_segment_start_node = input_node
+        current_segment_index = 0
+
+        forward_topo = self._get_forward_topo(topo)
+
+        for i, node in enumerate(forward_topo):
+            layer = self._get_layer_from_output_node(node)
+
+            if layer:
+                 if current_segment_index not in self.segment_inputs:
+                      self.segment_inputs[current_segment_index] = current_segment_start_node.value.copy()
+                      self._current_memory_usage += self.segment_inputs[current_segment_index].nbytes
+
+                 layer_input_node = next((p for p in node.parents if isinstance(p, Node)), None)
+                 if layer_input_node:
+                     cache_size = self.estimate_layer_cache_size(layer, layer_input_node.value.shape)
+                     if self._current_memory_usage + cache_size <= self.budget_bytes:
+                          self._store_layer_cache(layer, node)
+                     else:
+                          pass
+
+                 layer_index = self._get_layer_index(layer)
+                 if layer_index is not None and (layer_index + 1) % self.segment_size == 0:
+                      current_segment_index += 1
+                      current_segment_start_node = node
+
+        self._enforce_budget()
+
+    def _store_layer_cache(self, layer, output_node):
+        if hasattr(layer, 'x_cols') and layer.x_cols is not None:
+             self.layer_caches[id(layer)] = {'type': 'x_cols', 'data': layer.x_cols.copy()}
+             self._current_memory_usage += self.layer_caches[id(layer)]['data'].nbytes
+             self.cache_metadata[id(layer)] = {'size': self.layer_caches[id(layer)]['data'].nbytes, 'last_accessed': time.time()}
+        elif hasattr(layer, 'max_mask') and layer.max_mask is not None:
+             self.layer_caches[id(layer)] = {'type': 'max_mask', 'data': layer.max_mask.copy()}
+             self._current_memory_usage += self.layer_caches[id(layer)]['data'].nbytes
+             self.cache_metadata[id(layer)] = {'size': self.layer_caches[id(layer)]['data'].nbytes, 'last_accessed': time.time()}
+
+    def get_cache(self, layer, cache_type: str, input_arr: np.ndarray):
+        layer_id = id(layer)
+        if layer_id in self.layer_caches and self.layer_caches[layer_id]['type'] == cache_type:
+            self.cache_metadata[layer_id]['last_accessed'] = time.time()
+            return self.layer_caches[layer_id]['data']
+        else:
+            if hasattr(layer, 'recompute_from_input'):
+                 layer.recompute_from_input(input_arr)
+                 recomputed_cache = getattr(layer, cache_type, None)
+                 setattr(layer, cache_type, None)
+                 return recomputed_cache
+            else:
+                raise NotImplementedError(f"Recomputation not supported for {layer.__class__.__name__}")
+
+    def _enforce_budget(self):
+        while self._current_memory_usage > self.budget_bytes and self.layer_caches:
+            oldest_layer_id = min(self.cache_metadata, key=lambda k: self.cache_metadata[k]['last_accessed'])
+            freed_size = self.layer_caches[oldest_layer_id]['data'].nbytes
+            del self.layer_caches[oldest_layer_id]
+            del self.cache_metadata[oldest_layer_id]
+            self._current_memory_usage -= freed_size
+
+    def free_all_caches(self):
+        for layer in self.model.layers:
+             layer.free_cache()
+        self.layer_caches = {}
+        self.cache_metadata = {}
+        self.segment_inputs = {}
+        self._current_memory_usage = 0.0
+
+    def _get_forward_topo(self, backward_topo):
+        if backward_topo is None:
+             return []
+        return list(reversed(backward_topo))
+
+    def _get_layer_from_output_node(self, node):
+        try:
+            layer_ops = {
+                'linear': nn.Linear,
+                'relu': nn.ReLU,
+                'flatten': nn.Flatten,
+                'conv2d': nn.Conv2d,
+                'maxpool2d': nn.MaxPool2d,
+                'avgpool2d': nn.AvgPool2d
+            }
+            if node.op in layer_ops:
+                 for layer in self.model.layers:
+                      if isinstance(layer, layer_ops[node.op]):
+                           return layer
+        except NameError:
+             return None
+        return None
+
+    def _get_layer_index(self, layer):
+        try:
+            return self.model.layers.index(layer)
+        except ValueError:
+            return None
+
+# ----------------------------
+# Enhanced Adam/AdamW + Circular/Echo + improvements
+# ----------------------------
+class AdamOptimizer:
+    def __init__(self, params, lr=1e-3, betas=(0.9,0.999), eps=1e-8,
+                 weight_decay=0.0, adamw=True,
+                 circular_strength=0.0, echo_freq=1, neumann_steps=1,
+                 echo_norm_clip=None, source_selector:Callable=None, target_selector:Callable=None,
+                 grad_clip=None, loss_scale=1.0, prune_topo=False, logging_csv=None):
+        self.params = list(params)
+        self.lr = lr; self.beta1, self.beta2 = betas; self.eps = eps
+        self.weight_decay = weight_decay; self.adamw = adamw
+        self.t = 0
+        self.m = {id(p): np.zeros_like(p.value) for p in self.params}
+        self.v = {id(p): np.zeros_like(p.value) for p in self.params}
+        self.circular_strength = float(circular_strength)
+        self.echo_freq = int(echo_freq)
+        self.neumann_steps = max(1, int(neumann_steps))
+        self.echo_norm_clip = echo_norm_clip
+        self.source_selector = source_selector
+        self.target_selector = target_selector
+        self.grad_clip = grad_clip
+        self.loss_scale = float(loss_scale) if loss_scale is not None else 1.0
+        self.prune_topo = prune_topo
+        self.logging_csv = logging_csv
+        self.logs = []
+        self.state = {}
+
+    def zero_grad(self):
+        for p in self.params: p.grad = None
+
+    def _clip_grads(self):
+        if self.grad_clip is None: return
+        grads = [p.grad for p in self.params if p.grad is not None]
+        gn = global_norm(grads)
+        if gn > self.grad_clip:
+            scale = self.grad_clip / (gn + 1e-12)
+            for p in self.params:
+                if p.grad is not None:
+                    p.grad *= scale
+
+    def step(self, topo_graph=None, memory_manager=None, echo_strategy='concat', echo_weighting='grad', echo_distribution='chunk'):
+        self.t += 1
+        self._clip_grads()
+
+        for p in self.params:
+            if p.grad is None:
+                p.grad = np.zeros_like(p.value)
+            p.original_grad = p.grad.copy()
+
+            if self.adamw:
+                p.value -= self.lr * self.weight_decay * p.value
+
+            self.m[id(p)] = self.beta1 * self.m[id(p)] + (1 - self.beta1) * p.grad
+            self.v[id(p)] = self.beta2 * self.v[id(p)] + (1 - self.beta2) * (p.grad ** 2)
+            m_hat = self.m[id(p)] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[id(p)] / (1 - self.beta2 ** self.t)
+
+            p.value -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+        if self.circular_strength > 0 and topo_graph is not None and (self.t % self.echo_freq == 0):
+            sources = [p for p in self.params if getattr(p, 'original_grad', None) is not None]
+            if self.source_selector:
+                 sources = [p for p in sources if self.source_selector(p)]
+
+            if not sources: return
+
+            echo_components = []
+            for p in sources:
+                grad = getattr(p, 'original_grad', np.zeros_like(p.value))
+                if echo_weighting == 'param':
+                     weight = np.abs(p.value)
+                     echo_components.append(grad * weight)
+                elif echo_weighting == 'grad':
+                     echo_components.append(grad)
+                elif echo_weighting == 'none':
+                    echo_components.append(grad)
+
+            if not echo_components: return
+
+            if echo_strategy == 'concat':
+                echo_vector = np.concatenate([c.flatten() for c in echo_components])
+            elif echo_strategy == 'avg':
+                if len(set([c.shape for c in echo_components])) == 1:
+                    echo_vector = np.mean(echo_components, axis=0)
+                else:
+                    print("Warning: Cannot average echo components of different shapes. Skipping echo.")
+                    return
+
+            norm = np.linalg.norm(echo_vector.ravel())
+            if norm > 0:
+                echo_vector = echo_vector / (norm + 1e-12) * self.circular_strength
+                if self.echo_norm_clip is not None:
+                    en = np.linalg.norm(echo_vector.ravel())
+                    if en > self.echo_norm_clip:
+                        echo_vector *= self.echo_norm_clip / (en + 1e-12)
+
+            for p in self.params: p.grad = None
+
+            targets = self.params
+            if self.target_selector:
+                 targets = [p for p in targets if self.target_selector(p)]
+
+            if not targets: return
+
+            if echo_distribution == 'chunk':
+                total_target_size = sum(p.value.size for p in targets)
+                if total_target_size == 0: return
+
+                current_idx = 0
+                for p in targets:
+                    chunk_size = p.value.size
+                    if current_idx + chunk_size > len(echo_vector):
+                        chunk_size = len(echo_vector) - current_idx
+                        if chunk_size <= 0: break
+
+                    try:
+                         echo_chunk = echo_vector[current_idx : current_idx + chunk_size].reshape(p.value.shape)
+                    except ValueError:
+                         print(f"Warning: Reshape failed for echo chunk injection into parameter {p.name}. Skipping injection for this param.")
+                         current_idx += chunk_size
+                         continue
+
+                    if p.grad is None:
+                         p.grad = np.zeros_like(p.value)
+                    p.grad += echo_chunk
+
+                    current_idx += chunk_size
+                    if current_idx >= len(echo_vector): break
+
+            if topo_graph:
+                 loss_node_for_reprop = topo_graph[0]
+
+                 original_topo = loss_node_for_reprop.build_topo(prune_minimal=self.prune_topo)
+                 for v in original_topo:
+                     is_target_for_injection = False
+                     for target_p in targets:
+                          if id(v) == id(target_p) and v.grad is not None:
+                              is_target_for_injection = True
+                              break
+                     if not is_target_for_injection:
+                          v.grad = None
+
+                 loss_node_for_reprop.backward(prune_topo=self.prune_topo, memory_manager=memory_manager)
+
+        if self.logging_csv:
+             log_entry = {
+                 'step': self.t,
+                 'lr': self.lr,
+                 'loss_scale': self.loss_scale,
+             }
+             for p in self.params:
+                  if hasattr(p, 'original_grad') and p.original_grad is not None:
+                       log_entry[f'{p.name}_orig_grad_norm'] = np.linalg.norm(p.original_grad.ravel())
+                  if p.grad is not None:
+                       log_entry[f'{p.name}_final_grad_norm'] = np.linalg.norm(p.grad.ravel())
+                  log_entry[f'{p.name}_param_norm'] = np.linalg.norm(p.value.ravel())
+
+             self.logs.append(log_entry)
+
+             if self.t == 1 or not os.path.exists(self.logging_csv):
+                 with open(self.logging_csv, 'w', newline='') as f:
+                     writer = csv.DictWriter(f, fieldnames=self.logs[0].keys())
+                     writer.writeheader()
+             with open(self.logging_csv, 'a', newline='') as f:
+                 writer = csv.DictWriter(f, fieldnames=self.logs[-1].keys())
+                 writer.writerow(self.logs[-1])
+
+    def checkpoint(self, filepath):
+        state = {
+            't': self.t,
+            'm': {id(p): self.m[id(p)] for p in self.params},
+            'v': {id(p): self.v[id(p)] for p in self.params},
+            'param_values': {id(p): p.value for p in self.params},
+        }
+        np.savez(filepath, **state)
+        print(f"Optimizer state and parameters saved to {filepath}")
+
+    def load_checkpoint(self, filepath, load_params=True):
+        try:
+            state = np.load(filepath, allow_pickle=True)
+            self.t = state['t'].item()
+            loaded_m = state['m'].item()
+            loaded_v = state['v'].item()
+            loaded_param_values = state['param_values'].item()
+
+            for p in self.params:
+                if id(p) in loaded_m:
+                    self.m[id(p)] = loaded_m[id(p)]
+                if id(p) in loaded_v:
+                    self.v[id(p)] = loaded_v[id(p)]
+                if load_params and id(p) in loaded_param_values:
+                    p.value[:] = loaded_param_values[id(p)]
+
+            print(f"Optimizer state and parameters loaded from {filepath}")
+        except FileNotFoundError:
+            print(f"Checkpoint file not found at {filepath}. Starting from scratch.")
+        except Exception as e:
+            print(f"Error loading checkpoint from {filepath}: {e}. Starting from scratch.")
+
+# ----------------------------
+# training loop
+# ----------------------------
+def batch_iterator(X, y, batch_size=256, shuffle=True):
+    n = X.shape[0]; idx = np.arange(n)
+    if shuffle: np.random.shuffle(idx)
+    for i in range(0, n, batch_size):
+        s = idx[i:i+batch_size]
+        yield X[s], y[s]
+
+def init_model_weights(model):
+    for layer in getattr(model, 'layers', []):
+        if isinstance(layer, nn.Linear):
+            limit = np.sqrt(2 / layer.weight.value.shape[0])
+            layer.weight.value[:] = np.random.randn(*layer.weight.value.shape).astype(np.float32) * limit
+            layer.bias.value[:] = 0
+        if isinstance(layer, nn.Conv2d):
+            KH, KW = layer.kernel_size
+            in_ch = layer.weight.value.shape[1]
+            limit = np.sqrt(2 / (in_ch * KH * KW))
+            layer.weight.value[:] = np.random.randn(*layer.weight.value.shape).astype(np.float32) * limit
+            layer.bias.value[:] = 0
+
+def run_final_experiment(model_factory, X_train, y_train, X_test, y_test, config, experiment_name):
+    """
+    نسخة مُحسنة من run_final_experiment: آمنة لكتابة CSV ودمج سجلات Neumann.
+        استبدل بها الوظيفة القديمة في ملفك.
+    """
+    print(f"\n🚀 Experiment: {experiment_name}")
+    print("Config:", config)
+    model = model_factory()
+    init_model_weights(model)
+    params = list(model.parameters())
+    optimizer = AdamOptimizer(params, **config['optimizer_params'])
+
+    memory_manager_config = config.get('memory_manager_params', {})
+    memory_manager = MemoryManager(model, **memory_manager_config)
+
+
+    csv_path = config.get('csv_log_path') or getattr(optimizer, 'logging_csv', None)
+    fieldnames = ['epoch', 'train_loss', 'val_acc', 'grad_norm', 'weight_norm', 'neumann_time', 'timestamp', 'memory_usage_bytes']
+    if csv_path:
+        if os.path.exists(csv_path):
+            try:
+                with open(csv_path, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    existing_header = next(reader, None)
+                    if existing_header is None or set(existing_header) != set(fieldnames):
+                        bak = csv_path + '.bak.' + str(int(time.time()))
+                        os.rename(csv_path, bak)
+                        print(f"[CSV] Existing log header incompatible — backed up {csv_path} -> {bak}. New CSV will be created.")
+            except Exception as e:
+                bak = csv_path + '.bak.' + str(int(time.time()))
+                try:
+                    os.rename(csv_path, bak)
+                    print(f"[CSV] Warning: could not backup existing csv: {e}")
+                except Exception:
+                    print(f"[CSV] Warning: could not backup existing csv: {e}")
+
+    history = {'epoch':[], 'train_loss':[], 'val_acc':[], 'grad_norm':[], 'weight_norm':[]}
+
+    for epoch in range(1, config['epochs'] + 1):
+        epoch_start = time.time()
+        model.train()
+        train_loss = 0.0; seen = 0
+        for xb, yb in batch_iterator(X_train, y_train, batch_size=config['batch_size']):
+            x_node = Node(xb)
+            logits = model(x_node)
+            loss = cross_entropy_loss_stable(logits, yb)
+
+            full_topo = loss.build_topo(prune_minimal=False)
+
+            memory_manager.checkpoint_forward(full_topo, x_node)
+
+            scaled_loss = loss * getattr(optimizer, 'loss_scale', 1.0)
+
+            model.zero_grad(); optimizer.zero_grad()
+
+            topo = scaled_loss.backward(prune_topo=getattr(optimizer, 'prune_topo', False), memory_manager=memory_manager)
+
+            if getattr(optimizer, 'loss_scale', 1.0) != 1.0:
+                 for p in optimizer.params:
+                     if p.grad is not None:
+                         p.grad = p.grad / getattr(optimizer, 'loss_scale', 1.0)
+
+            optimizer.step(topo_graph=topo, memory_manager=memory_manager, **config.get('echo_params', {}))
+
+            train_loss += float(loss.value) * len(xb)
+            seen += len(xb)
+
+        train_loss /= max(1, seen)
+        epoch_time = time.time() - epoch_start
+        model.eval()
+
+        val_preds_all = []
+        for xb_val, _ in batch_iterator(X_test, y_test, batch_size=config['batch_size'], shuffle=False):
+            val_logits = model(Node(xb_val))
+            val_preds_all.append(np.argmax(val_logits.value, axis=1))
+        val_preds = np.concatenate(val_preds_all)
+        val_acc = np.mean(val_preds == y_test)
+
+        grad_norm = global_norm([p.grad for p in params if p.grad is not None])
+        weight_norm = global_norm([p.value for p in params])
+
+        history['epoch'].append(epoch)
+        history['train_loss'].append(train_loss)
+        history['val_acc'].append(val_acc)
+        history['grad_norm'].append(grad_norm)
+        history['weight_norm'].append(weight_norm)
+
+        neumann_time_val = ''
+        if getattr(optimizer, 'logs', None):
+            times = [entry.get('neumann_time') for entry in optimizer.logs if isinstance(entry.get('neumann_time'), (int, float, np.floating, np.integer))]
+            if len(times) > 0:
+                neumann_time_val = float(np.mean(times))
+            else:
+                neumann_time_val = ''
+            optimizer.logs = []
+
+        current_memory_usage_bytes = memory_manager._current_memory_usage
+
+        print(f"--- Epoch {epoch}/{config['epochs']} --- Train Loss: {train_loss:.4f} | Val Accuracy: {val_acc:.4f} | Time: {epoch_time:.2f}s | grad_norm: {grad_norm:.4f} | Memory Usage: {current_memory_usage_bytes/1024:.1f}KB ---")
+
+        if csv_path:
+            row = {
+                'epoch': epoch,
+                'train_loss': f"{train_loss:.6f}",
+                'val_acc': f"{val_acc:.6f}",
+                'grad_norm': f"{grad_norm:.6f}",
+                'weight_norm': f"{weight_norm:.6f}",
+                'neumann_time': f"{neumann_time_val:.6f}" if neumann_time_val != '' else '',
+                'timestamp': int(time.time()),
+                'memory_usage_bytes': current_memory_usage_bytes
+            }
+            row_to_write = {k: row.get(k, '') for k in fieldnames}
+            file_existed = os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_existed:
+                    writer.writeheader()
+                writer.writerow(row_to_write)
+
+    memory_manager.free_all_caches()
+
+    return history
+
+# Main execution block
+if __name__ == '__main__':
+    set_seed(42)
+    print("1. تحميل ومعالجة بيانات MNIST الكاملة...")
+    try:
+        from tensorflow.keras.datasets import mnist
+        (X_train_full, y_train_full), (X_test, y_test) = mnist.load_data()
+        X_train_full = X_train_full.reshape(-1, 1, 28, 28).astype(np.float32) / 255.0
+        X_test = X_test.reshape(-1, 1, 28, 28).astype(np.float32) / 255.0
+        print(f"تم تجهيز البيانات. حجم التدريب: {X_train_full.shape}, حجم الاختبار: {X_test.shape}")
+    except Exception as e:
+        print(f"Error loading MNIST data: {e}. Please ensure TensorFlow is installed or the dataset is available.")
+        print("Using dummy data for demonstration.")
+        X_train_full = np.random.randn(100, 1, 28, 28).astype(np.float32)
+        y_train_full = np.random.randint(0, 10, 100)
+        X_test = np.random.randn(50, 1, 28, 28).astype(np.float32)
+        y_test = np.random.randint(0, 10, 50)
+        print(f"Dummy data generated. Train size: {X_train_full.shape}, Test size: {X_test.shape}")
+
+    # Define the deeper CNN model factory
+    def cnn_model_factory():
+        return nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=8, kernel_size=5, padding=2), # -> (N, 8, 28, 28)
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),                             # -> (N, 8, 14, 14)
+
+            nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1),# -> (N, 16, 14, 14)
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),                             # -> (N, 16, 7, 7)
+
+            nn.Flatten(),
+            nn.Linear(16 * 7 * 7, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+
+    # Define different experiment configurations
+
+    # Base configuration (without MemoryManager or echo)
+    config_baseline = {
+        'epochs': 2, # Reduced epochs for faster testing
+        'batch_size': 32,
+        'optimizer_params': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.999,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+            'adamw': False,
+            'circular_strength': 0.0, # Disable circular echo
+            'prune_topo': False,
+            'logging_csv': 'log_baseline.csv'
+        },
+        'memory_manager_params': {
+            'budget_bytes': float('inf'), # Effectively no memory constraint
+            'segment_size': 1000, # Large segment size to avoid checkpointing
+            'compression': None,
+            'spill_to_disk': False
+        }
+    }
+
+    # Configuration with MemoryManager (limited budget, no echo)
+    config_memory_limited = {
+        'epochs': 2, # Reduced epochs
+        'batch_size': 32,
+        'optimizer_params': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.999,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+            'adamw': False,
+            'circular_strength': 0.0, # Disable circular echo
+            'prune_topo': False,
+            'logging_csv': 'log_memory_limited.csv'
+        },
+        'memory_manager_params': {
+            'budget_bytes': 500 * 1024, # 500 KB budget to force recomputation
+            'segment_size': 2, # Segment every 2 layers
+            'compression': None,
+            'spill_to_disk': False
+        }
+    }
+
+    # Configuration with MemoryManager and Circular Echo
+    config_echo = {
+        'epochs': 2, # Reduced epochs
+        'batch_size': 32,
+        'optimizer_params': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.999,
+            'eps': 1e-8,
+            'weight_decay': 0.01, # Add weight decay
+            'adamw': True,       # Use AdamW
+            'circular_strength': 0.01, # Enable circular echo
+            'echo_freq': 1,       # Echo every step
+            'neumann_steps': 1,   # 1 Neumann step
+            'echo_norm_clip': 1.0, # Clip echo norm
+            'grad_clip': 1.0,     # Clip global gradient norm
+            'prune_topo': True,  # Enable topo pruning for Neumann
+            'logging_csv': 'log_echo.csv'
+        },
+        'memory_manager_params': {
+            'budget_bytes': 500 * 1024, # Same memory budget
+            'segment_size': 2, # Same segment size
+            'compression': None,
+            'spill_to_disk': False
+        },
+         'echo_params': { # These override optimizer_params for echo-specific settings
+            'echo_strategy': 'concat',
+            'echo_weighting': 'grad',
+            'echo_distribution': 'chunk',
+            # 'source_selector': None, # Can define custom selectors
+            # 'target_selector': None,
+        }
+    }
+
+
+    print("Defined experiment configurations.")
+
+    print("\nRunning experiments...")
+
+    # Run Baseline
+    print("\n--- Running Baseline Experiment ---")
+    run_final_experiment(cnn_model_factory, X_train_full, y_train_full, X_test, y_test, config_baseline, "Baseline")
+
+    # Run Memory Limited
+    print("\n--- Running Memory Limited Experiment ---")
+    run_final_experiment(cnn_model_factory, X_train_full, y_train_full, X_test, y_test, config_memory_limited, "Memory Limited")
+
+    # Run Echo
+    print("\n--- Running Echo Experiment ---")
+    run_final_experiment(cnn_model_factory, X_train_full, y_train_full, X_test, y_test, config_echo, "Echo")
+
+    print("\nExperiments finished. Check the generated CSV files for results.")

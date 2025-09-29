@@ -1,0 +1,816 @@
+# Assuming Node, and existing nn classes (Linear, PReLU, Tanh, Sequential) are defined in previous cells.
+# If not, their definitions would need to be included here.
+
+# --- Core Engine Helpers ---
+
+def _sum_to_shape(grad: np.ndarray, shape: tuple) -> np.ndarray:
+    """
+    Sums gradient dimensions until it matches the target shape.
+    """
+    if not isinstance(grad, np.ndarray):
+        raise TypeError("Gradient must be a numpy array.")
+    if not isinstance(shape, tuple):
+        raise TypeError("Shape must be a tuple.")
+
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    if grad.shape != shape:
+         raise ValueError(f"Gradient shape {grad.shape} does not match target shape {shape} after summing.")
+    return grad.reshape(shape)
+
+# --- Core Engine: Node Class ---
+
+class Node:
+    """
+    Represents a node in a computation graph for automatic differentiation.
+    """
+    def __init__(self, value: Any, parents: Iterable['Node'] = (), op: str = ''):
+        try:
+            self.value: np.ndarray = np.array(value, dtype=float)
+        except ValueError as e:
+            raise ValueError(f"Could not convert value to float numpy array: {value}") from e
+
+        if not isinstance(parents, Iterable):
+             raise TypeError("Parents must be an iterable.")
+        self.parents: Tuple['Node', ...] = tuple(parents)
+        if not all(isinstance(p, Node) for p in self.parents) and self.parents:
+             raise TypeError("All elements in parents must be Node instances.")
+
+        if not isinstance(op, str):
+             raise TypeError("Operation 'op' must be a string.")
+        self.op: str = op
+
+        self.grad: Optional[np.ndarray] = None
+        self._backward: Callable = lambda: None
+
+    def _ensure(self, other: Any) -> 'Node':
+        """Ensures the other operand is a Node."""
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+
+    # --- Arithmetic Operations ---
+
+    def __add__(self, other: Any) -> 'Node':
+        """Defines addition: self + other."""
+        other = self._ensure(other)
+        # Removed np.can_broadcast check
+        out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+
+    def __mul__(self, other: Any) -> 'Node':
+        """Defines multiplication: self * other."""
+        other = self._ensure(other)
+        # Removed np.can_broadcast check
+        out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward; return out
+
+    def __matmul__(self, other: Any) -> 'Node':
+        """
+        Defines matrix multiplication and batch matrix multiplication: self @ other.
+        Supports (..., M, K) @ (..., K, N) -> (..., M, N)
+        """
+        other = self._ensure(other)
+
+        # Input shape validation for matrix multiplication
+        if self.value.ndim < 2 or other.value.ndim < 2:
+            raise ValueError(f"Inputs to matrix multiplication must have at least 2 dimensions, but got {self.value.ndim} and {other.value.ndim}.")
+        if self.value.shape[-1] != other.value.shape[-2]:
+            raise ValueError(f"Shape mismatch for matrix multiplication: {self.value.shape} @ {other.value.shape}. Inner dimensions must match.")
+
+        # Handle batch dimensions for broadcasting
+        # Get shapes excluding the last two matrix dimensions
+        self_batch_shape = self.value.shape[:-2]
+        other_batch_shape = other.value.shape[:-2]
+
+        # Check batch shape compatibility for broadcasting
+        try:
+            output_batch_shape = np.broadcast_shapes(self_batch_shape, other_batch_shape)
+        except ValueError:
+            raise ValueError(f"Batch shapes are not compatible for matrix multiplication broadcasting: {self_batch_shape} @ {other_batch_shape}")
+
+        # Perform the matrix multiplication using np.matmul which supports batching
+        try:
+            out_value = np.matmul(self.value, other.value)
+        except ValueError as e:
+             # This might catch errors np.matmul raises even after broadcast_shapes passes,
+             # e.g., more complex broadcasting edge cases.
+             raise ValueError(f"Error during numpy matrix multiplication with shapes {self.value.shape} @ {other.value.shape}: {e}") from e
+
+
+        out = Node(out_value, (self, other), '@')
+
+        def _backward():
+            """Defines the backward pass for matrix multiplication (including batching)."""
+            if out.grad is None: return
+
+            # print(f"Backward @: out.grad shape: {out.grad.shape}, self.value shape: {self.value.shape}, other.value shape: {other.value.shape}")
+
+
+            # Gradient of Z = A @ B (including batch dims): dL/dA = dL/dZ @ B.T, dL/dB = A.T @ dL/dZ
+            # dL/dZ is out.grad
+            G = out.grad
+            A = self.value
+            B = other.value
+
+            # Gradient with respect to A (self)
+            # dL/dA = dL/dZ @ B.T
+            # Shape: G (..., M, N), B.T (..., N, K) -> result (..., M, K) - this matches A's shape
+            # Use np.matmul for batch matrix multiplication in the backward pass
+            # (..., M, N) @ (..., N, K) -> (..., M, K)
+            # So G @ B.T requires transposing the last two dimensions of B.
+            try:
+                grad_A = np.matmul(G, B.transpose(
+                    *range(B.ndim - 2), # Keep batch dimensions as they are
+                    B.ndim - 1, B.ndim - 2 # Swap the last two dimensions
+                ))
+                # print(f"  Backward @: grad_A shape before sum_to_shape: {grad_A.shape}")
+            except ValueError as e:
+                 raise ValueError(f"Error calculating grad_A in matmul backward with shapes G={G.shape}, B.T={B.transpose(*range(B.ndim - 2), B.ndim - 1, B.ndim - 2).shape}: {e}") from e
+
+            # Fix: Before summing to shape, ensure grad_A has broadcasted dimensions if A was broadcasted.
+            # NumPy's matmul automatically handles batch broadcasting in the forward pass.
+            # The gradient `grad_A` computed by `np.matmul(G, B.T)` will have the broadcasted batch shape.
+            # We need to sum this gradient over the broadcasted dimensions that were *not* present in A.
+            # The _sum_to_shape function is designed for this. The issue might be the shape of `grad_A` itself
+            # coming out of `np.matmul` not being directly sum-reducible to `self.value.shape`.
+
+            # Let's ensure the shapes are printed for debugging if an error occurs in _sum_to_shape
+            try:
+                self.grad += _sum_to_shape(grad_A, self.value.shape)
+            except ValueError as e:
+                 print(f"Debug: Error in _sum_to_shape for self.grad (A). grad_A shape: {grad_A.shape}, self.value.shape: {self.value.shape}")
+                 raise e # Re-raise the error after printing debug info
+
+            # print(f"  Backward @: self.grad shape after sum_to_shape: {self.grad.shape}")
+
+
+            # Gradient with respect to B (other)
+            # dL/dB = A.T @ dL/dZ
+            # Shape: A.T (..., K, M), G (..., M, N) -> result (..., K, N) - this matches B's shape
+            # Use np.matmul for batch matrix multiplication
+            # (..., K, M) @ (..., M, N) -> (..., K, N)
+            # So A.T @ G requires transposing the last two dimensions of A.
+            try:
+                grad_B = np.matmul(A.transpose(
+                     *range(A.ndim - 2), # Keep batch dimensions as they are
+                     A.ndim - 1, A.ndim - 2 # Swap the last two dimensions
+                ), G)
+                # print(f"  Backward @: grad_B shape before sum_to_shape: {grad_B.shape}")
+            except ValueError as e:
+                 raise ValueError(f"Error calculating grad_B in matmul backward with shapes A.T={A.transpose(*range(A.ndim - 2), A.ndim - 1, A.ndim - 2).shape}, G={G.shape}: {e}") from e
+
+            # Fix: Similar to grad_A, ensure grad_B has broadcasted dimensions if B was broadcasted.
+            # The _sum_to_shape function should handle summing over broadcasted batch dimensions.
+            # The issue might be the shape of `grad_B` from `np.matmul` not being directly sum-reducible to `other.value.shape`.
+
+            try:
+                other.grad += _sum_to_shape(grad_B, other.value.shape)
+            except ValueError as e:
+                 print(f"Debug: Error in _sum_to_shape for other.grad (B). grad_B shape: {grad_B.shape}, other.value.shape: {other.value.shape}")
+                 raise e # Re-raise the error after printing debug info
+
+            # print(f"  Backward @: other.grad shape after sum_to_shape: {other.grad.shape}")
+
+        out._backward = _backward
+        return out
+
+
+    def sum(self) -> 'Node':
+        """Defines sum reduction."""
+        out = Node(self.value.sum(), (self,), 'sum')
+        def _backward():
+            if out.grad is None: return
+            # print(f"Backward sum: out.grad shape: {out.grad.shape}, self.value shape: {self.value.shape}")
+            # Removed np.can_broadcast check
+            self.grad += np.broadcast_to(out.grad, self.value.shape)
+            # print(f"  Backward sum: self.grad shape after broadcast_to: {self.grad.shape}")
+        out._backward = _backward; return out
+
+    def __neg__(self) -> 'Node':
+        """Defines negation: -self."""
+        return self * -1
+
+    def __sub__(self, other: Any) -> 'Node':
+        """Defines subtraction: self - other."""
+        return self + (-self._ensure(other))
+
+    def __rsub__(self, other: Any) -> 'Node':
+        """Defines reverse true division: other / self."""
+        other = self._ensure(other)
+        if np.any(self.value == 0):
+             raise ValueError("Division by zero encountered in Node reverse division.")
+        return other * (self ** -1)
+
+    def __pow__(self, other: Any) -> 'Node':
+        """Defines exponentiation: self ** other."""
+        other = self._ensure(other)
+        if np.any((self.value == 0) & (other.value == 0)):
+             raise ValueError("0**0 encountered in Node power operation.")
+        if np.any((self.value < 0) & (np.mod(other.value, 1) != 0)):
+             raise ValueError("Negative base with non-integer exponent encountered in Node power operation.")
+
+        out = Node(self.value ** other.value, (self, other), '**')
+
+        def _backward():
+            if out.grad is None: return
+            base, exp = self.value, other.value
+
+            grad_base = np.zeros_like(base)
+            valid_grad_mask = (base > 0) | ((base == 0) & (exp > 1))
+            safe_base_pow_exp_minus_1 = np.power(np.maximum(base[valid_grad_mask], 1e-10), exp[valid_grad_mask] - 1)
+            grad_base[valid_grad_mask] = exp[valid_grad_mask] * safe_base_pow_exp_minus_1
+            self.grad += _sum_to_shape(out.grad * grad_base, self.value.shape)
+
+            grad_exp = np.zeros_like(exp)
+            positive_base_mask = (base > 0)
+            if np.any(positive_base_mask):
+                 log_base = np.log(np.maximum(base[positive_base_mask], 1e-10))
+                 grad_exp[positive_base_mask] = out.value[positive_base_mask] * log_base
+            other.grad += _sum_to_shape(out.grad * grad_exp, other.value.shape)
+
+        out._backward = _backward; return out
+
+    def backward(self):
+        """Performs backpropagation starting from this node."""
+        topo: List[Node] = []
+        visited: set[Node] = set()
+
+        def build_topo(v: Node):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build_topo(p)
+                topo.append(v)
+
+        build_topo(self)
+
+        for v in topo: v.grad = np.zeros_like(v.value)
+        self.grad = np.ones_like(self.value) if self.value.shape == () else np.ones_like(self.value)
+
+        for v in reversed(topo):
+            if v.grad is not None:
+                v._backward()
+
+    def __repr__(self) -> str:
+        """Returns a string representation of the Node."""
+        return f"Node(value={self.value}, shape={self.value.shape}, op='{self.op}')"
+
+    # --- Added Mathematical Functions ---
+
+    def log(self) -> 'Node':
+        """Defines element-wise natural logarithm (log base e)."""
+        if np.any(self.value <= 0):
+             raise ValueError("Input to log must be positive.")
+        out = Node(np.log(self.value), parents=(self,), op='log')
+        def _backward():
+            if out.grad is None: return
+            if np.any(self.value == 0): return
+            grad_x = (1.0 / self.value) * out.grad
+            # Removed np.can_broadcast check
+            self.grad += grad_x
+        out._backward = _backward; return out
+
+    def exp(self) -> 'Node':
+        """Defines element-wise exponential function (e^x)."""
+        out = Node(np.exp(self.value), parents=(self,), op='exp')
+        def _backward():
+            if out.grad is None: return
+            grad_x = out.value * out.grad
+            # Removed np.can_broadcast check
+            self.grad += grad_x
+        out._backward = _backward; return out
+
+    def sin(self) -> 'Node':
+        """Defines element-wise sine function."""
+        out = Node(np.sin(self.value), parents=(self,), op='sin')
+        def _backward():
+            if out.grad is None: return
+            grad_x = np.cos(self.value) * out.grad
+            # Removed np.can_broadcast check
+            self.grad += grad_x
+        out._backward = _backward; return out
+
+    def cos(self) -> 'Node':
+        """Defines element-wise cosine function."""
+        out = Node(np.cos(self.value), parents=(self,), op='cos')
+        def _backward():
+            if out.grad is None: return
+            grad_x = -np.sin(self.value) * out.grad
+            # Removed np.can_broadcast check
+            self.grad += grad_x
+        out._backward = _backward; return out
+
+    # Add transpose method to Node for convenience
+    def transpose(self, *axes):
+        """Transposes the Node's value and creates a new Node."""
+        # The backward pass for transpose is simply another transpose
+        out = Node(self.value.transpose(*axes), parents=(self,), op=f'transpose({axes})')
+        def _backward():
+             if out.grad is None: return
+             # print(f"Backward transpose: out.grad shape: {out.grad.shape}, self.value shape: {self.value.shape}")
+             # Transpose the gradient back to the original shape
+             # Need to figure out the inverse axes permutation
+             # If axes is not provided, it's a full transpose (..., M, N) -> (..., N, M)
+             if not axes:
+                 inverse_axes = tuple(range(out.value.ndim))[::-1]
+             else:
+                 # Compute inverse permutation
+                 inverse_axes = tuple(np.argsort(axes))
+
+             try:
+                 transposed_grad = out.grad.transpose(*inverse_axes)
+                 # print(f"  Backward transpose: transposed_grad shape: {transposed_grad.shape}")
+             except ValueError as e:
+                  raise ValueError(f"Error transposing gradient in transpose backward: {e}") from e
+
+
+             self.grad += _sum_to_shape(transposed_grad, self.value.shape)
+             # print(f"  Backward transpose: self.grad shape after sum_to_shape: {self.grad.shape}")
+
+        out._backward = _backward
+        return out
+
+# --- Neural Network Module (Base Class) ---
+
+class Module:
+    """
+    Base class for all neural network modules.
+    """
+    def parameters(self) -> Iterable[Node]:
+        yield from []
+    def __call__(self, *args: Any, **kwargs: Any) -> Node:
+        try:
+            return self.forward(*args, **kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Error during forward pass of {self.__class__.__name__}: {e}") from e
+    def zero_grad(self):
+        for p in self.parameters():
+            if p.grad is not None:
+                 if isinstance(p.grad, np.ndarray):
+                     p.grad.fill(0.0)
+                 else:
+                     p.grad = np.zeros_like(p.value)
+
+
+# --- Neural Network Module (nn) - Redefined with all layers inheriting from the global Module ---
+
+class nn:
+    """A simple neural network module namespace containing layer definitions."""
+
+    class Linear(Module):
+        """A linear transformation layer (fully connected layer)."""
+        def __init__(self, in_features: int, out_features: int):
+            super().__init__()
+            if not isinstance(in_features, int) or in_features <= 0:
+                 raise ValueError(f"in_features must be a positive integer, but got {in_features}.")
+            if not isinstance(out_features, int) or out_features <= 0:
+                 raise ValueError(f"out_features must be a positive integer, but got {out_features}.")
+
+            self.in_features: int = in_features
+            self.out_features: int = out_features
+            limit = np.sqrt(1 / self.in_features)
+            self.weight: Node = Node(np.random.randn(in_features, out_features) * limit, op='weight')
+            self.bias: Node = Node(np.zeros(out_features), op='bias')
+
+        def forward(self, x: Node) -> Node:
+            if not isinstance(x, Node):
+                 raise TypeError(f"Input to Linear layer must be a Node, but got {type(x)}.")
+            if x.value.ndim < 1 or x.value.shape[-1] != self.in_features:
+                 raise ValueError(f"Input shape {x.value.shape} is not compatible with Linear layer input features {self.in_features}.")
+            return x @ self.weight + self.bias
+
+        def parameters(self) -> Iterable[Node]:
+            yield from [self.weight, self.bias]
+
+    class PReLU(Module):
+        """Parametric Rectified Linear Unit activation function."""
+        def __init__(self, initial_alpha: float = 0.01):
+            super().__init__()
+            if not isinstance(initial_alpha, (int, float)):
+                 raise TypeError(f"initial_alpha must be a number, but got {type(initial_alpha)}.")
+            self.alpha: Node = Node(np.array([float(initial_alpha)]), op='alpha')
+
+        def forward(self, x: Node) -> Node:
+            if not isinstance(x, Node):
+                 raise TypeError(f"Input to PReLU must be a Node, but got {type(x)}.")
+            positive_part = Node(np.maximum(0, x.value))
+            negative_part = Node(np.minimum(0, x.value))
+            out = positive_part + (negative_part * self.alpha)
+            out.parents = (x, self.alpha)
+            out.op = 'prelu'
+            def _backward():
+                if out.grad is None: return
+                grad_x = (x.value > 0) * 1.0 + (x.value <= 0) * self.alpha.value
+                # Removed np.can_broadcast check
+                x.grad += grad_x * out.grad
+                grad_alpha = (x.value * (x.value <= 0)) * out.grad
+                self.alpha.grad += grad_alpha.sum()
+            out._backward = _backward; return out
+
+        def parameters(self) -> Iterable[Node]:
+            yield self.alpha
+
+    class Tanh(Module):
+        """Hyperbolic Tangent activation function."""
+        def forward(self, x: Node) -> Node:
+            if not isinstance(x, Node):
+                 raise TypeError(f"Input to Tanh must be a Node, but got {type(x)}.")
+            out = Node(np.tanh(x.value), parents=(x,), op='tanh')
+            def _backward():
+                if out.grad is None: return
+                grad_x = (1 - out.value**2) * out.grad
+                # Removed np.can_broadcast check
+                x.grad += grad_x
+            out._backward = _backward; return out
+
+    class Sequential(Module):
+        """A sequential container of modules."""
+        def __init__(self, *layers: Module):
+            super().__init__()
+            if not all(isinstance(layer, Module) for layer in layers):
+                 raise TypeError("All elements in Sequential must be Module instances.")
+            self.layers: Tuple[Module, ...] = tuple(layers)
+
+        def forward(self, x: Node) -> Node:
+            if not isinstance(x, Node):
+                 raise TypeError(f"Input to Sequential must be a Node, but got {type(x)}.")
+            current_output = x
+            for layer in self.layers:
+                x = layer(x) # Pass the Node output from the previous layer to the next
+            return x
+
+        def parameters(self) -> Iterable[Node]:
+            for layer in self.layers:
+                yield from layer.parameters()
+
+
+    # --- New Advanced Layers ---
+
+    class AttentionMechanism(Module): # Inherit directly from the top-level Module
+        """
+        A simplified self-attention mechanism layer for 3D input (batch, seq, features).
+        Relies on Node's automatic differentiation for backward pass.
+        """
+        def __init__(self, input_features: int, key_features: Optional[int] = None, value_features: Optional[int] = None):
+            super().__init__()
+            self.input_features = input_features
+            self.key_features = key_features if key_features is not None else input_features
+            self.value_features = value_features if value_features is not None else input_features
+
+            # Linear transformations for Queries, Keys, and Values
+            query_limit = np.sqrt(1 / input_features)
+            key_limit = np.sqrt(1 / input_features)
+            value_limit = np.sqrt(1 / input_features)
+
+            self.W_q = Node(np.random.randn(input_features, self.key_features) * query_limit, op='W_q')
+            self.W_k = Node(np.random.randn(input_features, self.key_features) * key_limit, op='W_k')
+            self.W_v = Node(np.random.randn(input_features, self.value_features) * value_limit, op='W_v')
+
+        def forward(self, x: Node) -> Node:
+            if not isinstance(x, Node):
+                raise TypeError(f"Input to AttentionMechanism must be a Node, but got {type(x)}.")
+            if x.value.ndim != 3:
+                raise ValueError(f"Input to AttentionMechanism must have 3 dimensions (batch, seq, features), but got shape {x.value.shape}.")
+            if x.value.shape[-1] != self.input_features:
+                 raise ValueError(f"Input feature dimension {x.value.shape[-1]} does not match expected {self.input_features}.")
+
+
+            batch_size, seq_len, _ = x.value.shape
+
+            # Reshape input for matrix multiplication with weights - Manual reshape Node for now
+            # Note: Reshape operations don't have a backward defined on the Node,
+            # so the gradient will flow back to the original x Node directly from x_flat.grad
+            x_flat = Node(x.value.reshape(-1, self.input_features), parents=(x,), op='reshape_in_attention')
+
+            # Linear transformations using Node's @ operator (now supporting batching)
+            queries = x_flat @ self.W_q
+            keys = x_flat @ self.W_k
+            values = x_flat @ self.W_v
+
+            # Reshape back to (batch_size, seq_len, features) using manual reshape Node for now
+            # Similarly, gradients will flow back to queries.grad, keys.grad, values.grad
+            queries_rs = Node(queries.value.reshape(batch_size, seq_len, self.key_features), parents=(queries,), op='reshape_q')
+            keys_rs = Node(keys.value.reshape(batch_size, seq_len, self.key_features), parents=(keys,), op='reshape_k')
+            values_rs = Node(values.value.reshape(batch_size, seq_len, self.value_features), parents=(values,), op='reshape_v')
+
+            # print(f"Attention Forward: queries_rs shape: {queries_rs.value.shape}, keys_rs shape: {keys_rs.value.shape}, values_rs shape: {values_rs.value.shape}")
+
+
+            # Compute attention scores: Queries @ Keys.T (batch matmul using Node's @)
+            # (batch, seq, key) @ (batch, key, seq) -> (batch, seq, seq)
+            # Use Node's transpose method
+            keys_rs_T = keys_rs.transpose(0, 2, 1) # Transpose last two dimensions
+            scores = queries_rs @ keys_rs_T
+            scores.op = 'attention_scores' # Update op for clarity
+            # print(f"Attention Forward: scores shape: {scores.value.shape}")
+
+
+            # Scale scores
+            scale_factor = Node(np.array([1.0 / np.sqrt(self.key_features)]), op='scale_factor')
+            scaled_scores = scores * scale_factor
+            # print(f"Attention Forward: scaled_scores shape: {scaled_scores.value.shape}")
+
+
+            # Apply softmax to get attention weights (along the sequence dimension) - Manual for now
+            # The backward pass for softmax needs to be explicitly handled or defined as a Node operation
+            # For now, let's keep it manual and see if the matmul fixes resolve other issues.
+            # A proper autodiff library would have a Softmax Node.
+            exp_scaled_scores_value = np.exp(scaled_scores.value - np.max(scaled_scores.value, axis=-1, keepdims=True))
+            softmax_denom_value = np.sum(exp_scaled_scores_value, axis=-1, keepdims=True)
+            attention_weights_value = exp_scaled_scores_value / (softmax_denom_value + 1e-9) # Add epsilon for stability
+
+            attention_weights = Node(attention_weights_value, parents=(scaled_scores,), op='softmax')
+            # print(f"Attention Forward: attention_weights shape: {attention_weights.value.shape}")
+
+
+            # Compute weighted sum of Values: Attention_Weights @ Values (batch matmul using Node's @)
+            # (batch, seq, seq) @ (batch, seq, value) -> (batch, seq, value)
+            weighted_values = attention_weights @ values_rs
+            weighted_values.op = 'weighted_values' # Update op for clarity
+            # print(f"Attention Forward: weighted_values shape: {weighted_values.value.shape}")
+
+
+            # The backward pass will now be handled automatically by Node operations.
+            # We remove the manual _backward method here.
+            # def _backward():
+            #     # ... manual backward logic ...
+            # weighted_values._backward = _backward # Removed
+
+            # Need to add the backward for the manual softmax operation
+            def softmax_backward_manual(grad_out: np.ndarray, softmax_output: np.ndarray):
+                """Manual backward pass for softmax."""
+                # dL/dX = softmax_output * (grad_out - sum(grad_out * softmax_output, axis=-1, keepdims=True))
+                sum_term = np.sum(grad_out * softmax_output, axis=-1, keepdims=True)
+                return softmax_output * (grad_out - sum_term)
+
+            # Add the manual backward to the softmax Node
+            def attention_weights_backward():
+                 if attention_weights.grad is None: return
+                 grad_scaled_scores_val = softmax_backward_manual(attention_weights.grad, attention_weights.value)
+                 scaled_scores.grad += _sum_to_shape(grad_scaled_scores_val, scaled_scores.value.shape)
+
+            attention_weights._backward = attention_weights_backward
+
+
+            # Need to add backward for the manual reshape operations
+            def reshape_in_attention_backward():
+                 if x_flat.grad is None: return
+                 # Gradient just needs to be reshaped back to the original input shape
+                 x.grad += _sum_to_shape(x_flat.grad.reshape(batch_size, seq_len, self.input_features), x.value.shape)
+
+            x_flat._backward = reshape_in_attention_backward
+
+            def reshape_q_backward():
+                 if queries_rs.grad is None: return
+                 queries.grad += _sum_to_shape(queries_rs.grad.reshape(-1, self.key_features), queries.value.shape)
+
+            queries_rs._backward = reshape_q_backward
+
+            def reshape_k_backward():
+                 if keys_rs.grad is None: return
+                 keys.grad += _sum_to_shape(keys_rs.grad.reshape(-1, self.key_features), keys.value.shape)
+
+            keys_rs._backward = reshape_k_backward
+
+            def reshape_v_backward():
+                 if values_rs.grad is None: return
+                 values.grad += _sum_to_shape(values_rs.grad.reshape(-1, self.value_features), values.value.shape)
+
+            values_rs._backward = reshape_v_backward
+
+
+            return weighted_values
+
+
+        def parameters(self) -> Iterable[Node]:
+            yield from [self.W_q, self.W_k, self.W_v]
+
+
+    class GatingMechanism(Module): # Inherit directly from the top-level Module
+        """
+        A simple gating mechanism layer.
+        Takes two inputs, 'main' and 'gate', and computes output = main * sigmoid(gate_linear(gate)).
+        """
+        def __init__(self, gate_features: int, output_features: int):
+            super().__init__()
+            self.gate_features = gate_features
+            self.output_features = output_features
+            self.gate_linear = nn.Linear(gate_features, output_features)
+
+        def forward(self, main_input: Node, gate_input: Node) -> Node:
+            if not isinstance(main_input, Node) or not isinstance(gate_input, Node):
+                 raise TypeError("Both main_input and gate_input must be Node instances.")
+            if main_input.value.shape[-1] != self.output_features:
+                 raise ValueError(f"Main input feature dimension {main_input.value.shape[-1]} does not match expected output features {self.output_features}.")
+            if gate_input.value.shape[-1] != self.gate_features:
+                 raise ValueError(f"Gate input feature dimension {gate_input.value.shape[-1]} does not match expected gate features {self.gate_features}.")
+            # Removed np.can_broadcast check
+            # print(f"Warning: Non-feature dimensions of main_input {main_input.value.shape[:-1]} and gate_input {gate_input.value.shape[:-1]} might not broadcast as expected.")
+
+            linear_gate_output = self.gate_linear(gate_input)
+
+            # Softmax (element-wise sigmoid for gating) - using numpy and manual backward
+            # The backward pass for sigmoid needs to be explicitly handled or defined as a Node operation
+            sigmoid_gate_value = 1 / (1 + np.exp(-linear_gate_output.value))
+            sigmoid_gate = Node(sigmoid_gate_value, parents=(linear_gate_output,), op='sigmoid_gate')
+
+            output = main_input * sigmoid_gate
+            output.parents = (main_input, sigmoid_gate)
+            output.op = 'gated_output'
+
+            # The backward pass will now be handled automatically by Node operations, except for manual sigmoid
+            # def _backward(): ... # Removed
+
+            # Need to add the backward for the manual sigmoid operation
+            def sigmoid_gate_backward_manual():
+                 if sigmoid_gate.grad is None: return
+                 # Derivative of sigmoid is sigmoid * (1 - sigmoid)
+                 grad_linear_gate_output_val = sigmoid_gate.grad * sigmoid_gate.value * (1 - sigmoid_gate.value)
+                 linear_gate_output.grad += _sum_to_shape(grad_linear_gate_output_val, linear_gate_output.value.shape)
+
+            sigmoid_gate._backward = sigmoid_gate_backward_manual
+
+
+            return output
+
+        def parameters(self) -> Iterable[Node]:
+            yield from self.gate_linear.parameters()
+
+# 1. Create instances of the new layers
+input_features_attn = 10
+key_features_attn = 8
+value_features_attn = 12
+attention_layer = nn.AttentionMechanism(input_features_attn, key_features_attn, value_features_attn)
+
+gate_features_gate = 15
+output_features_gate = 5
+gating_layer = nn.GatingMechanism(gate_features_gate, output_features_gate)
+
+# 2. Create sample input Node tensors
+batch_size = 4
+seq_len = 7
+main_input_features_gate = output_features_gate # Main input feature dim must match gate output feature dim
+
+# Input for AttentionMechanism: (batch, sequence, features)
+input_attn_value = np.random.randn(batch_size, seq_len, input_features_attn)
+input_attn_node = Node(input_attn_value, op='input_attention')
+
+# Inputs for GatingMechanism: (batch, ..., features)
+# Example shapes: (batch, features) or (batch, seq, features) as long as broadcasting works
+main_input_gate_value = np.random.randn(batch_size, seq_len, main_input_features_gate)
+gate_input_value = np.random.randn(batch_size, seq_len, gate_features_gate)
+
+main_input_gate_node = Node(main_input_gate_value, op='main_input_gate')
+gate_input_node = Node(gate_input_value, op='gate_input')
+
+
+# --- Add Unit Tests for Forward and Backward Passes ---
+
+def check_gradients_v2(forward_fn: Callable, input_node_to_check: Node, tolerance=1e-9):
+    """
+    Numerically checks the gradient of the scalar output of forward_fn
+    with respect to a specific input node (input_node_to_check).
+
+    Args:
+        forward_fn (Callable): A function that takes NO arguments,
+                               runs the forward pass of the layer/model being tested,
+                               and returns a SCALAR Node (e.g., layer(input).sum()).
+        input_node_to_check (Node): The specific input Node whose gradient needs to be checked.
+        tolerance (float): Tolerance for comparing analytical and numerical gradients.
+    """
+    # Ensure the input node being checked has a gradient initialized to zero
+    input_node_to_check.grad = np.zeros_like(input_node_to_check.value)
+
+    # Compute analytical gradient
+    # The backward pass is run from the scalar output_node (which should have grad=1.0)
+    output_node = forward_fn() # Run forward pass to get the scalar output node
+    if output_node.value.shape != ():
+         raise ValueError("forward_fn must return a scalar Node (result of .sum()) for gradient checking.")
+
+    output_node.grad = np.array(1.0) # Set gradient for scalar output
+    output_node.backward() # Compute analytical gradients for all nodes in the graph
+    analytical_grad = input_node_to_check.grad.copy()
+
+    # Store original input value to restore later
+    original_input_value = input_node_to_check.value.copy()
+
+    # Compute numerical gradient
+    numerical_grad = np.zeros_like(input_node_to_check.value)
+    epsilon = 1e-6
+
+    # Iterate over each element of the input tensor being checked
+    # Use np.ndenumerate for a safer way to iterate and get indices
+    for idx, _ in np.ndenumerate(original_input_value):
+
+        # Perturb the input value by +epsilon at the current index
+        input_node_to_check.value[idx] = original_input_value[idx] + epsilon
+        # Recompute the forward pass with the perturbed input
+        # This re-computation is done by calling forward_fn() again.
+        output_plus_epsilon_value = forward_fn().value # Get the scalar value
+
+        # Perturb the input value by -epsilon at the current index
+        input_node_to_check.value[idx] = original_input_value[idx] - epsilon
+        output_minus_epsilon_value = forward_fn().value # Get the scalar value
+
+        # Restore original value
+        input_node_to_check.value[idx] = original_input_value[idx]
+
+        # Compute numerical gradient using central difference
+        numerical_grad[idx] = (output_plus_epsilon_value - output_minus_epsilon_value) / (2 * epsilon)
+
+
+    # Compare analytical and numerical gradients
+    abs_error = np.abs(analytical_grad - numerical_grad)
+    relative_error = abs_error / (np.maximum(np.abs(analytical_grad), np.abs(numerical_grad)) + 1e-15) # Add epsilon for division by zero
+
+    max_abs_error = np.max(abs_error)
+    max_relative_error = np.max(relative_error)
+
+    print(f"  Max Absolute Error: {max_abs_error:.10f}")
+    print(f"  Max Relative Error: {max_relative_error:.10f}")
+
+    # Add a check for NaNs or Infs in either gradient
+    if np.any(np.isnan(analytical_grad)) or np.any(np.isinf(analytical_grad)):
+        print("  Analytical gradient contains NaN or Inf.")
+        return False
+    if np.any(np.isnan(numerical_grad)) or np.any(np.isinf(numerical_grad)):
+        print("  Numerical gradient contains NaN or Inf.")
+        return False
+
+
+    if max_abs_error < tolerance and max_relative_error < tolerance:
+        print("  Gradient check PASSED")
+        return True
+    else:
+        print("  Gradient check FAILED")
+        # Optional: Print problematic gradients for debugging
+        # print("Analytical Grad:\n", analytical_grad)
+        # print("Numerical Grad:\n", numerical_grad)
+        # print("Difference:\n", analytical_grad - numerical_grad)
+        return False
+
+
+print("\n--- Testing AttentionMechanism (Gradient Check) ---")
+
+# Define a forward function for AttentionMechanism that returns a scalar Node
+# This function closes over the necessary layer and input node.
+def attn_forward_and_sum():
+    """Runs AttentionMechanism forward and sums the output."""
+    return attention_layer(input_attn_node).sum()
+
+# Run gradient check for AttentionMechanism input
+print("Checking gradient w.r.t. input_attn_node:")
+check_gradients_v2(attn_forward_and_sum, input_attn_node)
+
+# Check gradients w.r.t. weights
+print("\nChecking gradients w.r.t. parameters:")
+param_checks_passed_attn = True
+for param_node in attention_layer.parameters():
+    print(f"  Checking gradient w.r.t. {param_node.op} (shape {param_node.value.shape})...")
+    # Need to zero layer gradients before each parameter check's analytical backward
+    attention_layer.zero_grad()
+    # The forward_fn remains the same, it will use the potentially perturbed parameter
+    param_passed = check_gradients_v2(attn_forward_and_sum, param_node)
+    if not param_passed:
+        param_checks_passed_attn = False
+
+print(f"\nOverall AttentionMechanism gradient check: {'PASSED' if param_checks_passed_attn else 'FAILED'}") # Input check result is included in parameter checks indirectly
+
+
+print("\n--- Testing GatingMechanism (Gradient Check) ---")
+
+# Define a forward function for GatingMechanism that returns a scalar Node
+# This function closes over the necessary layer and input nodes.
+def gating_forward_and_sum():
+    """Runs GatingMechanism forward and sums the output."""
+    return gating_layer(main_input_gate_node, gate_input_node).sum()
+
+# Run gradient check for GatingMechanism inputs
+print("Checking gradient w.r.t. main_input_gate_node:")
+check_gradients_v2(gating_forward_and_sum, main_input_gate_node)
+
+print("\nChecking gradient w.r.t. gate_input_node:")
+check_gradients_v2(gating_forward_and_sum, gate_input_node)
+
+# Check gradients w.r.t. gate_linear parameters (W and bias)
+print("\nChecking gradients w.r.t. gate_linear parameters:")
+param_checks_passed_gate = True
+for param_node in gating_layer.parameters():
+    print(f"  Checking gradient w.r.t. {param_node.op} (shape {param_node.value.shape})...")
+    # Need to zero layer gradients before each parameter check's analytical backward
+    gating_layer.zero_grad()
+    # The forward_fn remains the same
+    param_passed = check_gradients_v2(gating_forward_and_sum, param_node)
+    if not param_passed:
+        param_checks_passed_gate = False
+
+print(f"\nOverall GatingMechanism gradient check: {'PASSED' if param_checks_passed_gate else 'FAILED'}")
