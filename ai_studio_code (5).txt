@@ -1,0 +1,194 @@
+# Create test_backend.py
+with open("test_backend.py", "w") as f:
+    f.write("""
+import pytest
+import numpy as np
+import pandas as pd
+import json
+from framework import Node, nn
+from features import prepare_features
+from server import app as flask_app
+
+# ===================================
+# 1. Framework Tests (framework.py)
+# ===================================
+
+def test_node_addition_backward():
+    a = Node(np.array([2.0]))
+    b = Node(np.array([3.0]))
+    c = a + b
+    c.backward()
+    assert np.allclose(a.grad, np.array([1.0]))
+    assert np.allclose(b.grad, np.array([1.0]))
+
+def test_node_multiplication_backward():
+    a = Node(np.array([2.0]))
+    b = Node(np.array([3.0]))
+    c = a * b
+    c.backward()
+    assert np.allclose(a.grad, b.value)
+    assert np.allclose(b.grad, a.value)
+    
+def test_node_matmul_backward():
+    a = Node(np.array([[1, 2], [3, 4]]))
+    b = Node(np.array([[5, 6], [7, 8]]))
+    c = a @ b
+    c.backward()
+    assert np.allclose(a.grad, np.array([[11, 15], [11, 15]]))
+    assert np.allclose(b.grad, np.array([[4, 4], [6, 6]]))
+
+def test_relu_backward():
+    a = Node(np.array([-1.0, 0.0, 1.0]))
+    b = a.relu()
+    b.backward()
+    assert np.allclose(b.value, np.array([0.0, 0.0, 1.0]))
+    assert np.allclose(a.grad, np.array([0.0, 0.0, 1.0]))
+
+def test_linear_layer():
+    layer = nn.Linear(in_features=3, out_features=2)
+    input_data = Node(np.random.randn(10, 3))
+    output = layer(input_data)
+    assert output.value.shape == (10, 2)
+    
+    # Test backward pass (ensure grads are computed)
+    output.sum().backward()
+    for param in layer.parameters():
+        assert param.grad is not None
+        assert not np.all(param.grad == 0)
+
+def test_conv1d_layer_forward():
+    layer = nn.Conv1d(in_channels=3, out_channels=5, kernel_size=3)
+    # (batch, channels, length)
+    input_data = Node(np.random.randn(10, 3, 20))
+    output = layer(input_data)
+    assert output.value.shape == (10, 5, 18) # 20 - 3 + 1
+
+# ===================================
+# 2. Features Tests (features.py)
+# ===================================
+
+@pytest.fixture
+def sample_price_data():
+    \"\"\"Create a sample DataFrame for testing feature engineering.\"\"\"
+    dates = pd.date_range(start="2023-01-01", periods=100)
+    close = 50 + np.sin(np.arange(100) * 0.1) * 5 + np.random.randn(100) * 0.5
+    data = {
+        'open': close - 0.5,
+        'high': close + 1.0,
+        'low': close - 1.0,
+        'close': close
+    }
+    return pd.DataFrame(data, index=dates)
+
+def test_prepare_features_output_shape(sample_price_data):
+    window_size = 20
+    X, y = prepare_features(sample_price_data, window_size)
+    
+    # After dropping NaNs from indicators and target, the number of samples is reduced
+    # 100 (original) - 1 (diff) - 13 (rolling mean) - 3 (target shift) - 20 (window_size) ~ 63
+    assert X.shape[1] == 4  # 4 features
+    assert X.shape[2] == window_size
+    assert X.shape[0] == len(y)
+    assert len(y) > 50 # Ensure we have a reasonable number of samples
+
+def test_prepare_features_empty_input():
+    X, y = prepare_features(pd.DataFrame(columns=['open','high','low','close']), 10)
+    assert X.shape == (0,)
+    assert y.shape == (0,)
+
+# ===================================
+# 3. Server Tests (server.py)
+# ===================================
+
+@pytest.fixture
+def client():
+    flask_app.config['TESTING'] = True
+    with flask_app.test_client() as client:
+        yield client
+
+def test_dynamic_endpoint_success(client, sample_price_data):
+    \"\"\"Test the main endpoint with a valid request.\"\"\"
+    model_config = {
+        "window_size": 15,
+        "learning_rate": 0.01,
+        "epochs": 2, # Use few epochs for speed
+        "layers": [
+            {"type": "conv1d", "out_channels": 4, "kernel_size": 3},
+            {"type": "relu"},
+            {"type": "flatten"},
+            {"type": "linear", "out_features": 2}
+        ]
+    }
+    
+    prices_dict = sample_price_data.to_dict(orient='list')
+    
+    response = client.post('/train_and_predict_dynamic', 
+                           data=json.dumps({'prices': prices_dict, 'model_config': model_config}),
+                           content_type='application/json')
+    
+    assert response.status_code == 200
+    data = response.get_json()
+    assert 'predictions' in data
+    assert isinstance(data['predictions'], list)
+    assert len(data['predictions']) == len(sample_price_data)
+
+def test_dynamic_endpoint_cache(client, sample_price_data):
+    \"\"\"Test if the caching mechanism works.\"\"\"
+    model_config = {
+        "window_size": 15, "epochs": 1,
+        "layers": [{"type": "conv1d", "out_channels": 2, "kernel_size": 2}, {"type": "flatten"}, {"type": "linear", "out_features": 2}]
+    }
+    prices_dict = sample_price_data.to_dict(orient='list')
+    payload = {'prices': prices_dict, 'model_config': model_config}
+
+    # First call - should train and cache
+    start_time = pd.Timestamp.now()
+    res1 = client.post('/train_and_predict_dynamic', data=json.dumps(payload), content_type='application/json')
+    duration1 = pd.Timestamp.now() - start_time
+    
+    # Second call - should be much faster due to cache hit
+    start_time = pd.Timestamp.now()
+    res2 = client.post('/train_and_predict_dynamic', data=json.dumps(payload), content_type='application/json')
+    duration2 = pd.Timestamp.now() - start_time
+    
+    assert res1.status_code == 200
+    assert res2.status_code == 200
+    assert res1.get_json()['predictions'] == res2.get_json()['predictions']
+    assert duration2 < duration1 * 0.5 # Cache should be at least twice as fast
+
+def test_dynamic_endpoint_bad_request(client):
+    \"\"\"Test endpoint with missing or invalid data.\"\"\"
+    # Missing 'prices'
+    response = client.post('/train_and_predict_dynamic', 
+                           data=json.dumps({'model_config': {}}),
+                           content_type='application/json')
+    assert response.status_code == 400
+    
+    # Invalid model config (will raise ValueError during model build)
+    model_config = {"layers": [{"type": "invalid_layer"}]}
+    prices_dict = {'close': [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]} # Dummy
+    response = client.post('/train_and_predict_dynamic', 
+                           data=json.dumps({'prices': prices_dict, 'model_config': model_config}),
+                           content_type='application/json')
+    # Note: This might return 500 if not caught, but our refactored server returns 400.
+    assert response.status_code == 400
+    assert 'error' in response.get_json()
+    """)
+
+# Now, run pytest.
+import sys
+import io
+
+# Capture original stdout
+original_stdout = sys.stdout
+sys.stdout = captured_output = io.StringIO()
+
+# Run pytest using its main entry point
+pytest.main(['-v', 'test_backend.py'])
+
+# Restore stdout
+sys.stdout = original_stdout
+pytest_output = captured_output.getvalue()
+
+print("Pytest execution finished.")
+print(pytest_output)
