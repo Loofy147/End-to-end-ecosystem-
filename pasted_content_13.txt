@@ -1,0 +1,272 @@
+import numpy as np
+import time
+
+# ==============================================================================
+#  القسم 1: محرك التفاضل التلقائي (النواة الصلبة)
+# ==============================================================================
+
+def _sum_to_shape(grad, shape):
+    """
+    وظيفة مساعدة لضمان تطابق أبعاد المشتقة مع أبعاد المتغير الأصلي،
+    وهو أمر ضروري للتعامل مع بث NumPy (broadcasting) بشكل صحيح.
+    """
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    """
+    الفئة الأساسية في إطار العمل. تمثل عقدة في الرسم البياني الحسابي.
+    تحتفظ بالقيمة، والمشتقة، والعملية التي أنتجتها، والآباء.
+    """
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float)
+        self.parents = set(parents)
+        self.op = op
+        self.grad = None
+        self._backward = lambda: None # وظيفة فارغة لتنفيذ الانتشار الخلفي
+
+    def _ensure(self, other):
+        """تضمن أن الطرف الآخر من العملية هو كائن Node."""
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+
+    # --- перевантаження العمليات الأساسية ---
+    def __add__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            # المشتقة توزع كما هي على كلا الطرفين
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            # قاعدة الضرب: كل طرف يأخذ مشتقة الآخر
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        other = self._ensure(other)
+        out = Node(self.value @ other.value, (self, other), '@')
+        def _backward():
+            # مشتقة ضرب المصفوفات
+            self.grad += _sum_to_shape(out.grad @ other.value.T, self.value.shape)
+            other.grad += _sum_to_shape(self.value.T @ out.grad, other.value.shape)
+        out._backward = _backward
+        return out
+        
+    def __pow__(self, power):
+        assert isinstance(power, (int, float)), "Power must be a scalar"
+        out = Node(self.value ** power, (self,), f'**{power}')
+        def _backward():
+            self.grad += (power * self.value**(power-1)) * out.grad
+        out._backward = _backward
+        return out
+
+    def __neg__(self):
+        return self * -1
+
+    def __sub__(self, other):
+        return self + (-other)
+
+    def __truediv__(self, other):
+        return self * (other**-1)
+
+    # --- دوال التنشيط والعمليات الأخرى ---
+    def relu(self):
+        out = Node(np.maximum(0, self.value), (self,), 'ReLU')
+        def _backward():
+            # المشتقة تمر فقط عبر القيم الموجبة
+            self.grad += (self.value > 0) * out.grad
+        out._backward = _backward
+        return out
+
+    def sum(self):
+        out = Node(self.value.sum(), (self,), 'sum')
+        def _backward():
+            self.grad += np.broadcast_to(out.grad, self.value.shape)
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        """
+        تنفذ الانتشار الخلفي عبر الرسم البياني بأكمله.
+        تستخدم الترتيب الطوبولوجي لضمان حساب المشتقات بالترتيب الصحيح.
+        """
+        topo, visited = [], set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for parent in v.parents:
+                    build_topo(parent)
+                topo.append(v)
+        
+        build_topo(self)
+
+        # تصفير جميع المشتقات قبل البدء
+        for v in topo:
+            v.grad = np.zeros_like(v.value)
+        
+        # مشتقة الخسارة بالنسبة لنفسها هي 1
+        self.grad = np.ones_like(self.value)
+
+        # تنفيذ الانتشار الخلفي بالترتيب العكسي
+        for v in reversed(topo):
+            v._backward()
+
+# ==============================================================================
+#  القسم 2: وحدة بناء الشبكات (مستوحاة من PyTorch)
+# ==============================================================================
+
+class nn:
+    class Module:
+        """الفئة الأساسية لجميع مكونات الشبكة (الطبقات، النماذج)."""
+        def parameters(self):
+            """تُرجع مولِّدًا (generator) لجميع البارامترات القابلة للتعلم."""
+            for name, value in self.__dict__.items():
+                if isinstance(value, Node):
+                    yield value
+                elif isinstance(value, nn.Module):
+                    yield from value.parameters()
+
+        def __call__(self, *args, **kwargs):
+            """يسمح باستدعاء الكائن كدالة (مثل model(x))."""
+            return self.forward(*args, **kwargs)
+
+        def zero_grad(self):
+            """يقوم بتصفير المشتقات لجميع البارامترات."""
+            for p in self.parameters():
+                p.grad = np.zeros_like(p.value)
+
+    class Linear(Module):
+        """الطبقة الخطية (Fully Connected Layer)."""
+        def __init__(self, in_features, out_features):
+            # تهيئة الأوزان باستخدام تهيئة Kaiming للـ ReLU
+            limit = np.sqrt(2 / in_features)
+            self.weight = Node(np.random.randn(in_features, out_features) * limit)
+            self.bias = Node(np.zeros(out_features))
+
+        def forward(self, x):
+            return x @ self.weight + self.bias
+
+        def parameters(self):
+            yield from [self.weight, self.bias]
+
+    class ReLU(Module):
+        """طبقة تنشيط ReLU."""
+        def forward(self, x):
+            return x.relu()
+
+    class Sequential(Module):
+        """حاوية لتجميع الطبقات في نموذج متسلسل."""
+        def __init__(self, *layers):
+            self.layers = layers
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+
+        def parameters(self):
+            for layer in self.layers:
+                yield from layer.parameters()
+
+# ==============================================================================
+#  القسم 3: المُحسِّن (Optimizer)
+# ==============================================================================
+
+class AdamOptimizer:
+    """
+    تنفيذ مُحسِّن Adam. يفصل منطق تحديث الأوزان عن النموذج.
+    """
+    def __init__(self, params, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.params = list(params)
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.t = 0
+        # تهيئة حالات Adam (المتوسطات المتحركة) لكل بارامتر
+        self.m = [np.zeros_like(p.value) for p in self.params]
+        self.v = [np.zeros_like(p.value) for p in self.params]
+
+    def step(self):
+        """ينفذ خطوة تحديث واحدة."""
+        self.t += 1
+        for i, p in enumerate(self.params):
+            # تحديث المتوسطات المتحركة
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * p.grad
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (p.grad**2)
+            
+            # تصحيح الانحياز (Bias correction)
+            m_hat = self.m[i] / (1 - self.beta1**self.t)
+            v_hat = self.v[i] / (1 - self.beta2**self.t)
+            
+            # تحديث البارامتر
+            p.value -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+# ==============================================================================
+#  القسم 4: مثال توضيحي للاستخدام (اختياري)
+# ==============================================================================
+
+if __name__ == '__main__':
+    print("--- عرض توضيحي للكود الأساسي لإطار العمل ---")
+
+    # 1. إعداد بيانات وهمية لمسألة انحدار
+    np.random.seed(42)
+    X_data = np.random.rand(100, 1) * 10
+    y_data = 2 * X_data + 5 + np.random.randn(100, 1) * 2
+    X_node = Node(X_data)
+    y_node = Node(y_data)
+
+    # 2. بناء النموذج
+    model = nn.Sequential(
+        nn.Linear(1, 10),
+        nn.ReLU(),
+        nn.Linear(10, 1)
+    )
+
+    # 3. إنشاء المُحسِّن
+    optimizer = AdamOptimizer(model.parameters(), lr=0.1)
+
+    # 4. حلقة التدريب
+    print("\nبدء التدريب...")
+    start_time = time.time()
+    for epoch in range(101):
+        # Forward pass
+        y_pred = model(X_node)
+        
+        # Loss calculation (Mean Squared Error)
+        loss = ((y_pred - y_node)**2).sum() * (1 / len(X_data))
+        
+        # Backward pass
+        model.zero_grad()
+        loss.backward()
+        
+        # Optimizer step
+        optimizer.step()
+        
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch:3d} | Loss: {loss.value.item():.4f}")
+            
+    end_time = time.time()
+    print(f"--- اكتمل التدريب في {end_time - start_time:.2f} ثانية ---")
+
+    # 5. عرض النتائج
+    print("\nالنموذج تعلم العلاقة. مثال على التنبؤ:")
+    test_input = Node([[5.0]])
+    predicted_output = model(test_input)
+    true_output = 2 * 5.0 + 5
+    print(f"المدخل: 5.0")
+    print(f"القيمة الحقيقية (تقريبًا): {true_output:.2f}")
+    print(f"القيمة المتوقعة من النموذج: {predicted_output.value.item():.2f}")
+

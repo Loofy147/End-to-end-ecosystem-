@@ -1,0 +1,1103 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Play, Pause, RotateCcw, Settings, TrendingUp, Database, Cpu, Network, Brain, Zap, AlertTriangle, CheckCircle, Activity, Target } from 'lucide-react';
+
+const AdaptiveExperimentController = () => {
+  const [experimentState, setExperimentState] = useState({
+    isRunning: false,
+    generation: 0,
+    bestFitness: 0,
+    fitnessHistory: [],
+    stagnationCounter: 0,
+    lastImprovement: 0,
+    diversityScore: 1.0,
+    adaptations: [],
+    surrogatEnabled: false,
+    localSearchResults: []
+  });
+
+  const [controllerConfig, setControllerConfig] = useState({
+    stagnationWindow: 5,
+    stagnationThreshold: 1e-4,
+    mutationIncreaseFactor: 1.5,
+    maxMutation: 0.2,
+    diversityThreshold: 0.15,
+    diversifyK: 2,
+    enableSurrogateAfter: 10,
+    localSearchBudget: 3,
+    migrationAdaptationRate: 1.2
+  });
+
+  const [population, setPopulation] = useState([]);
+  const [islands, setIslands] = useState([]);
+  const [adaptiveParameters, setAdaptiveParameters] = useState({
+    mutationRate: 0.02,
+    crossoverRate: 0.8,
+    tournamentK: 3,
+    migrationK: 2,
+    elitismRate: 0.1
+  });
+
+  const [realTimeMetrics, setRealTimeMetrics] = useState({
+    convergenceRate: 0,
+    solutionStability: 1,
+    resourceEfficiency: 0,
+    adaptationSuccess: 0
+  });
+
+  const intervalRef = useRef();
+
+  // تنفيذ ExperimentController المتقدم
+  class AdvancedExperimentController {
+    constructor(config) {
+      this.config = config;
+      this.bestHistory = [];
+      this.lastImprovementGen = 0;
+      this.surrogatEnabled = false;
+      this.adaptations = [];
+      this.localSearchResults = [];
+      this.diversityHistory = [];
+      this.parameterHistory = [];
+    }
+
+    // تحديث التاريخ وكشف التحسينات
+    updateHistory(gen, bestFitness, diversity) {
+      this.bestHistory.push(bestFitness);
+      this.diversityHistory.push(diversity);
+      
+      if (this.bestHistory.length === 1 || bestFitness > Math.max(...this.bestHistory.slice(0, -1)) + 1e-12) {
+        this.lastImprovementGen = gen;
+      }
+    }
+
+    // حساب معدل التحسن المتحرك
+    movingAverageImprovement(window = null) {
+      window = window || Math.min(this.config.stagnationWindow, Math.max(1, this.bestHistory.length));
+      if (this.bestHistory.length < window + 1) return Infinity;
+      
+      const prev = this.bestHistory[this.bestHistory.length - window - 1];
+      const curr = this.bestHistory[this.bestHistory.length - 1];
+      return curr - prev;
+    }
+
+    // حساب نقاط التنوع
+    calculateDiversityScore(population) {
+      if (population.length <= 1) return 0;
+      
+      let totalDistance = 0;
+      let comparisons = 0;
+      
+      // خوارزمية عينة للحساب السريع
+      const sampleSize = Math.min(20, population.length);
+      for (let i = 0; i < sampleSize - 1; i++) {
+        for (let j = i + 1; j < sampleSize; j++) {
+          const distance = this.calculateIndividualDistance(population[i], population[j]);
+          totalDistance += distance;
+          comparisons++;
+        }
+      }
+      
+      return comparisons > 0 ? totalDistance / comparisons : 0;
+    }
+
+    calculateIndividualDistance(ind1, ind2) {
+      // محاكاة حساب المسافة بين فردين
+      if (!ind1.genome || !ind2.genome) return 0;
+      
+      let differences = 0;
+      const length = Math.max(ind1.genome.length, ind2.genome.length);
+      
+      for (let i = 0; i < length; i++) {
+        const gene1 = ind1.genome[i] || 0;
+        const gene2 = ind2.genome[i] || 0;
+        if (gene1 !== gene2) differences++;
+      }
+      
+      return differences / length;
+    }
+
+    // التكيف الديناميكي للمعاملات
+    adaptParameters(gen, optimizer, population) {
+      const adaptations = [];
+      
+      // 1. كشف الركود وزيادة معدل الطفرة
+      if (gen - this.lastImprovementGen >= this.config.stagnationWindow) {
+        const improvement = this.movingAverageImprovement();
+        
+        if (improvement <= this.config.stagnationThreshold) {
+          const oldMutation = optimizer.mutationRate;
+          const newMutation = Math.min(
+            this.config.maxMutation, 
+            oldMutation * this.config.mutationIncreaseFactor
+          );
+          
+          optimizer.mutationRate = newMutation;
+          adaptations.push({
+            type: 'increase_mutation',
+            generation: gen,
+            oldValue: oldMutation,
+            newValue: newMutation,
+            reason: `Stagnation detected (improvement: ${improvement.toExponential(2)})`
+          });
+
+          // حقن أفراد عشوائيين للتنويع
+          const diversifyCount = this.config.diversifyK;
+          for (let i = 0; i < diversifyCount; i++) {
+            const randomIndex = Math.floor(Math.random() * population.length);
+            population[randomIndex] = this.generateRandomIndividual();
+          }
+
+          adaptations.push({
+            type: 'inject_diversity',
+            generation: gen,
+            count: diversifyCount,
+            reason: 'Boost genetic diversity'
+          });
+        }
+      }
+
+      // 2. تكيف معدل التنوع
+      const diversityScore = this.calculateDiversityScore(population);
+      if (diversityScore < this.config.diversityThreshold) {
+        const oldTournament = optimizer.tournamentK;
+        optimizer.tournamentK = Math.max(2, Math.floor(oldTournament * 0.8));
+        
+        adaptations.push({
+          type: 'reduce_selection_pressure',
+          generation: gen,
+          oldValue: oldTournament,
+          newValue: optimizer.tournamentK,
+          reason: `Low diversity (${diversityScore.toFixed(3)})`
+        });
+
+        // زيادة معدل الهجرة
+        const oldMigration = optimizer.migrationK;
+        optimizer.migrationK = Math.min(
+          Math.floor(population.length / 4),
+          Math.ceil(oldMigration * this.config.migrationAdaptationRate)
+        );
+
+        adaptations.push({
+          type: 'increase_migration',
+          generation: gen,
+          oldValue: oldMigration,
+          newValue: optimizer.migrationK,
+          reason: 'Enhance population mixing'
+        });
+      }
+
+      // 3. تفعيل النموذج البديل (Surrogate)
+      if (!this.surrogatEnabled && gen >= this.config.enableSurrogateAfter) {
+        this.surrogatEnabled = true;
+        optimizer.surrogateEnabled = true;
+        
+        adaptations.push({
+          type: 'enable_surrogate',
+          generation: gen,
+          reason: `Sufficient data points collected (${gen})`
+        });
+      }
+
+      // 4. البحث المحلي التكيفي
+      if (gen % Math.max(2, this.config.stagnationWindow) === 0) {
+        const localSearchResult = this.performLocalSearch(optimizer, population);
+        if (localSearchResult.improved) {
+          adaptations.push({
+            type: 'local_search_success',
+            generation: gen,
+            improvement: localSearchResult.improvement,
+            reason: 'Local hill-climbing found better solution'
+          });
+        }
+        this.localSearchResults.push(localSearchResult);
+      }
+
+      this.adaptations.push(...adaptations);
+      return adaptations;
+    }
+
+    // البحث المحلي المتقدم
+    performLocalSearch(optimizer, population) {
+      if (population.length === 0) return { improved: false, improvement: 0 };
+
+      const bestIndividual = population[0]; // افتراض الترتيب
+      if (!bestIndividual) return { improved: false, improvement: 0 };
+
+      const originalFitness = bestIndividual.fitness || 0;
+      let bestImprovement = 0;
+      let improved = false;
+
+      for (let attempt = 0; attempt < this.config.localSearchBudget; attempt++) {
+        const mutatedGenome = this.applyLocalMutation(bestIndividual.genome);
+        const mutatedFitness = this.evaluateGenome(mutatedGenome);
+        
+        const improvement = mutatedFitness - originalFitness;
+        if (improvement > bestImprovement) {
+          bestImprovement = improvement;
+          improved = true;
+          
+          // تحديث أفضل فرد
+          population[0] = {
+            ...bestIndividual,
+            genome: mutatedGenome,
+            fitness: mutatedFitness
+          };
+        }
+      }
+
+      return {
+        improved,
+        improvement: bestImprovement,
+        attempts: this.config.localSearchBudget,
+        originalFitness,
+        finalFitness: originalFitness + bestImprovement
+      };
+    }
+
+    applyLocalMutation(genome) {
+      if (!Array.isArray(genome)) return genome;
+      
+      const mutated = [...genome];
+      const mutationCount = Math.max(1, Math.floor(genome.length * 0.05)); // 5% طفرة محلية
+      
+      for (let i = 0; i < mutationCount; i++) {
+        const index = Math.floor(Math.random() * mutated.length);
+        if (typeof mutated[index] === 'boolean') {
+          mutated[index] = !mutated[index];
+        } else if (typeof mutated[index] === 'number') {
+          mutated[index] += (Math.random() - 0.5) * 0.1; // تعديل صغير
+        }
+      }
+      
+      return mutated;
+    }
+
+    evaluateGenome(genome) {
+      // محاكاة تقييم اللياقة
+      if (!Array.isArray(genome)) return Math.random();
+      
+      let score = 0;
+      genome.forEach((gene, index) => {
+        if (typeof gene === 'boolean') {
+          score += gene ? Math.sin(index * 0.1) * 0.5 + 0.5 : 0;
+        } else if (typeof gene === 'number') {
+          score += Math.abs(gene) * Math.cos(index * 0.1);
+        }
+      });
+      
+      return Math.max(0, score / genome.length);
+    }
+
+    generateRandomIndividual() {
+      const genomeLength = 20;
+      const genome = [];
+      
+      for (let i = 0; i < genomeLength; i++) {
+        genome.push(Math.random() < 0.5);
+      }
+      
+      return {
+        genome,
+        fitness: this.evaluateGenome(genome),
+        meta: { generated: 'random', timestamp: Date.now() }
+      };
+    }
+
+    // تقرير شامل عن حالة التجربة
+    generateReport() {
+      return {
+        bestHistory: this.bestHistory,
+        adaptations: this.adaptations,
+        diversityHistory: this.diversityHistory,
+        localSearchResults: this.localSearchResults,
+        surrogatEnabled: this.surrogatEnabled,
+        totalAdaptations: this.adaptations.length,
+        successfulLocalSearches: this.localSearchResults.filter(r => r.improved).length,
+        averageDiversity: this.diversityHistory.length > 0 ? 
+          this.diversityHistory.reduce((a, b) => a + b, 0) / this.diversityHistory.length : 0
+      };
+    }
+  }
+
+  const controllerRef = useRef(new AdvancedExperimentController(controllerConfig));
+
+  // محاكاة تشغيل التجربة
+  const runExperiment = useCallback(() => {
+    if (experimentState.isRunning) return;
+
+    setExperimentState(prev => ({ ...prev, isRunning: true }));
+
+    // تهيئة التجمع السكاني
+    const initialPopulation = Array.from({ length: 50 }, () => 
+      controllerRef.current.generateRandomIndividual()
+    );
+    setPopulation(initialPopulation);
+
+    // تقسيم إلى جزر
+    const islandCount = 4;
+    const islandSize = Math.floor(initialPopulation.length / islandCount);
+    const newIslands = [];
+    for (let i = 0; i < islandCount; i++) {
+      const start = i * islandSize;
+      const end = i === islandCount - 1 ? initialPopulation.length : start + islandSize;
+      newIslands.push(initialPopulation.slice(start, end));
+    }
+    setIslands(newIslands);
+
+    intervalRef.current = setInterval(() => {
+      setExperimentState(prev => {
+        const newGen = prev.generation + 1;
+        const controller = controllerRef.current;
+        
+        // محاكاة تطوير الجيل
+        const mockOptimizer = {
+          mutationRate: adaptiveParameters.mutationRate,
+          tournamentK: adaptiveParameters.tournamentK,
+          migrationK: adaptiveParameters.migrationK,
+          surrogateEnabled: false
+        };
+
+        // تحديث اللياقة
+        const updatedPopulation = initialPopulation.map(ind => ({
+          ...ind,
+          fitness: controller.evaluateGenome(ind.genome) + Math.random() * 0.1 - 0.05
+        }));
+
+        // حساب أفضل لياقة
+        const bestFitness = Math.max(...updatedPopulation.map(ind => ind.fitness));
+        const diversity = controller.calculateDiversityScore(updatedPopulation);
+
+        // تحديث التاريخ
+        controller.updateHistory(newGen, bestFitness, diversity);
+
+        // تطبيق التكيفات
+        const adaptations = controller.adaptParameters(newGen, mockOptimizer, updatedPopulation);
+
+        // تحديث المعاملات التكيفية
+        setAdaptiveParameters(prev => ({
+          ...prev,
+          mutationRate: mockOptimizer.mutationRate,
+          tournamentK: mockOptimizer.tournamentK,
+          migrationK: mockOptimizer.migrationK
+        }));
+
+        // حساب المقاييس في الوقت الفعلي
+        const convergenceRate = controller.bestHistory.length > 5 ? 
+          (controller.bestHistory[controller.bestHistory.length - 1] - controller.bestHistory[controller.bestHistory.length - 6]) / 5 : 0;
+        
+        const solutionStability = controller.bestHistory.length > 3 ?
+          1 / (1 + Math.abs(controller.bestHistory[controller.bestHistory.length - 1] - controller.bestHistory[controller.bestHistory.length - 2])) : 1;
+
+        setRealTimeMetrics({
+          convergenceRate: convergenceRate,
+          solutionStability: solutionStability,
+          resourceEfficiency: (controller.adaptations.length > 0 ? 0.8 : 0.6) + Math.random() * 0.2,
+          adaptationSuccess: controller.adaptations.filter(a => a.type.includes('success')).length / Math.max(1, controller.adaptations.length)
+        });
+
+        return {
+          ...prev,
+          generation: newGen,
+          bestFitness: bestFitness,
+          fitnessHistory: [...prev.fitnessHistory, bestFitness],
+          stagnationCounter: newGen - controller.lastImprovementGen,
+          lastImprovement: controller.lastImprovementGen,
+          diversityScore: diversity,
+          adaptations: [...prev.adaptations, ...adaptations],
+          surrogatEnabled: controller.surrogatEnabled,
+          localSearchResults: [...controller.localSearchResults]
+        };
+      });
+    }, 200);
+  }, [adaptiveParameters]);
+
+  const stopExperiment = () => {
+    setExperimentState(prev => ({ ...prev, isRunning: false }));
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+    }
+  };
+
+  const resetExperiment = () => {
+    stopExperiment();
+    controllerRef.current = new AdvancedExperimentController(controllerConfig);
+    setExperimentState({
+      isRunning: false,
+      generation: 0,
+      bestFitness: 0,
+      fitnessHistory: [],
+      stagnationCounter: 0,
+      lastImprovement: 0,
+      diversityScore: 1.0,
+      adaptations: [],
+      surrogatEnabled: false,
+      localSearchResults: []
+    });
+    setRealTimeMetrics({
+      convergenceRate: 0,
+      solutionStability: 1,
+      resourceEfficiency: 0,
+      adaptationSuccess: 0
+    });
+  };
+
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <div className="max-w-7xl mx-auto p-6 bg-gradient-to-br from-slate-50 to-blue-50 min-h-screen" dir="rtl">
+      <div className="bg-white rounded-xl shadow-xl p-6 mb-6">
+        
+        {/* العنوان */}
+        <div className="text-center mb-8">
+          <h1 className="text-4xl font-bold bg-gradient-to-r from-purple-600 to-blue-600 bg-clip-text text-transparent mb-2">
+            مراقب التجارب التكيفي المتقدم
+          </h1>
+          <p className="text-lg text-gray-600">
+            نظام ذكي لمراقبة وتكييف الخوارزميات الجينية في الوقت الفعلي
+          </p>
+        </div>
+
+        {/* لوحة التحكم */}
+        <div className="flex justify-center gap-4 mb-8">
+          <button
+            onClick={experimentState.isRunning ? stopExperiment : runExperiment}
+            className={`flex items-center gap-3 px-8 py-4 rounded-xl font-bold text-lg transition-all duration-300 ${
+              experimentState.isRunning 
+                ? 'bg-red-500 hover:bg-red-600 text-white shadow-lg' 
+                : 'bg-green-500 hover:bg-green-600 text-white shadow-lg hover:shadow-xl transform hover:scale-105'
+            }`}
+          >
+            {experimentState.isRunning ? <Pause size={24} /> : <Play size={24} />}
+            {experimentState.isRunning ? 'إيقاف التجربة' : 'بدء التجربة'}
+          </button>
+          
+          <button
+            onClick={resetExperiment}
+            className="flex items-center gap-3 px-8 py-4 bg-blue-500 hover:bg-blue-600 text-white rounded-xl font-bold text-lg transition-all duration-300 shadow-lg hover:shadow-xl transform hover:scale-105"
+          >
+            <RotateCcw size={24} />
+            إعادة تعيين
+          </button>
+        </div>
+
+        {/* المقاييس في الوقت الفعلي */}
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+          <div className="bg-gradient-to-br from-blue-100 to-blue-200 p-4 rounded-xl text-center">
+            <Activity className="w-8 h-8 mx-auto mb-2 text-blue-600" />
+            <div className="text-2xl font-bold text-blue-800">{experimentState.generation}</div>
+            <div className="text-sm text-blue-600">الجيل الحالي</div>
+          </div>
+          
+          <div className="bg-gradient-to-br from-green-100 to-green-200 p-4 rounded-xl text-center">
+            <Target className="w-8 h-8 mx-auto mb-2 text-green-600" />
+            <div className="text-2xl font-bold text-green-800">
+              {(experimentState.bestFitness * 100).toFixed(1)}%
+            </div>
+            <div className="text-sm text-green-600">أفضل لياقة</div>
+          </div>
+          
+          <div className="bg-gradient-to-br from-purple-100 to-purple-200 p-4 rounded-xl text-center">
+            <Zap className="w-8 h-8 mx-auto mb-2 text-purple-600" />
+            <div className="text-2xl font-bold text-purple-800">{experimentState.stagnationCounter}</div>
+            <div className="text-sm text-purple-600">أجيال الركود</div>
+          </div>
+          
+          <div className="bg-gradient-to-br from-orange-100 to-orange-200 p-4 rounded-xl text-center">
+            <TrendingUp className="w-8 h-8 mx-auto mb-2 text-orange-600" />
+            <div className="text-2xl font-bold text-orange-800">
+              {(experimentState.diversityScore * 100).toFixed(0)}%
+            </div>
+            <div className="text-sm text-orange-600">مؤشر التنوع</div>
+          </div>
+          
+          <div className="bg-gradient-to-br from-teal-100 to-teal-200 p-4 rounded-xl text-center">
+            <CheckCircle className="w-8 h-8 mx-auto mb-2 text-teal-600" />
+            <div className="text-2xl font-bold text-teal-800">{experimentState.adaptations.length}</div>
+            <div className="text-sm text-teal-600">التكيفات المطبقة</div>
+          </div>
+        </div>
+
+        {/* المعاملات التكيفية */}
+        <div className="bg-gradient-to-r from-indigo-50 to-purple-50 p-6 rounded-xl mb-8">
+          <h3 className="text-xl font-bold mb-6 text-gray-800">⚙️ المعاملات التكيفية</h3>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-4">
+              <div className="bg-white p-4 rounded-lg shadow-sm">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="font-medium">معدل الطفرة</span>
+                  <span className="font-bold text-blue-600">
+                    {(adaptiveParameters.mutationRate * 100).toFixed(2)}%
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-3">
+                  <div 
+                    className="bg-blue-500 h-3 rounded-full transition-all duration-500"
+                    style={{ width: `${(adaptiveParameters.mutationRate / 0.2) * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+              
+              <div className="bg-white p-4 rounded-lg shadow-sm">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="font-medium">حجم البطولة</span>
+                  <span className="font-bold text-green-600">{adaptiveParameters.tournamentK}</span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-3">
+                  <div 
+                    className="bg-green-500 h-3 rounded-full transition-all duration-500"
+                    style={{ width: `${(adaptiveParameters.tournamentK / 5) * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+            </div>
+            
+            <div className="space-y-4">
+              <div className="bg-white p-4 rounded-lg shadow-sm">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="font-medium">معدل الهجرة</span>
+                  <span className="font-bold text-purple-600">{adaptiveParameters.migrationK}</span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-3">
+                  <div 
+                    className="bg-purple-500 h-3 rounded-full transition-all duration-500"
+                    style={{ width: `${(adaptiveParameters.migrationK / 10) * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+              
+              <div className="bg-white p-4 rounded-lg shadow-sm">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium">النموذج البديل</span>
+                  <div className={`px-3 py-1 rounded-full text-sm font-bold ${
+                    experimentState.surrogatEnabled 
+                      ? 'bg-green-100 text-green-800' 
+                      : 'bg-gray-100 text-gray-600'
+                  }`}>
+                    {experimentState.surrogatEnabled ? 'مُفعل' : 'معطل'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* رسم بياني لتطور اللياقة */}
+        {experimentState.fitnessHistory.length > 1 && (
+          <div className="bg-white p-6 border rounded-xl mb-8">
+            <h3 className="font-bold text-xl mb-4 text-gray-800">📈 منحنى التطور التكيفي</h3>
+            <div className="bg-gray-50 p-4 rounded-lg">
+              <svg className="w-full h-64" viewBox="0 0 800 200">
+                <defs>
+                  <linearGradient id="fitnessGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stopColor="#3B82F6" stopOpacity="0.3"/>
+                    <stop offset="100%" stopColor="#3B82F6" stopOpacity="0.1"/>
+                  </linearGradient>
+                  <linearGradient id="diversityGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stopColor="#F59E0B" stopOpacity="0.3"/>
+                    <stop offset="100%" stopColor="#F59E0B" stopOpacity="0.1"/>
+                  </linearGradient>
+                </defs>
+                
+                {/* منطقة اللياقة */}
+                <polygon
+                  points={`20,180 ${experimentState.fitnessHistory.map((fitness, index) => 
+                    `${(index / (experimentState.fitnessHistory.length - 1)) * 760 + 20},${180 - fitness * 150}`
+                  ).join(' ')} ${(experimentState.fitnessHistory.length - 1) * 760 / (experimentState.fitnessHistory.length - 1) + 20},180`}
+                  fill="url(#fitnessGradient)"
+                />
+                
+                {/* خط اللياقة */}
+                <polyline
+                  points={experimentState.fitnessHistory.map((fitness, index) => 
+                    `${(index / (experimentState.fitnessHistory.length - 1)) * 760 + 20},${180 - fitness * 150}`
+                  ).join(' ')}
+                  fill="none"
+                  stroke="#3B82F6"
+                  strokeWidth="3"
+                />
+                
+                {/* نقاط التكيف */}
+                {experimentState.adaptations.map((adaptation, index) => {
+                  const x = (adaptation.generation / experimentState.generation) * 760 + 20;
+                  return (
+                    <g key={index}>
+                      <circle cx={x} cy="30" r="6" fill="#EF4444" stroke="#DC2626" strokeWidth="2"/>
+                      <text x={x} y="25" textAnchor="middle" className="text-xs font-bold" fill="#DC2626">A</text>
+                    </g>
+                  );
+                })}
+                
+                {/* خطوط الشبكة */}
+                {[0.25, 0.5, 0.75].map(level => (
+                  <line
+                    key={level}
+                    x1="20"
+                    y1={180 - level * 150}
+                    x2="780"
+                    y2={180 - level * 150}
+                    stroke="#E5E7EB"
+                    strokeWidth="1"
+                    strokeDasharray="5,5"
+                  />
+                ))}
+              </svg>
+              
+              <div className="flex justify-between items-center mt-4 text-sm">
+                <div className="flex gap-4">
+                  <div className="flex items-center">
+                    <div className="w-4 h-0.5 bg-blue-500 ml-2"></div>
+                    <span>اللياقة</span>
+                  </div>
+                  <div className="flex items-center">
+                    <div className="w-4 h-4 bg-red-500 rounded-full ml-2"></div>
+                    <span>نقاط التكيف</span>
+                  </div>
+                </div>
+                <div className="text-gray-600">
+                  الجيل {experimentState.generation} | التكيفات: {experimentState.adaptations.length}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* سجل التكيفات */}
+        <div className="bg-gradient-to-r from-yellow-50 to-orange-50 p-6 rounded-xl mb-8">
+          <h3 className="font-bold text-xl mb-6 text-gray-800">🔄 سجل التكيفات المطبقة</h3>
+          
+          <div className="max-h-96 overflow-y-auto">
+            {experimentState.adaptations.length === 0 ? (
+              <div className="text-center text-gray-500 py-8">
+                لم يتم تطبيق أي تكيفات بعد...
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {experimentState.adaptations.map((adaptation, index) => (
+                  <div key={index} className="bg-white p-4 rounded-lg shadow-sm border-r-4 border-blue-400">
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-2">
+                          {adaptation.type === 'increase_mutation' && <TrendingUp className="w-4 h-4 text-orange-500" />}
+                          {adaptation.type === 'inject_diversity' && <Zap className="w-4 h-4 text-green-500" />}
+                          {adaptation.type === 'reduce_selection_pressure' && <Target className="w-4 h-4 text-blue-500" />}
+                          {adaptation.type === 'increase_migration' && <Network className="w-4 h-4 text-purple-500" />}
+                          {adaptation.type === 'enable_surrogate' && <Brain className="w-4 h-4 text-indigo-500" />}
+                          {adaptation.type === 'local_search_success' && <CheckCircle className="w-4 h-4 text-green-600" />}
+                          
+                          <span className="font-semibold text-gray-800">
+                            {adaptation.type === 'increase_mutation' && 'زيادة معدل الطفرة'}
+                            {adaptation.type === 'inject_diversity' && 'حقن التنوع'}
+                            {adaptation.type === 'reduce_selection_pressure' && 'تقليل ضغط الاختيار'}
+                            {adaptation.type === 'increase_migration' && 'زيادة الهجرة'}
+                            {adaptation.type === 'enable_surrogate' && 'تفعيل النموذج البديل'}
+                            {adaptation.type === 'local_search_success' && 'نجاح البحث المحلي'}
+                          </span>
+                          
+                          <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">
+                            الجيل {adaptation.generation}
+                          </span>
+                        </div>
+                        
+                        <div className="text-sm text-gray-600 mb-2">
+                          {adaptation.reason}
+                        </div>
+                        
+                        {(adaptation.oldValue !== undefined && adaptation.newValue !== undefined) && (
+                          <div className="text-xs text-blue-600">
+                            {adaptation.oldValue.toFixed(4)} → {adaptation.newValue.toFixed(4)}
+                            <span className="text-green-600 mr-2">
+                              ({((adaptation.newValue / adaptation.oldValue - 1) * 100).toFixed(1)}% تغيير)
+                            </span>
+                          </div>
+                        )}
+                        
+                        {adaptation.count && (
+                          <div className="text-xs text-purple-600">
+                            عدد: {adaptation.count}
+                          </div>
+                        )}
+                        
+                        {adaptation.improvement && (
+                          <div className="text-xs text-green-600">
+                            تحسن: +{(adaptation.improvement * 100).toFixed(2)}%
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* مقاييس الأداء المتقدمة */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+          
+          {/* مقاييس الأداء الفوري */}
+          <div className="bg-white p-6 rounded-xl shadow-sm border">
+            <h4 className="font-bold text-lg mb-4 text-gray-800">⚡ مقاييس الأداء الفوري</h4>
+            
+            <div className="space-y-4">
+              <div>
+                <div className="flex justify-between mb-2">
+                  <span className="text-sm font-medium">معدل التقارب</span>
+                  <span className="text-sm font-bold text-blue-600">
+                    {(realTimeMetrics.convergenceRate * 1000).toFixed(2)}‰
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div 
+                    className="bg-blue-500 h-2 rounded-full transition-all duration-500"
+                    style={{ width: `${Math.min(100, Math.max(0, realTimeMetrics.convergenceRate * 500))}%` }}
+                  ></div>
+                </div>
+              </div>
+              
+              <div>
+                <div className="flex justify-between mb-2">
+                  <span className="text-sm font-medium">استقرار الحل</span>
+                  <span className="text-sm font-bold text-green-600">
+                    {(realTimeMetrics.solutionStability * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div 
+                    className="bg-green-500 h-2 rounded-full transition-all duration-500"
+                    style={{ width: `${realTimeMetrics.solutionStability * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+              
+              <div>
+                <div className="flex justify-between mb-2">
+                  <span className="text-sm font-medium">كفاءة الموارد</span>
+                  <span className="text-sm font-bold text-purple-600">
+                    {(realTimeMetrics.resourceEfficiency * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div 
+                    className="bg-purple-500 h-2 rounded-full transition-all duration-500"
+                    style={{ width: `${realTimeMetrics.resourceEfficiency * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+              
+              <div>
+                <div className="flex justify-between mb-2">
+                  <span className="text-sm font-medium">نجاح التكيفات</span>
+                  <span className="text-sm font-bold text-orange-600">
+                    {(realTimeMetrics.adaptationSuccess * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div 
+                    className="bg-orange-500 h-2 rounded-full transition-all duration-500"
+                    style={{ width: `${realTimeMetrics.adaptationSuccess * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* نتائج البحث المحلي */}
+          <div className="bg-white p-6 rounded-xl shadow-sm border">
+            <h4 className="font-bold text-lg mb-4 text-gray-800">🔍 نتائج البحث المحلي</h4>
+            
+            {experimentState.localSearchResults.length === 0 ? (
+              <div className="text-center text-gray-500 py-8">
+                لم يتم تنفيذ بحث محلي بعد...
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {experimentState.localSearchResults.slice(-5).map((result, index) => (
+                  <div key={index} className={`p-3 rounded-lg border-2 ${
+                    result.improved ? 'bg-green-50 border-green-200' : 'bg-gray-50 border-gray-200'
+                  }`}>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        {result.improved ? 
+                          <CheckCircle className="w-4 h-4 text-green-600" /> :
+                          <AlertTriangle className="w-4 h-4 text-gray-500" />
+                        }
+                        <span className="font-medium">
+                          {result.improved ? 'نجح البحث' : 'لم يحسن'}
+                        </span>
+                      </div>
+                      <span className="text-xs text-gray-500">
+                        {result.attempts} محاولات
+                      </span>
+                    </div>
+                    
+                    {result.improved && (
+                      <div className="text-sm">
+                        <div className="flex justify-between">
+                          <span>اللياقة الأصلية:</span>
+                          <span>{result.originalFitness.toFixed(4)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>اللياقة النهائية:</span>
+                          <span className="text-green-600 font-semibold">
+                            {result.finalFitness.toFixed(4)}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>التحسن:</span>
+                          <span className="text-green-600 font-semibold">
+                            +{(result.improvement * 100).toFixed(2)}%
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            
+            <div className="mt-4 pt-4 border-t">
+              <div className="text-sm text-gray-600">
+                إجمالي البحوث المحلية: {experimentState.localSearchResults.length}
+                <br />
+                البحوث الناجحة: {experimentState.localSearchResults.filter(r => r.improved).length}
+                <br />
+                معدل النجاح: {experimentState.localSearchResults.length > 0 ? 
+                  (experimentState.localSearchResults.filter(r => r.improved).length / experimentState.localSearchResults.length * 100).toFixed(1)
+                  : 0}%
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* تحليل متقدم وتوصيات */}
+        <div className="bg-gradient-to-r from-emerald-50 to-teal-50 p-6 rounded-xl mb-8">
+          <h3 className="font-bold text-xl mb-6 text-gray-800">🧠 التحليل الذكي والتوصيات</h3>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            {/* حالة التجربة */}
+            <div className="bg-white p-5 rounded-lg shadow-sm">
+              <h4 className="font-semibold mb-4 text-gray-800">📊 حالة التجربة الحالية</h4>
+              <div className="space-y-3 text-sm">
+                
+                {experimentState.stagnationCounter > controllerConfig.stagnationWindow && (
+                  <div className="p-3 bg-red-50 rounded border-r-2 border-red-400">
+                    <div className="font-medium text-red-700">⚠️ ركود مكتشف</div>
+                    <div className="text-red-600">
+                      لم يحدث تحسن لـ {experimentState.stagnationCounter} جيل
+                    </div>
+                  </div>
+                )}
+                
+                {experimentState.diversityScore < controllerConfig.diversityThreshold && (
+                  <div className="p-3 bg-yellow-50 rounded border-r-2 border-yellow-400">
+                    <div className="font-medium text-yellow-700">⚠️ تنوع منخفض</div>
+                    <div className="text-yellow-600">
+                      مؤشر التنوع: {(experimentState.diversityScore * 100).toFixed(1)}%
+                    </div>
+                  </div>
+                )}
+                
+                {experimentState.surrogatEnabled && (
+                  <div className="p-3 bg-blue-50 rounded border-r-2 border-blue-400">
+                    <div className="font-medium text-blue-700">✅ النموذج البديل مُفعل</div>
+                    <div className="text-blue-600">
+                      تسريع التقييم والتنبؤ
+                    </div>
+                  </div>
+                )}
+                
+                {realTimeMetrics.convergenceRate > 0.001 && (
+                  <div className="p-3 bg-green-50 rounded border-r-2 border-green-400">
+                    <div className="font-medium text-green-700">📈 تقارب جيد</div>
+                    <div className="text-green-600">
+                      معدل التحسن مستمر
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* التوصيات الذكية */}
+            <div className="bg-white p-5 rounded-lg shadow-sm">
+              <h4 className="font-semibold mb-4 text-gray-800">💡 التوصيات الذكية</h4>
+              <div className="space-y-3 text-sm">
+                
+                {experimentState.stagnationCounter <= 2 && realTimeMetrics.convergenceRate > 0.001 && (
+                  <div className="p-3 bg-green-50 rounded border-r-2 border-green-400">
+                    <div className="font-medium text-green-700">✅ الأداء ممتاز</div>
+                    <div className="text-green-600">
+                      استمر بالمعاملات الحالية
+                    </div>
+                  </div>
+                )}
+                
+                {experimentState.diversityScore < 0.1 && (
+                  <div className="p-3 bg-orange-50 rounded border-r-2 border-orange-400">
+                    <div className="font-medium text-orange-700">🔄 زيادة التنوع</div>
+                    <div className="text-orange-600">
+                      فكر في زيادة معدل الطفرة أو الهجرة
+                    </div>
+                  </div>
+                )}
+                
+                {experimentState.localSearchResults.filter(r => r.improved).length === 0 && experimentState.localSearchResults.length > 2 && (
+                  <div className="p-3 bg-purple-50 rounded border-r-2 border-purple-400">
+                    <div className="font-medium text-purple-700">🔍 تحسين البحث المحلي</div>
+                    <div className="text-purple-600">
+                      زيادة ميزانية البحث المحلي قد تساعد
+                    </div>
+                  </div>
+                )}
+                
+                {!experimentState.surrogatEnabled && experimentState.generation >= controllerConfig.enableSurrogateAfter && (
+                  <div className="p-3 bg-blue-50 rounded border-r-2 border-blue-400">
+                    <div className="font-medium text-blue-700">🧠 تفعيل النموذج البديل</div>
+                    <div className="text-blue-600">
+                      توفر بيانات كافية لتفعيل النموذج البديل
+                    </div>
+                  </div>
+                )}
+                
+                {experimentState.adaptations.length === 0 && experimentState.generation > 10 && (
+                  <div className="p-3 bg-indigo-50 rounded border-r-2 border-indigo-400">
+                    <div className="font-medium text-indigo-700">⚙️ معاملات مثلى</div>
+                    <div className="text-indigo-600">
+                      المعاملات الحالية تعمل بشكل جيد
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* إعدادات المراقب */}
+        <div className="bg-gray-50 p-6 rounded-xl">
+          <h3 className="font-bold text-xl mb-6 text-gray-800">⚙️ إعدادات المراقب التكيفي</h3>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <h4 className="font-medium mb-3">كشف الركود</h4>
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">نافذة الركود:</label>
+                  <input
+                    type="number"
+                    value={controllerConfig.stagnationWindow}
+                    onChange={(e) => setControllerConfig(prev => ({
+                      ...prev,
+                      stagnationWindow: parseInt(e.target.value)
+                    }))}
+                    className="w-full p-2 border rounded"
+                    min="2"
+                    max="20"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">حد الركود:</label>
+                  <input
+                    type="number"
+                    value={controllerConfig.stagnationThreshold}
+                    onChange={(e) => setControllerConfig(prev => ({
+                      ...prev,
+                      stagnationThreshold: parseFloat(e.target.value)
+                    }))}
+                    className="w-full p-2 border rounded"
+                    min="0"
+                    max="0.01"
+                    step="0.0001"
+                  />
+                </div>
+              </div>
+            </div>
+            
+            <div>
+              <h4 className="font-medium mb-3">تكيف الطفرة</h4>
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">معامل زيادة الطفرة:</label>
+                  <input
+                    type="number"
+                    value={controllerConfig.mutationIncreaseFactor}
+                    onChange={(e) => setControllerConfig(prev => ({
+                      ...prev,
+                      mutationIncreaseFactor: parseFloat(e.target.value)
+                    }))}
+                    className="w-full p-2 border rounded"
+                    min="1.1"
+                    max="3"
+                    step="0.1"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">أقصى طفرة:</label>
+                  <input
+                    type="number"
+                    value={controllerConfig.maxMutation}
+                    onChange={(e) => setControllerConfig(prev => ({
+                      ...prev,
+                      maxMutation: parseFloat(e.target.value)
+                    }))}
+                    className="w-full p-2 border rounded"
+                    min="0.05"
+                    max="0.5"
+                    step="0.05"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <div className="mt-6 p-4 bg-blue-100 rounded-lg">
+            <div className="text-sm text-blue-800">
+              <strong>💡 نصيحة:</strong> يمكن تعديل هذه المعاملات أثناء تشغيل التجربة. 
+              التغييرات ستطبق على الأجيال القادمة.
+            </div>
+          </div>
+        </div>
+
+        {/* تقرير نهائي */}
+        {experimentState.generation > 0 && (
+          <div className="mt-8 bg-gradient-to-r from-slate-100 to-gray-100 p-6 rounded-xl">
+            <h3 className="font-bold text-xl mb-4 text-gray-800">📋 تقرير التجربة</h3>
+            
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="text-center">
+                <div className="text-2xl font-bold text-blue-600">{experimentState.generation}</div>
+                <div className="text-sm text-gray-600">إجمالي الأجيال</div>
+              </div>
+              
+              <div className="text-center">
+                <div className="text-2xl font-bold text-green-600">
+                  {(experimentState.bestFitness * 100).toFixed(1)}%
+                </div>
+                <div className="text-sm text-gray-600">أفضل لياقة</div>
+              </div>
+              
+              <div className="text-center">
+                <div className="text-2xl font-bold text-purple-600">{experimentState.adaptations.length}</div>
+                <div className="text-sm text-gray-600">تكيفات مطبقة</div>
+              </div>
+              
+              <div className="text-center">
+                <div className="text-2xl font-bold text-orange-600">
+                  {experimentState.localSearchResults.filter(r => r.improved).length}
+                </div>
+                <div className="text-sm text-gray-600">بحوث محلية ناجحة</div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default AdaptiveExperimentController;

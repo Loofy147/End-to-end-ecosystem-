@@ -1,0 +1,498 @@
+# Re-create files after kernel reset
+import os, json, textwrap, zipfile, pathlib
+
+root = "/mnt/data/pbwc_lander"
+os.makedirs(root, exist_ok=True)
+
+def write(path, content, mode="w", binary=False):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb" if binary else "w", encoding=None if binary else "utf-8") as f:
+        f.write(content)
+
+# Files content (same as previous cell)
+README = textwrap.dedent("""
+# PBWC 3.0 + Orchestrator v5 + GA/PSO Hybrid (LunarLanderContinuous-v3)
+
+This repo integrates:
+- PBWC 3.0 core (fractional activations + Neural ODE step + adaptive horizons + MCTS α selection).
+- Scheduler Registry (constant, linear, exponential, cyclical) inspired by your v5 design.
+- Hybrid GA/PSO tuner to search hyperparameters (population islands + swarm with cross-pollination).
+- Minimal actor-critic training loop for `LunarLanderContinuous-v3` (Gymnasium) using PBWC policy.
+
+> Note: You need `gymnasium[box2d]`, `numpy`. Optional: `matplotlib` for plots.
+
+## Quickstart
+
+```bash
+python main.py --env LunarLanderContinuous-v3 --seed 42 --episodes 200
+```
+
+To run tuner:
+```bash
+python main.py --tune --generations 5 --population 12
+```
+
+All knobs are in `config.json`. Schedulers are in `schedulers.py` (Registry pattern).
+PBWC modules are in `pbwc_core.py`. The training loop is in `orchestrator.py`.
+""")
+
+CONFIG = json.dumps({
+    "seed": 42,
+    "env_id": "LunarLanderContinuous-v3",
+    "episodes": 200,
+    "gamma": 0.99,
+    "lr": 3e-4,
+    "lr_scheduler": {"type": "cyclical", "initial_lr": 3e-4, "max_lr": 1e-3, "step_size": 200, "total_epochs": 10000},
+    "hidden_sizes": [128, 128],
+    "activation": "prelu",
+    "fractional_alpha": 0.7,
+    "ode_steps": 1,
+    "ode_dt": 0.05,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5,
+    "grad_clip": 0.5,
+    "horizon": {"h0": 200, "eta": 0.05, "noise_sigma": 3.0, "min_h": 64, "max_h": 400},
+    "tuner": {"generations": 5, "population": 12}
+}, indent=2)
+
+SCHEDULERS = textwrap.dedent("""
+import math
+
+def constant_lr(epoch, initial_lr=1e-3, **kwargs):
+    return float(initial_lr)
+
+def linear_decay_lr(epoch, initial_lr=1e-3, total_epochs=1000, **kwargs):
+    frac = max(0.0, 1.0 - epoch / max(1, total_epochs))
+    return float(initial_lr) * frac
+
+def exponential_decay_lr(epoch, initial_lr=1e-3, decay_rate=0.999, **kwargs):
+    return float(initial_lr) * (decay_rate ** epoch)
+
+def cyclical_lr(epoch, initial_lr=1e-3, max_lr=3e-3, step_size=200, **kwargs):
+    cycle = math.floor(1 + epoch / (2 * step_size))
+    x = abs(epoch / step_size - 2 * cycle + 1)
+    scale = max(0.0, 1 - x)
+    return float(initial_lr + (max_lr - initial_lr) * scale)
+
+LR_SCHEDULER_REGISTRY = {
+    "constant": constant_lr,
+    "linear": linear_decay_lr,
+    "exponential": exponential_decay_lr,
+    "cyclical": cyclical_lr,
+}
+""")
+
+PBWC_CORE = textwrap.dedent("""
+import numpy as np
+
+class FractionalCaputo:
+    def __init__(self, alpha=0.7, max_k=32, eps=1e-8):
+        self.alpha = float(alpha); self.max_k = int(max_k); self.eps = float(eps)
+
+    def binom(self, a, k):
+        res = 1.0
+        for i in range(k): res *= (a - i) / (i + 1.0)
+        return res
+
+    def __call__(self, x_hist):
+        T = len(x_hist)
+        if T == 0: return np.zeros_like(x_hist)
+        x_hist = np.asarray(x_hist, dtype=np.float32)
+        d = np.zeros_like(x_hist[-1])
+        K = min(self.max_k, T)
+        for k in range(K):
+            c = ((-1)**k) * self.binom(self.alpha, k)
+            curr = x_hist[-1 - k]
+            prev = x_hist[-2 - k] if (T - 2 - k) >= 0 else x_hist[-1 - k]
+            d += c * (curr - prev)
+        return d
+
+class NeuralODEBlock:
+    def __init__(self, f, dt=0.05, steps=1):
+        self.f = f; self.dt = float(dt); self.steps = int(steps)
+
+    def __call__(self, x):
+        h = x
+        for _ in range(self.steps): h = h + self.dt * self.f(h)
+        return h
+
+class PReLU:
+    def __init__(self, a=0.25): self.a = float(a)
+    def __call__(self, x): return np.where(x >= 0, x, self.a * x)
+
+class Tanh:
+    def __call__(self, x): return np.tanh(x)
+
+class Linear:
+    def __init__(self, in_dim, out_dim, rng):
+        lim = np.sqrt(6/(in_dim+out_dim))
+        self.W = rng.uniform(-lim, lim, size=(in_dim, out_dim)).astype(np.float32)
+        self.b = np.zeros(out_dim, dtype=np.float32)
+    def __call__(self, x): return x @ self.W + self.b
+
+class MLP:
+    def __init__(self, in_dim, hidden_sizes, out_dim, activation="prelu", seed=42):
+        rng = np.random.default_rng(seed)
+        acts = {"prelu": PReLU(), "tanh": Tanh()}
+        self.act = acts.get(activation, PReLU())
+        sizes = [in_dim] + list(hidden_sizes) + [out_dim]
+        self.layers = [Linear(sizes[i], sizes[i+1], rng) for i in range(len(sizes)-1)]
+
+    def __call__(self, x):
+        h = x
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            if i < len(self.layers)-1: h = self.act(h)
+        return h
+
+    def parameters(self):
+        for layer in self.layers:
+            yield layer.W; yield layer.b
+
+class PBWCPolicy:
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation="prelu",
+                 alpha=0.7, ode_dt=0.05, ode_steps=1, seed=42):
+        self.mlp = MLP(obs_dim, hidden_sizes, act_dim, activation=activation, seed=seed)
+        self.log_std = np.full((act_dim,), -0.5, dtype=np.float32)
+        self.frac = FractionalCaputo(alpha=alpha)
+        self.ode = NeuralODEBlock(lambda z: self.mlp(z), dt=ode_dt, steps=ode_steps)
+        self.obs_hist = []
+
+    def act(self, obs):
+        obs = np.asarray(obs, dtype=np.float32)[None, :]
+        self.obs_hist.append(obs)
+        if len(self.obs_hist) > 128: self.obs_hist.pop(0)
+        frac_term = self.frac(self.obs_hist)
+        aug = np.concatenate([obs, frac_term], axis=-1)
+        z = self.ode(aug)
+        mu = self.mlp(z)
+        std = np.exp(self.log_std)
+        action = mu[0] + std * np.random.normal(size=std.shape).astype(np.float32)
+        logp = -0.5 * np.sum(((action - mu[0]) / (std + 1e-8))**2 + 2*np.log(std + 1e-8) + np.log(2*np.pi))
+        return np.clip(action, -1.0, 1.0), float(logp), mu[0]
+
+    def value(self, obs):
+        obs = np.asarray(obs, dtype=np.float32)[None, :]
+        self.obs_hist.append(obs)
+        if len(self.obs_hist) > 128: self.obs_hist.pop(0)
+        frac_term = self.frac(self.obs_hist)
+        aug = np.concatenate([obs, frac_term], axis=-1)
+        v = self.mlp(aug)
+        return float(v.mean())
+
+    def parameters(self):
+        for p in self.mlp.parameters(): yield p
+        yield self.log_std
+
+class AdaptiveHorizon:
+    def __init__(self, h0=200, eta=0.05, sigma=3.0, min_h=64, max_h=400):
+        self.h = int(h0); self.eta = float(eta); self.sigma = float(sigma)
+        self.min_h = int(min_h); self.max_h = int(max_h)
+
+    def update(self, grad_estimate):
+        noise = np.random.normal()
+        self.h = int(np.clip(self.h - self.eta * grad_estimate + self.sigma * noise,
+                             self.min_h, self.max_h))
+        return self.h
+
+class MCTSAlphaSelector:
+    def __init__(self, candidates=(0.4,0.5,0.6,0.7,0.8), c_puct=1.4):
+        self.candidates = list(candidates)
+        self.N = {a: 0 for a in self.candidates}
+        self.W = {a: 0.0 for a in self.candidates}
+        self.c = float(c_puct)
+
+    def select(self):
+        total_n = sum(self.N.values()) + 1e-8
+        def ucb(a):
+            q = self.W[a] / (self.N[a] + 1e-8)
+            u = self.c * np.sqrt(np.log(total_n + 1) / (self.N[a] + 1e-8))
+            return q + u
+        return max(self.candidates, key=ucb)
+
+    def update(self, a, reward):
+        self.N[a] += 1; self.W[a] += reward
+""")
+
+GA_PSO = textwrap.dedent("""
+import random, copy
+
+def random_config():
+    return {
+        "hidden_sizes": [random.choice([64, 128, 256]), random.choice([64, 128, 256])],
+        "activation": random.choice(["prelu", "tanh"]),
+        "fractional_alpha": random.choice([0.5, 0.6, 0.7, 0.8]),
+        "ode_steps": random.choice([1, 2]),
+        "ode_dt": random.choice([0.03, 0.05, 0.08]),
+        "lr": 10 ** random.uniform(-4, -2.5)
+    }
+
+def fitness_from_score(score):
+    return score
+
+def mutate(cfg):
+    c = copy.deepcopy(cfg)
+    key = random.choice(list(c.keys()))
+    if key == "hidden_sizes":
+        c[key][random.randrange(2)] = random.choice([64, 128, 256])
+    elif key == "activation":
+        c[key] = "prelu" if c[key] == "tanh" else "tanh"
+    elif key == "fractional_alpha":
+        c[key] = max(0.4, min(0.9, c[key] + random.choice([-0.1, 0.1])))
+    elif key == "ode_steps":
+        c[key] = 1 if c[key] == 2 else 2
+    elif key == "ode_dt":
+        c[key] = random.choice([0.03, 0.05, 0.08])
+    elif key == "lr":
+        c[key] = 10 ** random.uniform(-4, -2.5)
+    return c
+
+def crossover(a, b):
+    c = {}
+    for k in a: c[k] = a[k] if random.random() < 0.5 else b[k]
+    return c
+
+class HybridTuner:
+    def __init__(self, population=12):
+        self.islands = [[] for _ in range(3)]
+        for isl in self.islands:
+            for _ in range(max(1, population//3)):
+                isl.append({"genes": random_config(), "fitness": -1e9})
+        self.swarm = [{"position": random_config(), "bestPosition": None, "bestFitness": -1e9} for _ in range(population)]
+
+    def step(self, evaluator):
+        for isl in self.islands:
+            for ind in isl:
+                if ind["fitness"] < -1e6:
+                    ind["fitness"] = evaluator(ind["genes"])
+        for p in self.swarm:
+            if p["bestFitness"] < -1e6:
+                fit = evaluator(p["position"])
+                p["bestFitness"] = fit; p["bestPosition"] = p["position"]
+
+        for idx, isl in enumerate(self.islands):
+            isl.sort(key=lambda z: z["fitness"], reverse=True)
+            elites = isl[:2]
+            new_isl = elites[:]
+            while len(new_isl) < len(isl):
+                p1, p2 = random.choice(elites), random.choice(isl[:max(3, len(isl)//2)])
+                child = mutate(crossover(p1["genes"], p2["genes"]))
+                new_isl.append({"genes": child, "fitness": -1e9})
+            self.islands[idx] = new_isl
+
+        global_best = max([max(isl, key=lambda z: z["fitness"]) for isl in self.islands], key=lambda z: z["fitness"])
+        for p in self.swarm:
+            if random.random() < 0.6:
+                new_pos = crossover(p["position"], global_best["genes"])
+                new_pos = mutate(new_pos)
+                fit = evaluator(new_pos)
+                if fit > p["bestFitness"]:
+                    p["bestPosition"] = new_pos; p["bestFitness"] = fit
+                p["position"] = new_pos
+        self.swarm.sort(key=lambda s: s["bestFitness"], reverse=True)
+
+    def best(self):
+        all_inds = [ind for isl in self.islands for ind in isl] + [{"genes": p["bestPosition"], "fitness": p["bestFitness"]} for p in self.swarm if p["bestPosition"]]
+        return max(all_inds, key=lambda z: z["fitness"])
+""")
+
+ORCHESTRATOR = textwrap.dedent("""
+import numpy as np, math
+from pbwc_core import PBWCPolicy, AdaptiveHorizon, MCTSAlphaSelector
+from schedulers import LR_SCHEDULER_REGISTRY
+
+def discount_cumsum(x, gamma):
+    y = np.zeros_like(x, dtype=np.float32)
+    run = 0.0
+    for t in reversed(range(len(x))):
+        run = x[t] + gamma * run
+        y[t] = run
+    return y
+
+class LanderTrainer:
+    def __init__(self, env, config):
+        self.env = env
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.shape[0]
+        hs = config.get("hidden_sizes", [128,128])
+        activation = config.get("activation","prelu")
+        alpha = config.get("fractional_alpha", 0.7)
+        ode_dt = config.get("ode_dt", 0.05)
+        ode_steps = config.get("ode_steps", 1)
+
+        self.policy = PBWCPolicy(obs_dim*2, act_dim, hs, activation=activation, alpha=alpha, ode_dt=ode_dt, ode_steps=ode_steps, seed=config.get("seed",42))
+        self.selector = MCTSAlphaSelector()
+        self.horizon = AdaptiveHorizon(**config.get("horizon", {}))
+        self.gamma = config.get("gamma", 0.99)
+        self.grad_clip = config.get("grad_clip", 0.5)
+
+        self.lr_cfg = config.get("lr_scheduler", {"type":"constant", "initial_lr": config.get("lr",3e-4), "total_epochs": 10000})
+        if "initial_lr" not in self.lr_cfg: self.lr_cfg["initial_lr"] = config.get("lr",3e-4)
+        self.scheduler = LR_SCHEDULER_REGISTRY.get(self.lr_cfg["type"], LR_SCHEDULER_REGISTRY["constant"])
+        self.epoch = 0
+
+    def step_update(self, grads, params, lr):
+        total_norm = 0.0
+        for g in grads: total_norm += float((g**2).sum())
+        total_norm = math.sqrt(total_norm) + 1e-8
+        scale = min(1.0, self.grad_clip / total_norm)
+        for p, g in zip(params, grads): p[...] -= lr * scale * g
+
+    def collect_rollout(self, max_steps):
+        obs, _ = self.env.reset()
+        traj = {"obs": [], "acts": [], "rews": [], "logp": [], "vals": []}
+        ep_ret = 0.0
+        for t in range(max_steps):
+            a, logp, mu = self.policy.act(obs)
+            next_obs, rew, terminated, truncated, _ = self.env.step(a)
+            v = self.policy.value(obs)
+            traj["obs"].append(obs); traj["acts"].append(a); traj["rews"].append(rew); traj["logp"].append(logp); traj["vals"].append(v)
+            ep_ret += rew; obs = next_obs
+            if terminated or truncated: break
+        return traj, ep_ret
+
+    def compute_grads(self, traj):
+        obs = np.asarray(traj["obs"], dtype=np.float32)
+        acts = np.asarray(traj["acts"], dtype=np.float32)
+        rews = np.asarray(traj["rews"], dtype=np.float32)
+        logp = np.asarray(traj["logp"], dtype=np.float32)
+        vals = np.asarray(traj["vals"], dtype=np.float32)
+
+        returns = discount_cumsum(rews, self.gamma)
+        adv = returns - vals
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        params = list(self.policy.parameters())
+        grads = [np.zeros_like(p, dtype=np.float32) for p in params]
+        eps = 1e-3
+        base_score = (adv * logp).sum()
+
+        for i, p in enumerate(params):
+            noise = np.random.normal(size=p.shape).astype(np.float32)
+            p[...] += eps * noise
+            new_logps = []
+            for o, a in zip(obs, acts):
+                _, lp, mu = self.policy.act(o)
+                new_logps.append(lp)
+            new_logps = np.array(new_logps, dtype=np.float32)
+            score = (adv * new_logps).sum()
+            grads[i][...] = -(score - base_score) / (eps + 1e-8) * noise
+            p[...] -= eps * noise
+
+        h_grad = np.var(returns) - np.mean(returns)
+        return grads, h_grad
+
+    def train(self, episodes=200, log_cb=None):
+        best_ret = -1e9; best_cfg = None
+        for ep in range(1, episodes+1):
+            self.epoch += 1
+            curr_lr = self.scheduler(self.epoch, **self.lr_cfg)
+            h_used = self.horizon.h
+            traj, ep_ret = self.collect_rollout(h_used)
+            grads, h_grad = self.compute_grads(traj)
+            self.step_update(grads, list(self.policy.parameters()), curr_lr)
+
+            a = self.selector.select()
+            self.policy.frac.alpha = a
+            self.selector.update(a, ep_ret)
+
+            new_h = self.horizon.update(h_grad)
+
+            if log_cb: log_cb(ep, ep_ret, curr_lr, a, new_h)
+
+            if ep_ret > best_ret:
+                best_ret = ep_ret; best_cfg = {"alpha": a, "h": new_h}
+        return best_ret, best_cfg
+""")
+
+MAIN = textwrap.dedent("""
+import argparse, json, os
+
+from orchestrator import LanderTrainer
+
+def make_env(env_id, seed):
+    try:
+        import gymnasium as gym
+    except ImportError:
+        import gym as gym
+    env = gym.make(env_id)
+    try:
+        env.reset(seed=seed)
+    except TypeError:
+        env.seed(seed)
+    return env
+
+def run_once(cfg):
+    env = make_env(cfg.get("env_id","LunarLanderContinuous-v3"), cfg.get("seed",42))
+    trainer = LanderTrainer(env, cfg)
+    hist = []
+    def log_cb(ep, ret, lr, alpha, h):
+        hist.append((ep, ret, lr, alpha, h))
+        if ep % 10 == 0:
+            print(f"Ep {ep:4d} | Return {ret:8.2f} | lr {lr:.2e} | α {alpha:.2f} | h {h}")
+    best_ret, best_cfg = trainer.train(episodes=cfg.get("episodes",200), log_cb=log_cb)
+    env.close()
+    return best_ret
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--generations", type=int, default=None)
+    parser.add_argument("--population", type=int, default=None)
+    args = parser.parse_args()
+
+    cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+    with open(cfg_path, "r") as f:
+        cfg = json.load(f)
+
+    if args.env: cfg["env_id"] = args.env
+    if args.seed is not None: cfg["seed"] = args.seed
+    if args.episodes is not None: cfg["episodes"] = args.episodes
+
+    if args.tune:
+        from ga_pso import HybridTuner
+        gens = args.generations or cfg["tuner"]["generations"]
+        pop = args.population or cfg["tuner"]["population"]
+        tuner = HybridTuner(population=pop)
+
+        def evaluator(genes):
+            temp = dict(cfg); temp.update(genes)
+            return run_once(temp)
+
+        best = None
+        for g in range(1, gens+1):
+            tuner.step(evaluator)
+            if g % 2 == 0:
+                best = tuner.best()
+                print(f"\\n🔄 Cross-pollination at gen {g} | best so far = {best['fitness']:.2f}")
+            best = tuner.best()
+            print(f"Gen {g} | Current best = {best['fitness']:.2f}")
+        print("\\n✅ Tuning done. Best config:", best["genes"], "Fitness:", best["fitness"])
+    else:
+        best_ret = run_once(cfg)
+        print(f"\\n✅ Finished. Best episodic return: {best_ret:.2f}")
+
+if __name__ == "__main__":
+    main()
+""")
+
+write(os.path.join(root, "README.md"), README)
+write(os.path.join(root, "config.json"), CONFIG)
+write(os.path.join(root, "schedulers.py"), SCHEDULERS)
+write(os.path.join(root, "pbwc_core.py"), PBWC_CORE)
+write(os.path.join(root, "ga_pso.py"), GA_PSO)
+write(os.path.join(root, "orchestrator.py"), ORCHESTRATOR)
+write(os.path.join(root, "main.py"), MAIN)
+
+# Zip the repo
+zip_path = "/mnt/data/pbwc_lander.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            zf.write(fp, arcname=os.path.relpath(fp, start="/mnt/data"))
+
+zip_path

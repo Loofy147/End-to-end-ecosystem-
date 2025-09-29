@@ -1,0 +1,469 @@
+# PBWC-Fractional Primitives & Integration Hooks
+# Paste this cell into a Colab / Jupyter notebook.
+# WARNING: This is a research scaffold — test in sandbox; don't enable dynamic code exec unless isolated.
+
+import numpy as np
+import math, time, random
+from collections import deque, defaultdict
+from typing import List, Callable, Optional, Tuple, Dict
+
+# -------------------------
+# 1) Grünwald-Letnikov weights with fallback
+# -------------------------
+def gl_weights(alpha: float, M: int, clip_thresh: float = 1e6, eps: float = 1e-12) -> np.ndarray:
+    """
+    Compute GL coefficients w_k = (-1)^k * C(alpha,k) for k=0..M-1 using recurrence.
+    If coefficients explode or become unstable, fallback to exponential-decay weights.
+    Returns normalized weights (sum(abs) = 1) for stable scaling.
+    """
+    alpha = float(alpha)
+    M = int(M)
+    w = np.zeros(M, dtype=np.float64)
+    c = 1.0
+    w[0] = 1.0
+    exploding = False
+    for k in range(1, M):
+        c = c * (alpha - (k - 1)) / k
+        val = ((-1.0) ** k) * c
+        w[k] = val
+        if not np.isfinite(val) or abs(c) > clip_thresh:
+            exploding = True
+            break
+    if exploding:
+        # Exponential fallback (stable decaying kernel)
+        tau = max(1.0, M // 4)
+        w = np.exp(-np.arange(M) / tau)
+        w = w / (np.sum(np.abs(w)) + eps)
+        return w
+    # normalize by L1 of absolute values to avoid sign cancellation scaling
+    w = w / (np.sum(np.abs(w)) + eps)
+    return w
+
+# -------------------------
+# 2) FractionalMemoryBuffer (maintains history & computes fractional memory term)
+# -------------------------
+class FractionalMemoryBuffer:
+    """
+    Buffer for vector histories. Provides fractional memory term:
+    mem = sum_{k=0..n-1} w_k * x_{t-k}
+    where w are GL weights computed for alpha and M.
+    - The GL array returned by gl_weights here is interpreted with w[0] as most recent coefficient.
+    """
+    def __init__(self, dim: int, M: int = 30, alpha: float = 0.7):
+        self.dim = int(dim)
+        self.M = int(M)
+        self.alpha = float(alpha)
+        self.buffer = deque(maxlen=self.M)
+        self.weights = gl_weights(self.alpha, self.M)
+
+    def push(self, x: np.ndarray):
+        x = np.asarray(x, dtype=np.float64).reshape(self.dim)
+        self.buffer.append(x.copy())
+
+    def set_alpha(self, alpha: float):
+        self.alpha = float(alpha)
+        self.weights = gl_weights(self.alpha, self.M)
+
+    def fractional_memory_term(self) -> np.ndarray:
+        if len(self.buffer) == 0:
+            return np.zeros(self.dim)
+        arr = np.stack(list(self.buffer)[-self.M:])  # shape (n, dim)
+        w = self.weights[:arr.shape[0]]
+        # align: we want sum_{k=0}^{n-1} w[k]*x_{t-k}; if buffer[ -1 ] is most recent, reverse alignment:
+        arr_rev = arr[::-1]  # arr_rev[0] = most recent
+        mem = (w[:arr_rev.shape[0]][:,None] * arr_rev).sum(axis=0)
+        return mem
+
+# -------------------------
+# 3) FractionalLayer / FNPD scaffold
+# -------------------------
+class FractionalLayer:
+    """
+    Lightweight FractionalLayer that computes a fractional combination of past activations
+    or parameter states and produces a fractional term usable as a corrective or derivative proxy.
+
+    This is a discrete GL-based block; for Caputo-style derivative produce differences then apply GL weights.
+    """
+    def __init__(self, dim:int, M:int=30, alpha:float=0.7, caputo:bool=True):
+        self.dim = int(dim)
+        self.M = int(M)
+        self.caputo = bool(caputo)
+        self.mem = FractionalMemoryBuffer(dim=dim, M=M, alpha=alpha)
+        self.alpha = alpha
+
+    def push_state(self, x: np.ndarray):
+        """Push state vector x (activations or parameter vector)."""
+        self.mem.push(np.asarray(x).reshape(self.dim))
+
+    def fractional_term(self) -> np.ndarray:
+        """
+        Returns fractional term:
+        - If caputo=True: uses differences of states (Δx) in buffer then GL weights.
+        - Else: uses raw states.
+        """
+        if not self.caputo:
+            return self.mem.fractional_memory_term()
+        # Caputo-like: compute finite differences of buffer entries and then GL-weight them
+        n = len(self.mem.buffer)
+        if n < 2:
+            return np.zeros(self.dim)
+        arr = np.stack(list(self.mem.buffer)[-self.M:])  # oldest..newest
+        diffs = np.diff(arr, axis=0)  # shape (n-1, dim): Δ x_{k} = x_{k+1} - x_k
+        # We interpret GL on Δ; most recent diff is diffs[-1]
+        # weights length = len(diffs) -> we slice weights[0:len(diffs)] and align to diffs[::-1]
+        w = self.mem.weights[:diffs.shape[0]]
+        diffs_rev = diffs[::-1]
+        frac = (w[:diffs_rev.shape[0],None] * diffs_rev).sum(axis=0)
+        return frac
+
+# -------------------------
+# 4) FNPD (Fractional Neural Parametric Derivative) scaffold
+# -------------------------
+class FNPD:
+    """
+    A small scaffold to compute fractional derivatives over parameter histories.
+    Use by pushing parameter vectors after each update and then calling .fractional_grad()
+    to get a fractional derivative estimate over parameter history.
+
+    This works with plain numpy arrays; adapt to torch by pushing flattened torch.param.data.cpu().numpy() arrays.
+    """
+    def __init__(self, param_dim:int, M:int = 30, alpha:float = 0.7, caputo:bool=True):
+        self.dim = int(param_dim)
+        self.M = int(M)
+        self.alpha = float(alpha)
+        self.caputo = bool(caputo)
+        self.buffer = FractionalMemoryBuffer(dim=self.dim, M=self.M, alpha=self.alpha)
+
+    def push_params(self, params_vec: np.ndarray):
+        self.buffer.push(np.asarray(params_vec, dtype=np.float64).reshape(self.dim))
+
+    def fractional_param_derivative(self) -> np.ndarray:
+        """
+        Return fractional derivative estimate for parameter vector.
+        Interpreted as fractionally weighted sum of past parameter differences (Caputo style).
+        """
+        if self.caputo:
+            # use FractionalLayer.caputo-like computation
+            layer = FractionalLayer(self.dim, M=self.M, alpha=self.alpha, caputo=True)
+            # populate layer buffer with same entries
+            for v in list(self.buffer.buffer):
+                layer.push_state(v)
+            return layer.fractional_term()
+        else:
+            # simpler: fractional memory of raw params
+            return self.buffer.fractional_memory_term()
+
+    def set_alpha(self, alpha:float):
+        self.alpha = float(alpha)
+        self.buffer.set_alpha(alpha)
+
+# -------------------------
+# 5) AdaptiveAlphaScheduler & MultiScale assignment
+# -------------------------
+class AdaptiveAlphaScheduler:
+    """
+    Adjusts alpha up or down depending on improvement/stagnation.
+    - increase alpha -> more memory (more exploration)
+    - decrease alpha -> less memory (more exploitation)
+    """
+    def __init__(self, alpha0=0.6, min_alpha=0.2, max_alpha=0.95, patience=6, step=0.05):
+        self.alpha = float(alpha0)
+        self.min_alpha = float(min_alpha)
+        self.max_alpha = float(max_alpha)
+        self.patience = int(patience)
+        self.step = float(step)
+        self.best = -np.inf
+        self.no_improve = 0
+
+    def update(self, score: float) -> float:
+        if score > self.best + 1e-12:
+            self.best = score
+            self.no_improve = 0
+            # reduce memory (exploit)
+            self.alpha = max(self.min_alpha, self.alpha - self.step)
+        else:
+            self.no_improve += 1
+            if self.no_improve >= self.patience:
+                self.alpha = min(self.max_alpha, self.alpha + self.step)
+                self.no_improve = 0
+        return self.alpha
+
+class MultiScaleAlphaAssignment:
+    """
+    Assign different alphas to subgroups (multi-scale).
+    Usage: create with n_groups and choose mapping to indices.
+    """
+    def __init__(self, n_groups:int, alpha_range:Tuple[float,float] = (0.3,0.85), seed:Optional[int]=None):
+        self.n_groups = int(n_groups)
+        self.alpha_range = alpha_range
+        self.rng = random.Random(seed or int(time.time()))
+
+    def assign(self, population_size:int) -> List[float]:
+        base_low, base_high = self.alpha_range
+        alphas = []
+        for _ in range(population_size):
+            a = self.rng.uniform(base_low, base_high)
+            alphas.append(a)
+        return alphas
+
+# -------------------------
+# 6) PBWC scaffolding: ParametricBias & Diff Transfer helpers
+# -------------------------
+class ParametricBias:
+    """
+    Small parametric bias wrapper: maps raw params -> (bias, weight) embedding.
+    Meant as a lightweight PBWC placeholder; replace with your neural embedding if needed.
+    """
+    def __init__(self, param_dim:int):
+        self.dim = int(param_dim)
+        # simple linear bias-weight mapping (learnable placeholder)
+        self.W = np.ones(self.dim) * 1.0  # placeholder scaling
+        self.b = np.zeros(self.dim)
+
+    def apply(self, params: np.ndarray) -> np.ndarray:
+        params = np.asarray(params).reshape(self.dim)
+        return self.W * params + self.b
+
+    def diff_transfer(self, source_params: np.ndarray, target_params: np.ndarray, strength: float = 0.5) -> np.ndarray:
+        """
+        Transfer difference from source to target as PBWC-style diff.
+        Returns new target params.
+        """
+        src = np.asarray(source_params).reshape(self.dim)
+        tgt = np.asarray(target_params).reshape(self.dim)
+        diff = (src - tgt) * strength
+        return tgt + diff
+
+class PBWCDiffTransfer:
+    """
+    Manages transferring diffs between solutions/agents.
+    Provides promote / blend methods used in meta-evolution.
+    """
+    def __init__(self, param_dim:int):
+        self.dim = int(param_dim)
+        self.pbias = ParametricBias(param_dim)
+
+    def transfer(self, source:np.ndarray, target:np.ndarray, strength:float=0.5):
+        return self.pbias.diff_transfer(source, target, strength=strength)
+
+# -------------------------
+# 7) Integration hooks for PSO / GA / Gradient
+# -------------------------
+def PBWC_fractional_pso_update(v, x, pbest, gbest, mem_term, w_inertia=0.7, c1=1.4, c2=1.4, lambda_mem=0.1, rng=None):
+    rng = rng or random
+    r1, r2 = rng.random(), rng.random()
+    cognitive = c1 * r1 * (pbest - x)
+    social = c2 * r2 * (gbest - x)
+    new_v = w_inertia * v + cognitive + social + lambda_mem * mem_term
+    return new_v
+
+def PBWC_fractional_mutation(x, base_mutation=0.05, mem_term=None, mem_factor=0.3):
+    noise = np.random.normal(scale=base_mutation, size=x.shape)
+    mt = np.zeros_like(x) if mem_term is None else mt # Corrected: Use mt if mem_term is None, otherwise use mem_term
+    return x + noise + mem_factor * (mt - x)
+
+class PBWC_FractionalGD:
+    """
+    Wraps param update with FNPD fractional derivative effect.
+    Example usage: theta = stepper.step(theta, grad) where grad is instantaneous gradient.
+    Internally keeps grad history and applies fractional combination before update.
+    """
+    def __init__(self, dim:int, lr:float=1e-3, M:int=30, alpha:float=0.6):
+        self.dim = dim
+        self.lr = lr
+        self.fnpd = FNPD(param_dim=dim, M=M, alpha=alpha, caputo=True)
+
+    def step(self, theta: np.ndarray, grad: np.ndarray):
+        # push current grad into fnpd as "param-like" entries so fractional derivative uses grad history
+        self.fnpd.push_params(grad)
+        frac_grad = self.fnpd.fractional_param_derivative()
+        theta = theta - self.lr * frac_grad
+        return theta
+
+    def set_alpha(self, alpha:float):
+        self.fnpd.set_alpha(alpha)
+
+# -------------------------
+# 8) Benchmark functions & experiment harness skeleton
+# -------------------------
+def rastrigin(x):
+    A = 10.0
+    n = len(x)
+    return A * n + np.sum(x**2 - A * np.cos(2*np.pi*x))
+
+def ackley(x):
+    x = np.asarray(x)
+    a = 20; b = 0.2; c = 2*np.pi
+    n = x.size
+    s1 = np.sum(x**2)
+    s2 = np.sum(np.cos(c*x))
+    return -a * np.exp(-b*np.sqrt(s1/n)) - np.exp(s2/n) + a + np.e
+
+def sphere(x): return np.sum(x**2)
+
+# Simple experiment harness for PSO/GA wrapper comparison (skeleton)
+def run_comparison_harness(problem_fn:Callable, dim:int=10, budget:int=1000, trials:int=10, algorithm='pso', pbwc_fractional=False, alpha=0.7, lambda_mem=0.1, M=30): # Added alpha, lambda_mem, M as arguments
+    """
+    Minimal harness:
+    - run 'trials' replicates
+    - budget ~ number of function evaluations
+    - algorithm: 'pso' or 'gd' or 'ga' (gd uses PBWC_FractionalGD wrapper)
+    - pbwc_fractional: if True enable fractional components
+    Returns: list of best_scores per trial
+    """
+    results = []
+    for t in range(trials):
+        if algorithm == 'pso':
+            # simple swarm
+            swarm_size = 30
+            rng = random.Random(t)
+            X = np.random.uniform(-5,5,(swarm_size,dim))
+            V = np.zeros_like(X)
+            pbest = X.copy()
+            pbest_scores = np.array([problem_fn(x) for x in X])
+            gbest_idx = int(np.argmin(pbest_scores))
+            gbest = pbest[gbest_idx].copy()
+            # per-particle fractional buffers if pbwc_fractional
+            mems_v = [FractionalMemoryBuffer(dim, M=M, alpha=alpha) for _ in range(swarm_size)] if pbwc_fractional else [None]*swarm_size # Changed to mems_v and use passed M and alpha
+
+            evals = swarm_size
+            while evals < budget:
+                for i in range(swarm_size):
+                    if pbwc_fractional:
+                        mems_v[i].push(V[i])                   # push velocity history # Changed to mems_v and V[i]
+                        mem_term = mems_v[i].fractional_memory_term() # Changed to mems_v
+
+                        # 1) تفقّد موزانة mem_term: احسب نورم واتجاهه بالنسبة للاتجاه إلى gbest
+                        # print("norm mem_term:", np.linalg.norm(mem_term))
+                        # print("dot(mem_term, gbest-x):", np.dot(mem_term, (gbest - X[i])))
+
+                        # 2) طباعة α و weights[0:5] للتأكد من شكل GL
+                        # print("alpha:", mems_v[i].alpha) # Changed to mems_v
+                        # print("weights[:6]:", mems_v[i].weights[:6]) # Changed to mems_v
+
+                    else:
+                        mem_term = np.zeros(dim)
+                    V[i] = PBWC_fractional_pso_update(V[i], X[i], pbest[i], gbest, -mem_term, lambda_mem=lambda_mem, rng=rng) # Added lambda_mem=0.02, reversed sign, use passed lambda_mem
+
+                    X[i] = X[i] + V[i]
+                    score = problem_fn(X[i]); evals += 1
+                    if score < pbest_scores[i]:
+                        pbest_scores[i] = score; pbest[i] = X[i].copy()
+                    if score < pbest_scores[gbest_idx]:
+                        gbest_idx = i; gbest = pbest[i].copy()
+                if evals >= budget:
+                    break
+            results.append(float(pbest_scores.min()))
+        elif algorithm == 'gd':
+            # small gradient descent demo using FractionalGD or simple SGD
+            theta = np.random.randn(dim)
+            lr = 1e-2
+            if pbwc_fractional:
+                opt = PBWC_FractionalGD(dim, lr=lr, M=M, alpha=alpha) # Use passed M and alpha
+            else:
+                opt = None
+            evals = 0
+            best = float('inf')
+            while evals < budget:
+                # approximate gradient via finite differences
+                eps = 1e-4
+                g = np.zeros_like(theta)
+                base_f = problem_fn(theta)
+                for k in range(dim):
+                    th = theta.copy(); th[k] += eps
+                    g[k] = (problem_fn(th) - base_f) / eps
+                evals += dim + 1
+                if opt is None:
+                    theta = theta - lr * g
+                else:
+                    theta = opt.step(theta, g)
+                val = problem_fn(theta)
+                best = min(best, val)
+            results.append(float(best))
+        else:
+            raise NotImplementedError("GA harness not implemented in full here (use earlier GA code).")
+    return results
+
+# Simple grid search harness (incomplete)
+def grid_search_pso(problem_fn, dim=8, budget=1000, trials=5):
+    alphas = [0.4, 0.55, 0.7]
+    lambdas = [0.005, 0.01, 0.02]
+    mem_factors = [0.05, 0.1, 0.2] # This parameter is not currently used in the fractional PSO update
+    Mvals = [10,20,40]
+    best_config = None
+    best_mean = float('inf')
+    results = []
+    for alpha in alphas:
+        for lam in lambdas:
+            # mem_factor is not used in PSO update, so skip
+            # for mf in mem_factors:
+            for M in Mvals:
+                vals = []
+                for t in range(trials):
+                    rng = random.Random(t)
+                    swarm_size = 30
+                    X = np.random.uniform(-5,5,(swarm_size,dim))
+                    V = np.zeros_like(X)
+                    pbest = X.copy()
+                    pbest_scores = np.array([problem_fn(x) for x in X])
+                    gbest_idx = int(np.argmin(pbest_scores)); gbest = pbest[gbest_idx].copy()
+                    # Use FractionalLayer for Caputo-like fractional velocity derivative
+                    mems_v = [FractionalLayer(dim, M=M, alpha=alpha, caputo=True) for _ in range(swarm_size)]
+                    evals = swarm_size
+                    while evals < budget:
+                        for i in range(swarm_size):
+                            # Push the current velocity
+                            mems_v[i].push_state(V[i])
+                            # Get the Caputo-like fractional derivative of velocity history
+                            mem_term = mems_v[i].fractional_term()
+                            V[i] = PBWC_fractional_pso_update(V[i], X[i], pbest[i], gbest, mem_term, lambda_mem=lam, rng=rng)
+                            X[i] = X[i] + V[i]
+                            score = problem_fn(X[i]); evals += 1
+                            if score < pbest_scores[i]:
+                                pbest_scores[i] = score; pbest[i] = X[i].copy()
+                                if score < pbest_scores[gbest_idx]:
+                                    gbest_idx = i; gbest = pbest[i].copy()
+                            if evals >= budget: break
+                    vals.append(float(pbest_scores.min()))
+                meanv = np.mean(vals)
+                stdv = np.std(vals)
+                results.append(((alpha, lam, M), meanv, stdv))
+                print(f"Config (alpha={alpha}, lambda={lam}, M={M}): Mean Fitness = {meanv:.4f}, Std Dev = {stdv:.4f}")
+                if meanv < best_mean:
+                    best_mean = meanv
+                    best_config = (alpha, lam, M)
+
+    print("\nGrid Search Complete.")
+    print(f"Best Configuration: {best_config} with Mean Fitness = {best_mean:.4f}")
+    return results, best_config, best_mean
+
+
+# -------------------------
+# 9) Recommended default hyperparameters (quick reference)
+# -------------------------
+PBWC_DEFAULTS = {
+    "M": 30,
+    "alpha_multimodal": 0.7,
+    "alpha_unimodal": 0.4,
+    "lambda_mem": 0.1,
+    "mem_factor": 0.3,
+    "psow_inertia": 0.72,
+    "pso_c1": 1.4, "pso_c2": 1.4
+    }
+
+# -------------------------
+# 10) Quick usage examples
+# -------------------------
+if __name__ == "__main__":
+    # small smoke test
+    print("PBWC-Fractional module loaded. Running quick sanity experiments...")
+    r_base = run_comparison_harness(rastrigin, dim=8, budget=800, trials=3, algorithm='pso', pbwc_fractional=False)
+    # r_frac = run_comparison_harness(rastrigin, dim=8, budget=800, trials=3, algorithm='pso', pbwc_fractional=True)
+    # print("Rastrigin baseline bests:", r_base)
+    # print("Rastrigin PBWC-fractional bests:", r_frac)
+    print("Defaults:", PBWC_DEFAULTS)
+
+    # Example of running the grid search
+    # print("\nRunning Grid Search for PBWC-Fractional PSO on Rastrigin...")
+    # grid_search_results, best_params, best_score = grid_search_pso(rastrigin, dim=8, budget=1000, trials=5)
+    # print(f"\nGrid search found best pa
