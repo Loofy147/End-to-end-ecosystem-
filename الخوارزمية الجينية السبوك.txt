@@ -1,0 +1,316 @@
+أتفق معك تماماً. لقد فهمت قصدك بالكامل. أنت لا تريد مجرد توثيق، بل تريد إنشاء **مستودع معرفي شامل (Comprehensive Knowledge Repository)** يكون هو المرجع الأساسي والوحيد للمشروع، يحتوي على كل سطر كود وكل قرار تم اتخاذه. هذه هي الطريقة الصحيحة لإنشاء "بيضة ذهبية" حقيقية.
+
+ممتاز. لنقم بذلك. سنقوم بدمج كل شيء في مكان واحد.
+
+سنعيد هيكلة هذا الجزء ليكون أكثر شمولاً، حيث سنقدم شرحاً مفصلاً ثم نتبعه بالكود الكامل لكل مكون.
+
+---
+
+### **توثيق المشروع الشامل: الجزء الثالث (النسخة الكاملة)**
+
+**4. التصميم والتنفيذ (Design and Implementation)**
+
+تم بناء النظام عبر مرحلتين رئيسيتين: مرحلة البحث الخوارزمي والتصميم (باستخدام JavaScript لمحاكاة سريعة)، ومرحلة التطبيق العملي والتدريب (باستخدام Python ومكتبات التعلم العميق). يهدف هذا القسم إلى توثيق البنية النهائية لكل مكون بالتفصيل.
+
+**4.1. المُحسِّن الهجين التفاعلي لـ NAS (`NAS_InteractiveHybridOptimizer`)**
+
+هذه هي الفئة الأساسية التي تقوم بمهمة البحث عن بنية الشبكة العصبية. تم تصميمها لتكون متخصصة في التعامل مع "كروموسومات" تمثل بنى الشبكات، وتدمج بين قوة الخوارزمية الجينية (GA) وسرعة تحسين أسراب الجسيمات (PSO).
+
+**4.1.1. الشرح التفصيلي للمكونات**
+
+*   **دالة اللياقة (`evaluateArchitecture`):** هي قلب المُحسِّن. تقوم بتقييم أي بنية مقترحة وتعطيها "نقاط" جودة. المعادلة النهائية `Fitness = Accuracy * Efficiency * Speed` تضمن أن الخوارزمية لا تفضل فقط النماذج الدقيقة، بل أيضاً تلك التي تكون فعالة من حيث عدد المعلمات وسريعة من حيث العمليات الحسابية. هذا التوازن ضروري لإنتاج نماذج قابلة للاستخدام في العالم الحقيقي.
+
+*   **عمليات التطور (`mutateArchitecture`, `crossoverArchitectures`):** هذه هي الأدوات التي تستخدمها الخوارزمية لاستكشاف فضاء الحلول. تم تصميم الطفرة لتكون ذكية، حيث يمكنها إجراء تغييرات كبيرة (إضافة/حذف طبقات) أو تغييرات طفيفة (تعديل المعلمات الفائقة). أما التزاوج، فيستخدم آلية بسيطة وفعالة لدمج "الأفكار" من بنيتين مختلفتين.
+
+*   **الحلقة الرئيسية (`run`):** هي العقل المدبر الذي ينسق العملية. تقوم بتشغيل GA و PSO بشكل متوازٍ، مما يسمح بالاستكشاف الواسع والتقارب السريع في نفس الوقت. آلية "التلقيح المتبادل" الدورية هي الميزة الرئيسية، حيث تمنع أي من الخوارزميتين من الركود عن طريق حقن "دم جديد" (حلول واعدة) من الخوارزمية الأخرى. المرحلة النهائية من البحث المحلي تضمن صقل الحل الأفضل الذي تم العثور عليه.
+
+**4.1.2. الكود الكامل للمُحسِّن الهجين (JavaScript)**
+
+```javascript
+// =================================================================
+// 🚀 الكود الكامل: المُحسِّن الهجين التفاعلي في مواجهة NAS
+// =================================================================
+
+class NAS_InteractiveHybridOptimizer {
+  constructor() {
+    this.layerLibrary = {
+      conv: { params: 100, flops: 1000, boost: 0.15 },
+      dense: { params: 200, flops: 500, boost: 0.10 },
+      dropout: { params: 0, flops: 0, boost: 0.05 },
+      batch_norm: { params: 10, flops: 50, boost: 0.08 },
+      activation: { params: 0, flops: 10, boost: 0.02 }
+    };
+    this.ga = { islands: [] };
+    this.pso = { swarm: [] };
+  }
+
+  // --- دوال NAS المتخصصة ---
+  evaluateArchitecture(architecture) {
+    if (!architecture || architecture.length === 0) return 0;
+    let totalParams = 0, totalFlops = 0, expectedAccuracy = 0.5, synergy = 1.0;
+    architecture.forEach((layer, index) => {
+      const info = this.layerLibrary[layer.type] || this.layerLibrary.dense;
+      totalParams += info.params * (layer.neurons || layer.filters || 1);
+      totalFlops += info.flops * (layer.neurons || layer.filters || 1);
+      expectedAccuracy += info.boost;
+      if (index > 0) {
+        const prevLayer = architecture[index - 1];
+        if ((prevLayer.type === 'conv' && layer.type === 'batch_norm') || (prevLayer.type === 'dense' && layer.type === 'dropout')) {
+          synergy *= 1.05;
+        }
+      }
+    });
+    const efficiency = 1 / (1 + Math.log10(1 + totalParams));
+    const speed = 1 / (1 + Math.log10(1 + totalFlops));
+    const finalAccuracy = Math.min(0.99, expectedAccuracy * synergy);
+    return finalAccuracy * efficiency * speed;
+  }
+
+  generateRandomArchitecture() {
+    const numLayers = Math.floor(Math.random() * 8) + 4;
+    const arch = [];
+    for (let i = 0; i < numLayers; i++) arch.push(this.createRandomLayer());
+    return arch;
+  }
+
+  createRandomLayer() {
+    const layerTypes = ['conv', 'dense', 'dropout', 'batch_norm'];
+    const type = layerTypes[Math.floor(Math.random() * layerTypes.length)];
+    const layer = { type };
+    if (type === 'conv') {
+      layer.filters = [16, 32, 64, 128][Math.floor(Math.random() * 4)];
+    } else if (type === 'dense') {
+      layer.neurons = [64, 128, 256, 512][Math.floor(Math.random() * 4)];
+    } else if (type === 'dropout') {
+      layer.rate = (Math.random() * 0.4 + 0.1).toFixed(2);
+    }
+    return layer;
+  }
+
+  mutateArchitecture(architecture) {
+    const mutatedArch = JSON.parse(JSON.stringify(architecture));
+    const mutationType = Math.random();
+    if (mutationType < 0.3 && mutatedArch.length > 4) {
+      mutatedArch.splice(Math.floor(Math.random() * mutatedArch.length), 1);
+    } else if (mutationType < 0.6 && mutatedArch.length < 15) {
+      mutatedArch.splice(Math.floor(Math.random() * (mutatedArch.length + 1)), 0, this.createRandomLayer());
+    } else if (mutatedArch.length > 0) {
+      const layerIndex = Math.floor(Math.random() * mutatedArch.length);
+      mutatedArch[layerIndex] = this.createRandomLayer();
+    }
+    return mutatedArch;
+  }
+
+  crossoverArchitectures(parent1, parent2) {
+    if (!parent1 || !parent2 || parent1.length === 0 || parent2.length === 0) {
+        return parent1 || parent2 || [];
+    }
+    const crossoverPoint = Math.floor(Math.random() * Math.min(parent1.length, parent2.length));
+    const child = [...parent1.slice(0, crossoverPoint), ...parent2.slice(crossoverPoint)];
+    return child.length > 15 ? child.slice(0, 15) : child;
+  }
+
+  // --- الحلقة الرئيسية للمُحسِّن الهجين ---
+  run(totalGenerations = 30) {
+    console.log("\n🏁 بدء تشغيل المُحسِّن الهجين في مواجهة NAS 🏁");
+
+    // --- التهيئة ---
+    this.ga.islands = Array.from({ length: 3 }, () => 
+        Array.from({ length: 10 }, () => {
+            const arch = this.generateRandomArchitecture();
+            return { genes: arch, fitness: this.evaluateArchitecture(arch) };
+        }).sort((a, b) => b.fitness - a.fitness)
+    );
+    this.pso.swarm = Array.from({ length: 10 }, () => {
+        const arch = this.generateRandomArchitecture();
+        return {
+            position: arch, velocity: 0.1, bestPosition: arch,
+            bestFitness: this.evaluateArchitecture(arch)
+        };
+    }).sort((a, b) => b.bestFitness - a.bestFitness);
+
+    let globalBest = this.ga.islands[0][0];
+
+    // --- حلقة التطور ---
+    for (let gen = 1; gen <= totalGenerations; gen++) {
+      // 1. تطوير GA
+      this.ga.islands.forEach(island => {
+        const newIsland = [...island.slice(0, 2)];
+        while (newIsland.length < 10) {
+          const p1 = island[Math.floor(Math.random() * 3)];
+          const p2 = island[Math.floor(Math.random() * 3)];
+          const child = this.crossoverArchitectures(p1.genes, p2.genes);
+          const mutated = this.mutateArchitecture(child);
+          newIsland.push({ genes: mutated, fitness: this.evaluateArchitecture(mutated) });
+        }
+        island.splice(0, island.length, ...newIsland.sort((a, b) => b.fitness - a.fitness));
+      });
+
+      // 2. تطوير PSO
+      this.pso.swarm.forEach(particle => {
+          if (Math.random() < 0.5) {
+              const newPosition = this.crossoverArchitectures(particle.position, globalBest.genes);
+              const mutatedPosition = this.mutateArchitecture(newPosition);
+              const fitness = this.evaluateArchitecture(mutatedPosition);
+              if (fitness > particle.bestFitness) {
+                  particle.bestPosition = mutatedPosition;
+                  particle.bestFitness = fitness;
+              }
+              particle.position = mutatedPosition;
+          }
+      });
+      this.pso.swarm.sort((a, b) => b.bestFitness - a.bestFitness);
+
+      // 3. تحديث أفضل حل عالمي
+      const gaBest = this.ga.islands.flat().reduce((a, b) => a.fitness > b.fitness ? a : b);
+      const psoBest = { genes: this.pso.swarm[0].bestPosition, fitness: this.pso.swarm[0].bestFitness };
+      if (gaBest.fitness > globalBest.fitness) globalBest = gaBest;
+      if (psoBest.fitness > globalBest.fitness) globalBest = psoBest;
+
+      // 4. التلقيح المتبادل
+      if (gen % 10 === 0) {
+        console.log(`\n--- 🔄 التلقيح المتبادل في الجيل ${gen} | أفضل لياقة: ${globalBest.fitness.toFixed(4)} ---`);
+        const worstIsland = this.ga.islands.reduce((a, b) => a[0].fitness < b[0].fitness ? a : b);
+        worstIsland[worstIsland.length - 1] = { genes: psoBest.genes, fitness: psoBest.fitness };
+      }
+    }
+
+    // --- الصقل النهائي ---
+    console.log("\n[المرحلة النهائية] ⚙️ الصقل باستخدام البحث المحلي...");
+    let finalSolution = globalBest;
+    for(let i=0; i<100; i++) {
+        const neighbor = this.mutateArchitecture(finalSolution.genes);
+        const neighborFitness = this.evaluateArchitecture(neighbor);
+        if (neighborFitness > finalSolution.fitness) {
+            finalSolution = { genes: neighbor, fitness: neighborFitness };
+        }
+    }
+    
+    console.log(`\n🏆 اكتمل تحدي NAS! أفضل بنية تم العثور عليها بلياقة: ${finalSolution.fitness.toFixed(5)}`);
+    return finalSolution;
+  }
+}
+```
+
+**4.2. كود بناء وتدريب النموذج النهائي (Python)**
+
+هذا الجزء هو المسؤول عن تحويل البنية النظرية التي تم تصميمها في الخطوة السابقة إلى نموذج حقيقي وتدريبه باستخدام أفضل الممارسات.
+
+**4.2.1. الشرح التفصيلي للمكونات**
+
+*   **`build_improved_model`:** هذه الدالة هي الجسر بين عالمي JavaScript و Python. تقوم بترجمة مصفوفة الكائنات التي تمثل البنية إلى نموذج `keras.Sequential` حقيقي. تم تصميمها لتكون مرنة وقادرة على التعامل مع أنواع الطبقات المختلفة التي يمكن أن تنتجها خوارزميتنا، مع إضافة طبقة `Flatten` تلقائياً عند الحاجة.
+
+*   **إعداد البيانات:** يتم استخدام مجموعة بيانات CIFAR-10 القياسية. الخطوات الأساسية تشمل تسوية قيم البكسلات (لجعلها بين 0 و 1) وتحويل التسميات إلى صيغة one-hot encoding، وهي متطلبات أساسية لتدريب نماذج التصنيف.
+
+*   **التحسينات المتقدمة للتدريب:**
+    1.  **`ImageDataGenerator`:** هذه الأداة القوية من Keras هي مفتاح نجاحنا في محاربة فرط الملاءمة. من خلال إنشاء نسخ معدلة بشكل طفيف من صور التدريب في كل دورة، فإنها تزيد بشكل فعال من حجم وتنوع مجموعة التدريب، مما يجبر النموذج على تعلم تمثيلات أكثر قوة وتعميمية.
+    2.  **`ReduceLROnPlateau`:** هذه الآلية الذكية تراقب أداء النموذج على بيانات التحقق، وتقوم تلقائياً بتخفيض معدل التعلم عندما يتوقف التحسن. هذا يسمح للنموذج بالتقارب بسرعة في البداية، ثم إجراء تعديلات دقيقة وحذرة في النهاية للوصول إلى أفضل أداء ممكن.
+
+**4.2.2. الكود الكامل لبناء وتدريب النموذج (Python)**
+
+```python
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+
+def build_improved_model(architecture, input_shape, num_classes):
+    """
+    يبني نموذج Keras بشكل ديناميكي من البنية المُصمَّمة والمحسّنة.
+    """
+    print("🏗️  بناء النموذج المحسّن...")
+    model = keras.Sequential(name="Ultimate_CNN_Model")
+    model.add(keras.Input(shape=input_shape))
+
+    for layer_config in architecture:
+        layer_type = layer_config.get('type')
+        
+        if layer_type == 'conv':
+            model.add(layers.Conv2D(filters=layer_config.get('filters', 32), kernel_size=(3, 3), padding='same', activation='relu'))
+        elif layer_type == 'batch_norm':
+            model.add(layers.BatchNormalization())
+        elif layer_type == 'max_pooling':
+            model.add(layers.MaxPooling2D(pool_size=(2, 2)))
+        elif layer_type == 'dense':
+            if not any(isinstance(l, layers.Flatten) for l in model.layers):
+                model.add(layers.Flatten())
+            model.add(layers.Dense(units=layer_config.get('neurons', 128), activation='relu'))
+        elif layer_type == 'dropout':
+            if any(isinstance(l, layers.Flatten) for l in model.layers):
+                 model.add(layers.Dropout(rate=float(layer_config.get('rate', 0.25))))
+
+    if not any(isinstance(l, layers.Flatten) for l in model.layers):
+        model.add(layers.Flatten())
+    model.add(layers.Dense(num_classes, activation='softmax'))
+    
+    print("✅ تم بناء النموذج المحسّن بنجاح!")
+    return model
+
+# --- 1. تهيئة البيانات ---
+print("💾 تحميل وتجهيز بيانات CIFAR-10...")
+(x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+x_train = x_train.astype("float32") / 255.0
+x_test = x_test.astype("float32") / 255.0
+y_train = keras.utils.to_categorical(y_train, 10)
+y_test = keras.utils.to_categorical(y_test, 10)
+print("✅ البيانات جاهزة.")
+
+# --- 2. استخدام البنية النهائية المحسّنة ---
+# هذه البنية هي نتاج الخوارزمية + التحسينات اليدوية
+final_architecture = [
+    {'type': 'conv', 'filters': 64}, {'type': 'batch_norm'}, {'type': 'max_pooling'},
+    {'type': 'conv', 'filters': 128}, {'type': 'batch_norm'}, {'type': 'max_pooling'},
+    {'type': 'dense', 'neurons': 256}, {'type': 'dropout', 'rate': '0.5'},
+    {'type': 'dense', 'neurons': 128}, {'type': 'dropout', 'rate': '0.4'},
+    {'type': 'dense', 'neurons': 64}
+]
+
+# --- 3. بناء النموذج ---
+input_shape = (32, 32, 3)
+num_classes = 10
+model = build_improved_model(final_architecture, input_shape, num_classes)
+
+# --- 4. تهيئة التحسينات المتقدمة للتدريب ---
+print("💡 تهيئة مولد زيادة البيانات وجدولة معدل التعلم...")
+datagen = keras.preprocessing.image.ImageDataGenerator(
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    horizontal_flip=True,
+    zoom_range=0.1
+)
+datagen.fit(x_train)
+
+lr_scheduler = ReduceLROnPlateau(
+    monitor='val_accuracy', factor=0.2, patience=3, min_lr=0.00001, verbose=1
+)
+
+# --- 5. تجميع النموذج ---
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+model.summary()
+
+# --- 6. تدريب النموذج النهائي ---
+print("\n🔥 بدء التدريب النهائي...")
+epochs = 30 
+history = model.fit(
+    datagen.flow(x_train, y_train, batch_size=64),
+    epochs=epochs,
+    validation_data=(x_test, y_test),
+    callbacks=[lr_scheduler]
+)
+
+# --- 7. تقييم الأداء النهائي ---
+print("\n📈 تقييم الأداء النهائي على بيانات الاختبار...")
+test_loss, test_acc = model.evaluate(x_test, y_test, verbose=2)
+print(f"\n✅ دقة النموذج النهائي على بيانات الاختبار: {test_acc*100:.2f}%")
+```
+
+---
+
+بهذا نكون قد وثقنا "البيضة الذهبية" بالكامل. هذا الجزء الآن يحتوي على الشرح التفصيلي والكود الكامل لكل مكون رئيسي في المشروع.
+
+**هل هذا المستوى من التفصيل يرضي طموحك للتوثيق الشامل؟ هل ننتقل الآن إلى الجزء الأخير، عرض النتائج والاستنتاجات؟**

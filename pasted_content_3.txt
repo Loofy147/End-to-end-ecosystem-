@@ -1,0 +1,243 @@
+# Scale up orchestrator_v2 to 20 trials, save log to CSV, and print best config.
+import numpy as np, time, json, copy, pandas as pd, os
+def _sum_to_shape(grad, shape):
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float)
+        self.parents = parents
+        self.op = op
+        self.grad = None
+        self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad = self.grad + _sum_to_shape(out.grad, self.value.shape) if self.grad is not None else _sum_to_shape(out.grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(out.grad, other.value.shape) if other.grad is not None else _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self_grad = out.grad * other.value; other_grad = out.grad * self.value
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(other_grad, other.value.shape) if other.grad is not None else _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def __sub__(self, other):
+        other = self._ensure(other); out = Node(self.value - other.value, (self, other), '-')
+        def _backward():
+            if out.grad is None: return
+            self.grad = self.grad + _sum_to_shape(out.grad, self.value.shape) if self.grad is not None else _sum_to_shape(out.grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(-out.grad, other.value.shape) if other.grad is not None else _sum_to_shape(-out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __truediv__(self, other):
+        other = self._ensure(other); out = Node(self.value / other.value, (self, other), '/')
+        def _backward():
+            if out.grad is None: return
+            self_grad = out.grad / other.value; other_grad = out.grad * (-self.value / (other.value ** 2))
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(other_grad, other.value.shape) if other.grad is not None else _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def __matmul__(self, other):
+        other = self._ensure(other); out = Node(self.value @ other.value, (self, other), '@')
+        def _backward():
+            if out.grad is None: return
+            A=self.value; B=other.value; G=out.grad
+            if A.ndim == 2 and B.ndim == 2:
+                self_grad = G @ B.T; other_grad = A.T @ G
+            elif A.ndim == 2 and B.ndim == 1:
+                self_grad = (G[:, None] @ B[None, :]); other_grad = A.T @ G
+            elif A.ndim == 1 and B.ndim == 2:
+                self_grad = (G[None, :] @ B.T).reshape(A.shape); other_grad = np.outer(A, G)
+            elif A.ndim == 1 and B.ndim == 1:
+                self_grad = G * B; other_grad = G * A
+            else:
+                self_grad = np.matmul(G, B.T); other_grad = np.matmul(A.T, G)
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(other_grad, other.value.shape) if other.grad is not None else _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def relu(self):
+        out = Node(np.where(self.value > 0, self.value, 0.0), (self,), 'relu')
+        def _backward():
+            if out.grad is None: return
+            self_grad = (self.value > 0).astype(float) * out.grad
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+        out._backward = _backward; return out
+    def tanh(self):
+        out = Node(np.tanh(self.value), (self,), 'tanh')
+        def _backward():
+            if out.grad is None: return
+            self_grad = (1 - np.tanh(self.value)**2) * out.grad
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+        out._backward = _backward; return out
+    def sum(self, axis=None, keepdims=False):
+        out_val = self.value.sum(axis=axis, keepdims=keepdims); out = Node(out_val, (self,), 'sum')
+        def _backward():
+            if out.grad is None: return
+            grad = out.grad
+            if not keepdims and axis is None:
+                grad = np.broadcast_to(out.grad, self.value.shape)
+            elif not keepdims:
+                shape = list(self.value.shape); axis_list = [axis] if isinstance(axis,int) else list(axis)
+                for ax in sorted(axis_list):
+                    grad = np.expand_dims(grad, ax)
+                grad = np.broadcast_to(grad, self.value.shape)
+            else:
+                grad = np.broadcast_to(grad, self.value.shape)
+            self.grad = self.grad + grad if self.grad is not None else grad
+        out._backward = _backward; return out
+    def backward(self, grad=None):
+        topo=[]; visited=set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents:
+                    build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo:
+            v.grad = np.zeros_like(v.value)
+        if grad is None:
+            grad = np.ones_like(self.value)
+        self.grad = grad if self.grad is None else self.grad + grad
+        for v in reversed(topo):
+            v._backward()
+
+def compute_hvp(params, X, y, eps=1e-4):
+    flat = np.concatenate([p.value.ravel() for p in params])
+    shapes = [p.value.shape for p in params]; sizes = [int(np.prod(s)) for s in shapes]
+    np.random.seed(10); v = np.random.randn(flat.size)
+    def set_flat(flat_vec):
+        idx = 0
+        for p,s,sz in zip(params, shapes, sizes):
+            p.value = flat_vec[idx:idx+sz].reshape(s); idx += sz
+    def compute_grad():
+        Xn = Node(X); yn = Node(y)
+        h1 = Xn @ params_map['W1']; h1 = h1 + params_map['b1']; h1 = h1.tanh()
+        h2 = h1 @ params_map['W2']; h2 = h2 + params_map['b2']; h2 = h2.relu()
+        pred = h2 @ params_map['W3']; pred = pred + params_map['b3']
+        diff = pred - yn; loss = (diff * diff).sum() / X.shape[0]; loss.backward()
+        return np.concatenate([p.grad.ravel() for p in params])
+    orig_flat = flat.copy()
+    flat_plus = orig_flat + eps * v; flat_minus = orig_flat - eps * v
+    set_flat(flat_plus); grad_plus = compute_grad()
+    set_flat(flat_minus); grad_minus = compute_grad()
+    set_flat(orig_flat)
+    hvp = (grad_plus - grad_minus) / (2*eps)
+    return float(np.dot(hvp, v)), float(np.linalg.norm(hvp))
+
+def run_experiment(config, compute_hvp_flag=True):
+    np.random.seed(config.get('seed',0))
+    N = config.get('N',120); D = config.get('D',4)
+    X = np.random.randn(N, D)
+    y = np.sin(X[:,0]) + 0.5 * (X[:,1]**2) - 0.3 * X[:,2] + 0.2*np.tanh(X[:,3]) + 0.1 * np.random.randn(N)
+    H1 = config.get('H1',24); H2 = config.get('H2',12)
+    W1 = Node(np.random.randn(D, H1) * 0.1); b1 = Node(np.zeros(H1))
+    W2 = Node(np.random.randn(H1, H2) * 0.1); b2 = Node(np.zeros(H2))
+    W3 = Node(np.random.randn(H2) * 0.1); b3 = Node(np.array(0.0))
+    params = [W1, b1, W2, b2, W3, b3]
+    global params_map
+    params_map = {'W1':W1,'b1':b1,'W2':W2,'b2':b2,'W3':W3,'b3':b3}
+    def init_adam(p): return {'m': np.zeros_like(p.value), 'v': np.zeros_like(p.value)}
+    state = {'W1': init_adam(W1), 'b1': init_adam(b1), 'W2': init_adam(W2), 'b2': init_adam(b2), 'W3': init_adam(W3), 'b3': init_adam(b3)}
+    beta1=0.9; beta2=0.999; eps=1e-8; lr=config.get('lr',0.01)
+    def adam_step(param, s, t):
+        m_new = beta1 * s['m'] + (1-beta1) * param.grad
+        v_new = beta2 * s['v'] + (1-beta2) * (param.grad * param.grad)
+        s['m']=m_new; s['v']=v_new
+        m_hat = s['m'] / (1 - beta1**t); v_hat = s['v'] / (1 - beta2**t)
+        param.value = param.value - lr * m_hat / (np.sqrt(v_hat) + eps)
+    loss_history = []
+    for epoch in range(1, config.get('epochs',80)+1):
+        Xn = Node(X); yn = Node(y)
+        h1 = Xn @ W1; h1 = h1 + b1
+        h1 = h1.tanh() if config.get('activation1','tanh')=='tanh' else h1.relu()
+        h2 = h1 @ W2; h2 = h2 + b2; h2 = h2.relu()
+        pred = h2 @ W3; pred = pred + b3
+        diff = pred - yn; sq = diff * diff; loss = sq.sum() / N
+        loss.backward()
+        loss_history.append(float(loss.value))
+        adam_step(W1, state['W1'], epoch); adam_step(b1, state['b1'], epoch)
+        adam_step(W2, state['W2'], epoch); adam_step(b2, state['b2'], epoch)
+        adam_step(W3, state['W3'], epoch); adam_step(b3, state['b3'], epoch)
+    # metrics
+    W1v, b1v, W2v, b2v, W3v, b3v = W1.value, b1.value, W2.value, b2.value, W3.value, b3.value
+    hidden = np.tanh(X @ W1v + b1v) if config.get('activation1','tanh')=='tanh' else np.maximum(X @ W1v + b1v, 0.0)
+    h2_np = hidden @ W2v + b2v
+    relu_np = np.maximum(h2_np, 0.0)
+    pred_np = relu_np @ W3v + b3v
+    mse = float(np.mean((pred_np - y)**2)); r2 = float(1 - mse/np.var(y))
+    Xn = Node(X); yn = Node(y)
+    h1 = Xn @ W1; h1 = h1 + b1; h1 = h1.tanh() if config.get('activation1','tanh')=='tanh' else h1.relu()
+    h2 = h1 @ W2; h2 = h2 + b2; h2 = h2.relu()
+    pred = h2 @ W3; pred = pred + b3; diff = pred - yn
+    sq = diff * diff; loss = sq.sum() / N; loss.backward()
+    grad_vec = np.concatenate([p.grad.ravel() for p in params])
+    grad_norm = float(np.linalg.norm(grad_vec))
+    res = {'config': config, 'mse': mse, 'r2': r2, 'grad_norm': grad_norm, 'final_loss': loss_history[-1], 'loss_history': loss_history}
+    if compute_hvp_flag:
+        hvp_dot, hvp_norm = compute_hvp(params, X, y, eps=1e-4)
+        res['hvp_dot_v'] = hvp_dot; res['hvp_norm'] = hvp_norm
+    return res
+
+def orchestrator_v2(n_trials=20, seed=123, compute_hvp_flag=True):
+    np.random.seed(seed)
+    base = {'seed':5,'N':120,'D':4,'H1':24,'H2':12,'lr':0.01,'epochs':80,'activation1':'tanh'}
+    best = run_experiment(base, compute_hvp_flag=compute_hvp_flag)
+    log = [best]
+    for t in range(1, n_trials):
+        cand = copy.deepcopy(best['config'])
+        if np.random.rand() < 0.6:
+            cand['H1'] = max(4, int(cand['H1'] * (1 + (np.random.rand()-0.5)*0.6)))
+            cand['H2'] = max(4, int(cand['H2'] * (1 + (np.random.rand()-0.5)*0.6)))
+        else:
+            cand['lr'] = float(cand['lr'] * (0.4 + np.random.rand()*1.2))
+        cand['seed'] = int(np.random.randint(0,1000))
+        res = run_experiment(cand, compute_hvp_flag=compute_hvp_flag)
+        log.append(res)
+        stable = True
+        if compute_hvp_flag and ('hvp_norm' in res and res['hvp_norm'] > 200):
+            stable = False
+        if res['mse'] < best['mse'] - 1e-6 and stable:
+            best = res
+            best['config']['lr'] = float(max(1e-5, best['config'].get('lr',0.01) * 0.9))
+        else:
+            if res['grad_norm'] > 1.0 or (compute_hvp_flag and res.get('hvp_norm',0) > 200):
+                best['config']['lr'] = float(max(1e-6, best['config'].get('lr',0.01) * 0.8))
+    return log, best
+
+start = time.time()
+log20, best20 = orchestrator_v2(n_trials=20, seed=123, compute_hvp_flag=True)
+end = time.time()
+
+rows = []
+for i, r in enumerate(log20):
+    cfg = r['config']
+    rows.append({
+        'trial': i,
+        'seed': cfg.get('seed'),
+        'H1': cfg.get('H1'),
+        'H2': cfg.get('H2'),
+        'lr': cfg.get('lr'),
+        'mse': r['mse'],
+        'r2': r['r2'],
+        'grad_norm': r['grad_norm'],
+        'hvp_norm': r.get('hvp_norm', None),
+        'final_loss': r.get('final_loss')
+    })
+df20 = pd.DataFrame(rows).sort_values('mse').reset_index(drop=True)
+csv_path = '/mnt/data/orchestrator20_results.csv'
+df20.to_csv(csv_path, index=False)
+display_dataframe_to_user("Orchestrator_v2 (20 trials) Results", df20)
+print("Best (summary):", json.dumps(best20, indent=2))
+print("Saved CSV to:", csv_path)
+print("Elapsed:", end-start)

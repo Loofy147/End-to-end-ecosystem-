@@ -1,0 +1,246 @@
+import numpy as np
+import pandas as pd
+import json
+import time
+import copy
+import random
+
+# ==============================================================================
+#  Section 1: Core Autodiff Engine (Unchanged)
+# ==============================================================================
+# --- The Node class remains the same powerful tool as before ---
+def _sum_to_shape(grad, shape):
+    while grad.ndim > len(shape): grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1: grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float); self.parents = parents; self.op = op
+        self.grad = None; self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward; return out
+    def __pow__(self, power):
+        assert isinstance(power, (int, float)); out = Node(self.value ** power, (self,), f'**{power}')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (power * self.value**(power-1)) * out.grad
+        out._backward = _backward; return out
+    def __matmul__(self, other):
+        other = self._ensure(other); out = Node(self.value @ other.value, (self, other), '@')
+        def _backward():
+            if out.grad is None: return
+            A, B, G = self.value, other.value, out.grad
+            if A.ndim == 2 and B.ndim == 1: self_grad, other_grad = np.outer(G, B), A.T @ G
+            else: self_grad, other_grad = G @ B.T, A.T @ G
+            self.grad += _sum_to_shape(self_grad, self.value.shape)
+            other.grad += _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def relu(self):
+        out = Node(np.maximum(0, self.value), (self,), 'relu')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (self.value > 0) * out.grad
+        out._backward = _backward; return out
+    def tanh(self):
+        out = Node(np.tanh(self.value), (self,), 'tanh')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (1 - out.value**2) * out.grad
+        out._backward = _backward; return out
+    def sum(self):
+        out = Node(self.value.sum(), (self,), 'sum')
+        def _backward():
+            if out.grad is None: return
+            self.grad += np.broadcast_to(out.grad, self.value.shape)
+        out._backward = _backward; return out
+    def backward(self):
+        topo, visited = [], set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo: v.grad = np.zeros_like(v.value)
+        self.grad = np.ones_like(self.value)
+        for v in reversed(topo): v._backward()
+
+# ==============================================================================
+#  Section 2: Dynamic Model Builder and Experiment Runner
+# ==============================================================================
+
+def build_model_from_config(config, input_dim):
+    """Dynamically creates model parameters based on a layer configuration."""
+    params = []
+    current_dim = input_dim
+    for layer_conf in config['layers']:
+        if layer_conf['type'] == 'linear':
+            out_dim = layer_conf['out_features']
+            W = Node(np.random.randn(current_dim, out_dim) * 0.1)
+            b = Node(np.zeros(out_dim))
+            params.extend([W, b])
+            current_dim = out_dim
+    return params
+
+def run_forward_pass(X_node, params, config):
+    """Dynamically runs the forward pass based on the layer configuration."""
+    x = X_node
+    param_idx = 0
+    for layer_conf in config['layers']:
+        if layer_conf['type'] == 'linear':
+            W, b = params[param_idx], params[param_idx+1]
+            x = x @ W + b
+            param_idx += 2
+        elif layer_conf['type'] == 'tanh':
+            x = x.tanh()
+        elif layer_conf['type'] == 'relu':
+            x = x.relu()
+    return x
+
+def run_nas_experiment(config, X_data, y_data):
+    """Trains and evaluates a dynamically generated model."""
+    np.random.seed(config.get('seed', 0))
+    
+    # 1. Dynamically build the model
+    params = build_model_from_config(config, X_data.shape[1])
+    
+    # 2. Adam Optimizer State
+    adam_state = [{'m': np.zeros_like(p.value), 'v': np.zeros_like(p.value)} for p in params]
+    beta1, beta2, eps, lr = 0.9, 0.999, 1e-8, config['lr']
+
+    # 3. Training Loop
+    Xn, yn = Node(X_data), Node(y_data)
+    for epoch in range(1, config['epochs'] + 1):
+        pred = run_forward_pass(Xn, params, config)
+        loss = ((pred - yn) * (pred - yn)).sum() * (1 / X_data.shape[0])
+        loss.backward()
+        
+        for i, p in enumerate(params):
+            adam_state[i]['m'] = 0.9 * adam_state[i]['m'] + 0.1 * p.grad
+            adam_state[i]['v'] = 0.999 * adam_state[i]['v'] + 0.001 * (p.grad**2)
+            m_hat, v_hat = adam_state[i]['m']/(1-0.9**epoch), adam_state[i]['v']/(1-0.999**epoch)
+            p.value -= lr * m_hat / (np.sqrt(v_hat) + 1e-8)
+
+    # 4. Evaluation
+    pred_np = run_forward_pass(Xn, params, config).value
+    mse = np.mean((pred_np - y_data)**2)
+    
+    return {'mse': float(mse), 'config': config}
+
+# ==============================================================================
+#  Section 3: Neural Architecture Search (NAS) Orchestrator
+# ==============================================================================
+
+def nas_orchestrator(n_trials=100, seed=42):
+    """Performs Neural Architecture Search by evolving model configurations."""
+    print(f"--- Starting NAS Orchestrator: {n_trials} trials ---")
+    np.random.seed(seed)
+    
+    # Define a simple starting architecture
+    base_config = {
+        'lr': 0.01, 'epochs': 70, 'seed': 5,
+        'layers': [
+            {'type': 'linear', 'out_features': 16},
+            {'type': 'tanh'},
+            {'type': 'linear', 'out_features': 1}
+        ]
+    }
+    
+    X_search, y_search = np.random.randn(150, 4), np.sin(np.random.randn(150, 4)[:,0])
+    
+    best = run_nas_experiment(base_config, X_search, y_search)
+    log = [best]
+    
+    for t in range(1, n_trials):
+        cand_config = copy.deepcopy(best['config'])
+        
+        # --- Architectural Mutation Engine ---
+        mutation_type = random.choice(['add', 'remove', 'change_activation', 'change_size', 'tune_lr'])
+        
+        linear_layers_indices = [i for i, l in enumerate(cand_config['layers']) if l['type'] == 'linear']
+
+        if mutation_type == 'add' and len(linear_layers_indices) < 4:
+            idx_to_add_after = random.choice(linear_layers_indices)
+            new_layer_size = random.choice([8, 16, 24, 32])
+            new_activation = random.choice([{'type': 'tanh'}, {'type': 'relu'}])
+            cand_config['layers'].insert(idx_to_add_after + 1, {'type': 'linear', 'out_features': new_layer_size})
+            cand_config['layers'].insert(idx_to_add_after + 2, new_activation)
+        
+        elif mutation_type == 'remove' and len(linear_layers_indices) > 2:
+            # Remove a linear layer and its subsequent activation
+            idx_to_remove = random.choice(linear_layers_indices[1:-1]) # Dont remove first or last
+            del cand_config['layers'][idx_to_remove:idx_to_remove+2]
+
+        elif mutation_type == 'change_activation':
+            activation_indices = [i for i, l in enumerate(cand_config['layers']) if l['type'] in ['tanh', 'relu']]
+            if activation_indices:
+                idx_to_change = random.choice(activation_indices)
+                cand_config['layers'][idx_to_change]['type'] = 'relu' if cand_config['layers'][idx_to_change]['type'] == 'tanh' else 'tanh'
+
+        elif mutation_type == 'change_size' and len(linear_layers_indices) > 1:
+            idx_to_change = random.choice(linear_layers_indices[:-1]) # Dont change output layer size
+            cand_config['layers'][idx_to_change]['out_features'] = int(cand_config['layers'][idx_to_change]['out_features'] * (0.7 + random.random()*0.6))
+
+        else: # Default to tuning learning rate
+            cand_config['lr'] = best['config']['lr'] * (0.8 + random.random()*0.4)
+
+        cand_config['seed'] = int(np.random.randint(0, 10000))
+        
+        # Run experiment with the new, mutated architecture
+        res = run_nas_experiment(cand_config, X_search, y_search)
+        log.append(res)
+        
+        if res['mse'] < best['mse']:
+            best = res
+            arch_str = " -> ".join([f"{l['type']}({l.get('out_features', '')})" for l in best['config']['layers']])
+            print(f"Trial {t:3d}: New best arch! MSE: {best['mse']:.6f} | Arch: {arch_str}")
+            
+    print("--- NAS Orchestrator Finished ---")
+    return best
+
+# ==============================================================================
+#  Section 4: Execution
+# ==============================================================================
+
+if __name__ == "__main__":
+    start_time = time.time()
+    
+    # Run the NAS orchestrator
+    best_found_model = nas_orchestrator(n_trials=100)
+    
+    end_time = time.time()
+    
+    print("\n" + "="*50)
+    print("      NEURAL ARCHITECTURE SEARCH (NAS) COMPLETE")
+    print("="*50 + "\n")
+    print(f"Total execution time: {end_time - start_time:.2f} seconds.\n")
+    
+    print("--- Best Architecture Found by AutoML ---")
+    
+    # Pretty print the best configuration
+    best_config = best_found_model['config']
+    print(f"Final MSE: {best_found_model['mse']:.6f}")
+    print(f"Learning Rate: {best_config['lr']:.6f}")
+    print("Architecture Layers:")
+    for layer in best_config['layers']:
+        if layer['type'] == 'linear':
+            print(f"  - {layer['type']:<10} | Neurons: {layer['out_features']}")
+        else:
+            print(f"  - {layer['type']:<10} | Activation")
+

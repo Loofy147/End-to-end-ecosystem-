@@ -1,0 +1,360 @@
+import numpy as np
+import pandas as pd
+import json
+import time
+import copy
+import ast
+import networkx as nx
+from collections import defaultdict
+
+# ==============================================================================
+#  Section 1: Core Autodiff Engine and Static Code Analyzer
+# ==============================================================================
+
+# --- Autodiff Node Class (unchanged) ---
+def _sum_to_shape(grad, shape):
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float)
+        self.parents = parents
+        self.op = op
+        self.grad = None
+        self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad, self.value.shape)
+            other.grad += _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
+            other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+        out._backward = _backward; return out
+    def __sub__(self, other):
+        return self + (other * -1)
+    def __truediv__(self, other):
+        return self * (other**-1)
+    def __pow__(self, power):
+        assert isinstance(power, (int, float))
+        out = Node(self.value ** power, (self,), f'**{power}')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (power * self.value**(power-1)) * out.grad
+        out._backward = _backward; return out
+    def __matmul__(self, other):
+        other = self._ensure(other); out = Node(self.value @ other.value, (self, other), '@')
+        def _backward():
+            if out.grad is None: return
+            A, B, G = self.value, other.value, out.grad
+            if A.ndim == 2 and B.ndim == 1: self_grad, other_grad = np.outer(G, B), A.T @ G
+            elif A.ndim == 1 and B.ndim == 2: self_grad, other_grad = G @ B.T, np.outer(A, G)
+            else: self_grad, other_grad = G @ B.T, A.T @ G
+            self.grad += _sum_to_shape(self_grad, self.value.shape)
+            other.grad += _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def relu(self):
+        out = Node(np.maximum(0, self.value), (self,), 'relu')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (self.value > 0) * out.grad
+        out._backward = _backward; return out
+    def tanh(self):
+        out = Node(np.tanh(self.value), (self,), 'tanh')
+        def _backward():
+            if out.grad is None: return
+            self.grad += (1 - out.value**2) * out.grad
+        out._backward = _backward; return out
+    def sum(self):
+        out = Node(self.value.sum(), (self,), 'sum')
+        def _backward():
+            if out.grad is None: return
+            self.grad += np.broadcast_to(out.grad, self.value.shape)
+        out._backward = _backward; return out
+    def backward(self):
+        topo, visited = [], set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents: build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo: v.grad = np.zeros_like(v.value)
+        self.grad = np.ones_like(self.value)
+        for v in reversed(topo): v._backward()
+
+# --- Static Code Analyzer ---
+def analyze_code_structure(code_string):
+    """Parses a string of Python code and returns structural metrics."""
+    try:
+        tree = ast.parse(code_string)
+        call_graph = defaultdict(list)
+        visitor = CallGraphVisitor()
+        visitor.visit(tree)
+        call_graph = visitor.graph
+        
+        # Using networkx to easily calculate graph metrics
+        G = nx.DiGraph(call_graph)
+        out_degrees = [d for n, d in G.out_degree()]
+        in_degrees = [d for n, d in G.in_degree()]
+        
+        max_out_degree = max(out_degrees) if out_degrees else 0
+        max_in_degree = max(in_degrees) if in_degrees else 0
+        
+        return {
+            "max_out_degree": max_out_degree,
+            "max_in_degree": max_in_degree,
+            "num_functions": len(G.nodes),
+            "num_edges": len(G.edges)
+        }
+    except Exception as e:
+        # Return default values if parsing fails
+        return {
+            "max_out_degree": 99, "max_in_degree": 99,
+            "num_functions": 0, "num_edges": 0, "error": str(e)
+        }
+
+class CallGraphVisitor(ast.NodeVisitor):
+    """AST visitor to build a call graph."""
+    def __init__(self):
+        self.graph = defaultdict(list)
+        self.current_function = None
+
+    def visit_FunctionDef(self, node):
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = None
+
+    def visit_Call(self, node):
+        if self.current_function:
+            if isinstance(node.func, ast.Name):
+                self.graph[self.current_function].append(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                # This is a method call, e.g., 'x.relu()'. We can choose to log the attribute name.
+                self.graph[self.current_function].append(node.func.attr)
+        self.generic_visit(node)
+
+# ==============================================================================
+#  Section 2: The "Complexity Trap" and Experiment Logic
+# ==============================================================================
+
+def helper_a(n): return n * 0.5
+def helper_b(n): return n + 0.1
+def helper_c(n): return n * n
+
+def super_complex_activation(node):
+    """
+    A hypothetical complex activation function to introduce structural complexity.
+    It gives a tiny performance boost but adds many function calls.
+    """
+    # These calls increase the out-degree of any function that uses this
+    a = helper_a(node)
+    b = helper_b(a)
+    c = helper_c(b)
+    return c * 0.1 + node * 0.9 # Mix with original to keep it stable
+
+def run_experiment_with_analysis(config, code_string_to_analyze):
+    """
+    Wraps run_experiment to perform static code analysis and include metrics.
+    """
+    # --- This inner function is what gets analyzed ---
+    def experiment_logic(config):
+        np.random.seed(config.get('seed', 0))
+        X_data = np.random.randn(120, 4)
+        y_data = np.sin(X_data[:,0]) + 0.5*(X_data[:,1]**2) - 0.3*X_data[:,2] + 0.1*np.random.randn(120)
+        
+        D = X_data.shape[1]
+        H1, H2 = config['H1'], config['H2']
+        
+        W1 = Node(np.random.randn(D, H1) * 0.1); b1 = Node(np.zeros(H1))
+        W2 = Node(np.random.randn(H1, H2) * 0.1); b2 = Node(np.zeros(H2))
+        W3 = Node(np.random.randn(H2) * 0.1); b3 = Node(np.array(0.0))
+        params = [W1, b1, W2, b2, W3, b3]
+        
+        adam_state = [{'m': np.zeros_like(p.value), 'v': np.zeros_like(p.value)} for p in params]
+        beta1, beta2, eps, lr = 0.9, 0.999, 1e-8, config['lr']
+
+        Xn, yn = Node(X_data), Node(y_data)
+        for epoch in range(1, config['epochs'] + 1):
+            h1 = (Xn @ W1 + b1).tanh()
+            
+            # --- Complexity Trap is here ---
+            if config.get("use_complex_activation", False):
+                h2 = super_complex_activation((h1 @ W2 + b2))
+            else:
+                h2 = (h1 @ W2 + b2).relu()
+            
+            pred = h2 @ W3 + b3
+            loss = ((pred - yn) * (pred - yn)).sum() * (1 / X_data.shape[0])
+            loss.backward()
+            
+            for i, p in enumerate(params):
+                adam_state[i]['m'] = beta1 * adam_state[i]['m'] + (1 - beta1) * p.grad
+                adam_state[i]['v'] = beta2 * adam_state[i]['v'] + (1 - beta2) * (p.grad**2)
+                m_hat = adam_state[i]['m'] / (1 - beta1**epoch)
+                v_hat = adam_state[i]['v'] / (1 - beta2**epoch)
+                p.value -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+        h1_np = np.tanh(X_data @ W1.value + b1.value)
+        if config.get("use_complex_activation", False):
+            # Need to re-implement the forward pass with numpy
+            h2_in = h1_np @ W2.value + b2.value
+            a = h2_in * 0.5
+            b = a + 0.1
+            c = b * b
+            h2_np = c * 0.1 + h2_in * 0.9
+        else:
+            h2_np = np.maximum(0, h1_np @ W2.value + b2.value)
+        
+        pred_np = h2_np @ W3.value + b3.value
+        mse = np.mean((pred_np - y_data)**2)
+        grad_norm = np.linalg.norm(np.concatenate([p.grad.ravel() for p in params]))
+        
+        return {'mse': float(mse), 'grad_norm': float(grad_norm)}
+    
+    # --- Execution and Analysis ---
+    # 1. Analyze the code structure
+    structural_metrics = analyze_code_structure(code_string_to_analyze)
+    
+    # 2. Run the actual experiment
+    performance_metrics = experiment_logic(config)
+    
+    # 3. Combine results
+    return {**performance_metrics, **structural_metrics, "config": config}
+
+def calculate_composite_score(metrics, mse_ref, grad_ref, out_degree_ref):
+    """Calculates a composite score balancing performance and complexity."""
+    w_mse = 1.0  # Weight for performance
+    w_grad = 0.3 # Weight for stability
+    w_struct = 0.5 # Weight for structural complexity
+    
+    mse_term = metrics['mse'] / mse_ref
+    grad_term = metrics['grad_norm'] / grad_ref
+    struct_term = metrics['max_out_degree'] / out_degree_ref
+    
+    return w_mse * mse_term + w_grad * grad_term + w_struct * struct_term
+
+# ==============================================================================
+#  Section 3: Main Orchestrator Logic
+# ==============================================================================
+
+def orchestrator_with_composite_score(n_trials=200, seed=42):
+    print(f"--- Starting Orchestrator with Composite Score: {n_trials} trials ---")
+    np.random.seed(seed)
+    
+    # Define the two versions of the code to be analyzed
+    code_simple = """
+def model_logic(Xn, yn, W1, b1, W2, b2, W3, b3):
+    h1 = (Xn @ W1 + b1).tanh()
+    h2 = (h1 @ W2 + b2).relu()
+    pred = h2 @ W3 + b3
+    return pred
+"""
+    code_complex = """
+def model_logic(Xn, yn, W1, b1, W2, b2, W3, b3):
+    h1 = (Xn @ W1 + b1).tanh()
+    h2 = super_complex_activation((h1 @ W2 + b2))
+    pred = h2 @ W3 + b3
+    return pred
+"""
+    
+    # --- Initial Run to get reference values ---
+    base_config = {'seed': 5, 'H1': 24, 'H2': 12, 'lr': 0.01, 'epochs': 80, 'use_complex_activation': False}
+    best = run_experiment_with_analysis(base_config, code_simple)
+    log = [best]
+    
+    mse_ref = best['mse']
+    grad_ref = best['grad_norm']
+    out_degree_ref = best['max_out_degree']
+    best['composite_score'] = calculate_composite_score(best, mse_ref, grad_ref, out_degree_ref)
+
+    for t in range(1, n_trials):
+        cand_config = copy.deepcopy(best['config'])
+        
+        # Propose new config
+        if np.random.rand() < 0.7:
+            cand_config['H1'] = max(4, int(cand_config['H1'] * (1 + np.random.randn()*0.15)))
+            cand_config['lr'] = max(1e-6, cand_config['lr'] * (1 + np.random.randn()*0.1))
+        else:
+            cand_config['H1'] = int(np.random.choice([16, 24, 32, 48]))
+            cand_config['lr'] = 10**np.random.uniform(-4, -1.5)
+        
+        # Randomly decide whether to use the complex activation
+        use_complex = np.random.rand() < 0.3 # 30% chance to try the complex function
+        cand_config['use_complex_activation'] = use_complex
+        code_to_analyze = code_complex if use_complex else code_simple
+        
+        cand_config['seed'] = int(np.random.randint(0, 10000))
+        
+        res = run_experiment_with_analysis(cand_config, code_to_analyze)
+        res['composite_score'] = calculate_composite_score(res, mse_ref, grad_ref, out_degree_ref)
+        log.append(res)
+        
+        if res['composite_score'] < best['composite_score']:
+            best = res
+            print(f"Trial {t:3d}: New best! Comp Score: {best['composite_score']:.4f} (MSE: {best['mse']:.6f}, Complexity: {best['max_out_degree']})")
+
+    print("--- Orchestrator Finished ---")
+    return pd.DataFrame(log)
+
+# ==============================================================================
+#  Section 4: Execution
+# ==============================================================================
+
+if __name__ == "__main__":
+    start_time = time.time()
+    
+    # Run the orchestrator
+    results_df = orchestrator_with_composite_score(n_trials=200)
+    
+    end_time = time.time()
+    
+    # --- Analyze and Print Results ---
+    print(f"\nTotal execution time: {end_time - start_time:.2f} seconds.")
+    
+    # Separate the simple and complex runs for analysis
+    simple_runs = results_df[results_df['config'].apply(lambda x: not x['use_complex_activation'])]
+    complex_runs = results_df[results_df['config'].apply(lambda x: x['use_complex_activation'])]
+    
+    # Find the best run overall (based on composite score)
+    best_overall = results_df.loc[results_df['composite_score'].idxmin()]
+    
+    # Find the best run if we had only used MSE
+    best_mse_only = results_df.loc[results_df['mse'].idxmin()]
+    
+    print("\n--- Final Analysis ---")
+    print(f"Total trials: {len(results_df)}")
+    print(f"Number of times complex function was tried: {len(complex_runs)}")
+    
+    print("\n--- Best solution according to COMPOSITE SCORE ---")
+    print(f"MSE: {best_overall['mse']:.6f}")
+    print(f"Complexity (Max Out-Degree): {best_overall['max_out_degree']}")
+    print(f"Composite Score: {best_overall['composite_score']:.4f}")
+    print(f"Used Complex Function: {best_overall['config']['use_complex_activation']}")
+    
+    print("\n--- Best solution if we had only used MSE ---")
+    print(f"MSE: {best_mse_only['mse']:.6f}")
+    print(f"Complexity (Max Out-Degree): {best_mse_only['max_out_degree']}")
+    print(f"Composite Score: {best_mse_only['composite_score']:.4f}")
+    print(f"Used Complex Function: {best_mse_only['config']['use_complex_activation']}")
+
+    # Check if the system successfully avoided the complexity trap
+    if not best_overall['config']['use_complex_activation'] and best_mse_only['config']['use_complex_activation']:
+        print("\nSUCCESS: The composite score successfully avoided the 'complexity trap'!")
+    elif not best_overall['config']['use_complex_activation']:
+        print("\nNOTE: The composite score correctly chose a simple solution, which also happened to have the best MSE.")
+    else:
+        print("\nNOTE: The complex solution's performance boost was so high it overcame the complexity penalty.")
+
