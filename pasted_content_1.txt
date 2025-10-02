@@ -1,0 +1,203 @@
+# Final attempt: compact, self-contained run to produce exact numeric results.
+import numpy as np, time, json
+def _sum_to_shape(grad, shape):
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, (g_dim, t_dim) in enumerate(zip(grad.shape, shape)):
+        if t_dim == 1 and g_dim != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Node:
+    def __init__(self, value, parents=(), op=''):
+        self.value = np.array(value, dtype=float)
+        self.parents = parents
+        self.op = op
+        self.grad = None
+        self._backward = lambda: None
+    def _ensure(self, other):
+        return other if isinstance(other, Node) else Node(np.array(other, dtype=float))
+    def __add__(self, other):
+        other = self._ensure(other); out = Node(self.value + other.value, (self, other), '+')
+        def _backward():
+            if out.grad is None: return
+            self.grad = self.grad + _sum_to_shape(out.grad, self.value.shape) if self.grad is not None else _sum_to_shape(out.grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(out.grad, other.value.shape) if other.grad is not None else _sum_to_shape(out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __mul__(self, other):
+        other = self._ensure(other); out = Node(self.value * other.value, (self, other), '*')
+        def _backward():
+            if out.grad is None: return
+            self_grad = out.grad * other.value; other_grad = out.grad * self.value
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(other_grad, other.value.shape) if other.grad is not None else _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def __sub__(self, other):
+        other = self._ensure(other); out = Node(self.value - other.value, (self, other), '-')
+        def _backward():
+            if out.grad is None: return
+            self.grad = self.grad + _sum_to_shape(out.grad, self.value.shape) if self.grad is not None else _sum_to_shape(out.grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(-out.grad, other.value.shape) if other.grad is not None else _sum_to_shape(-out.grad, other.value.shape)
+        out._backward = _backward; return out
+    def __truediv__(self, other):
+        other = self._ensure(other); out = Node(self.value / other.value, (self, other), '/')
+        def _backward():
+            if out.grad is None: return
+            self_grad = out.grad / other.value; other_grad = out.grad * (-self.value / (other.value ** 2))
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(other_grad, other.value.shape) if other.grad is not None else _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def __matmul__(self, other):
+        other = self._ensure(other); out = Node(self.value @ other.value, (self, other), '@')
+        def _backward():
+            if out.grad is None: return
+            A=self.value; B=other.value; G=out.grad
+            if A.ndim == 2 and B.ndim == 2:
+                self_grad = G @ B.T; other_grad = A.T @ G
+            elif A.ndim == 2 and B.ndim == 1:
+                self_grad = (G[:, None] @ B[None, :]); other_grad = A.T @ G
+            elif A.ndim == 1 and B.ndim == 2:
+                self_grad = (G[None, :] @ B.T).reshape(A.shape); other_grad = np.outer(A, G)
+            elif A.ndim == 1 and B.ndim == 1:
+                self_grad = G * B; other_grad = G * A
+            else:
+                self_grad = np.matmul(G, B.T); other_grad = np.matmul(A.T, G)
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+            other.grad = other.grad + _sum_to_shape(other_grad, other.value.shape) if other.grad is not None else _sum_to_shape(other_grad, other.value.shape)
+        out._backward = _backward; return out
+    def __pow__(self, power):
+        out = Node(self.value ** power, (self,), f'**{power}'); 
+        def _backward():
+            if out.grad is None: return
+            grad = (power * (self.value ** (power - 1))) * out.grad
+            self.grad = self.grad + _sum_to_shape(grad, self.value.shape) if self.grad is not None else _sum_to_shape(grad, self.value.shape)
+        out._backward = _backward; return out
+    def sum(self, axis=None, keepdims=False):
+        out_val = self.value.sum(axis=axis, keepdims=keepdims); out = Node(out_val, (self,), 'sum')
+        def _backward():
+            if out.grad is None: return
+            grad = out.grad
+            if not keepdims and axis is None:
+                grad = np.broadcast_to(out.grad, self.value.shape)
+            elif not keepdims:
+                shape = list(self.value.shape); axis_list = [axis] if isinstance(axis,int) else list(axis)
+                for ax in sorted(axis_list):
+                    grad = np.expand_dims(grad, ax)
+                grad = np.broadcast_to(grad, self.value.shape)
+            else:
+                grad = np.broadcast_to(grad, self.value.shape)
+            self.grad = self.grad + grad if self.grad is not None else grad
+        out._backward = _backward; return out
+    def relu(self):
+        out = Node(np.where(self.value > 0, self.value, 0.0), (self,), 'relu')
+        def _backward():
+            if out.grad is None: return
+            self_grad = (self.value > 0).astype(float) * out.grad
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+        out._backward = _backward; return out
+    def tanh(self):
+        out = Node(np.tanh(self.value), (self,), 'tanh')
+        def _backward():
+            if out.grad is None: return
+            self_grad = (1 - np.tanh(self.value)**2) * out.grad
+            self.grad = self.grad + _sum_to_shape(self_grad, self.value.shape) if self.grad is not None else _sum_to_shape(self_grad, self.value.shape)
+        out._backward = _backward; return out
+    def backward(self, grad=None):
+        topo=[]; visited=set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v.parents:
+                    build_topo(p)
+                topo.append(v)
+        build_topo(self)
+        for v in topo:
+            v.grad = np.zeros_like(v.value)
+        if grad is None:
+            grad = np.ones_like(self.value)
+        self.grad = grad if self.grad is None else self.grad + grad
+        for v in reversed(topo):
+            v._backward()
+
+# Run experiment
+np.random.seed(5)
+N = 120; D = 4
+X_np = np.random.randn(N, D)
+y_np = np.sin(X_np[:,0]) + 0.5 * (X_np[:,1]**2) - 0.3 * X_np[:,2] + 0.2*np.tanh(X_np[:,3]) + 0.1 * np.random.randn(N)
+
+H1 = 24; H2 = 12
+W1 = Node(np.random.randn(D, H1) * 0.1); b1 = Node(np.zeros(H1))
+W2 = Node(np.random.randn(H1, H2) * 0.1); b2 = Node(np.zeros(H2))
+W3 = Node(np.random.randn(H2) * 0.1); b3 = Node(np.array(0.0))
+
+def init_adam_state(param):
+    return {"m": np.zeros_like(param.value), "v": np.zeros_like(param.value)}
+
+adam_state = {"W1": init_adam_state(W1), "b1": init_adam_state(b1),
+              "W2": init_adam_state(W2), "b2": init_adam_state(b2),
+              "W3": init_adam_state(W3), "b3": init_adam_state(b3)}
+
+beta1=0.9; beta2=0.999; eps=1e-8; lr=0.01
+def adam_step(param, state, t, lr=lr):
+    m = state["m"]; v = state["v"]; g = param.grad
+    m_new = beta1 * m + (1 - beta1) * g
+    v_new = beta2 * v + (1 - beta2) * (g * g)
+    state["m"] = m_new; state["v"] = v_new
+    m_hat = state["m"] / (1 - beta1**t); v_hat = state["v"] / (1 - beta2**t)
+    param.value = param.value - lr * m_hat / (np.sqrt(v_hat) + eps)
+
+# train
+epochs = 150
+loss_history = []
+for epoch in range(1, epochs+1):
+    Xn = Node(X_np); yn = Node(y_np)
+    h1 = Xn @ W1; h1 = h1 + b1; h1 = h1.tanh()
+    h2 = h1 @ W2; h2 = h2 + b2; h2 = h2.relu()
+    pred = h2 @ W3; pred = pred + b3
+    diff = pred - yn
+    loss = (diff ** 2).sum() / N
+    loss.backward()
+    loss_history.append(float(loss.value))
+    adam_step(W1, adam_state["W1"], epoch); adam_step(b1, adam_state["b1"], epoch)
+    adam_step(W2, adam_state["W2"], epoch); adam_step(b2, adam_state["b2"], epoch)
+    adam_step(W3, adam_state["W3"], epoch); adam_step(b3, adam_state["b3"], epoch)
+
+# metrics
+W1_val = W1.value; b1_val = b1.value; W2_val = W2.value; b2_val = b2.value; W3_val = W3.value; b3_val = b3.value
+hidden = np.tanh(X_np @ W1_val + b1_val)
+h2_np = hidden @ W2_val + b2_val
+relu_np = np.maximum(h2_np, 0.0)
+pred_np = relu_np @ W3_val + b3_val
+mse = float(np.mean((pred_np - y_np)**2)); r2_like = float(1 - mse/np.var(y_np))
+
+# HVP approx via finite-diff
+params = [W1, b1, W2, b2, W3, b3]
+def get_flat(params):
+    flat = np.concatenate([p.value.ravel() for p in params])
+    shapes=[tuple(p.value.shape) for p in params]; sizes=[int(np.prod(s)) for s in shapes]; return flat, shapes, sizes
+def set_flat(params, flat, shapes, sizes):
+    idx=0
+    for p,s,sz in zip(params, shapes, sizes):
+        p.value = flat[int(idx):int(idx+sz)].reshape(s); idx += sz
+
+flat, shapes, sizes = get_flat(params)
+np.random.seed(10); v = np.random.randn(flat.size)
+def compute_grad_vec():
+    Xn = Node(X_np); yn = Node(y_np)
+    h1 = Xn @ W1; h1 = h1 + b1; h1 = h1.tanh()
+    h2 = h1 @ W2; h2 = h2 + b2; h2 = h2.relu()
+    pred = h2 @ W3; pred = pred + b3
+    diff = pred - yn; loss = (diff ** 2).sum() / N; loss.backward()
+    return np.concatenate([p.grad.ravel() for p in params])
+
+grad0 = compute_grad_vec()
+eps = 1e-4
+flat_plus = flat + eps * v; flat_minus = flat - eps * v
+set_flat(params, flat_plus, shapes, sizes); grad_plus = compute_grad_vec()
+set_flat(params, flat_minus, shapes, sizes); grad_minus = compute_grad_vec()
+set_flat(params, flat, shapes, sizes)
+hvp_approx = (grad_plus - grad_minus) / (2*eps); hvp_dot_v = float(np.dot(hvp_approx, v)); hvp_norm = float(np.linalg.norm(hvp_approx))
+result = {"final_loss": loss_history[-1], "mse": mse, "r2_like": r2_like, "grad_norm": float(np.linalg.norm(grad0)),
+          "hvp_dot_v": hvp_dot_v, "hvp_norm": hvp_norm}
+print(json.dumps(result, indent=2))
+result

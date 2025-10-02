@@ -1,0 +1,259 @@
+# adaptive_experiment.py
+import time
+import math
+import numpy as np
+import statistics
+import random
+from typing import Optional, Dict, Any, List
+
+# نفترض أن SpokNASOptimizer, Genome، و advanced_fitness_function_v2 موجودون في النطاق
+
+class ExperimentController:
+    """
+    مراقب داخلي للتجربة (on-line). يراقب التاريخ ويعدل معلمات البحث تلقائياً.
+    الاستراتيجية:
+      - رصد نافذة ركود (no_improve_gens) على أفضل fitness
+      - إن تم الركود: زيادة mutation_rate نسبيًا، أو تنويع بجلب أفراد عشوائيين
+      - مراقبة تباين السكان: إن انخفض التنوّع، خفف ضغط الاختيار أو زد الهجرة
+      - تفعيل الـsurrogate بعد تحصيل عدد كافٍ من نقاط البيانات
+      - إجراء "تجارب داخلية" على الفرد الأفضل: local_mutation_search (hill-climb) لاختبار إمكانية التحسين السريع
+    """
+    def __init__(self,
+                 stagnation_window: int = 5,
+                 stagnation_threshold: float = 1e-4,
+                 mutation_increase_factor: float = 1.5,
+                 max_mutation: float = 0.2,
+                 diversity_threshold: float = 0.15,
+                 diversify_k: int = 2,
+                 enable_surrogate_after: int = 10,
+                 surrogate_enable_callback=None,
+                 logger = print):
+        self.stagnation_window = stagnation_window
+        self.stagnation_threshold = stagnation_threshold
+        self.mutation_increase_factor = mutation_increase_factor
+        self.max_mutation = max_mutation
+        self.diversity_threshold = diversity_threshold
+        self.diversify_k = diversify_k
+        self.enable_surrogate_after = enable_surrogate_after
+        self.surrogate_enable_callback = surrogate_enable_callback
+        self.logger = logger
+
+        # حالة داخلية
+        self.best_history: List[float] = []
+        self.last_improvement_gen = 0
+        self.surrogate_enabled = False
+        self.suggestions = []
+
+    # ---------- مؤشرات وتقييم ----------
+    def update_history(self, gen: int, best_fitness: float):
+        self.best_history.append(best_fitness)
+        if len(self.best_history) == 1 or best_fitness > max(self.best_history[:-1]) + 1e-12:
+            self.last_improvement_gen = gen
+
+    def moving_average_improvement(self, window: int = None):
+        if window is None:
+            window = min(self.stagnation_window, max(1, len(self.best_history)))
+        if len(self.best_history) < window + 1:
+            return float('inf')
+        prev = self.best_history[-(window+1)]
+        curr = self.best_history[-1]
+        return curr - prev
+
+    def diversity_score(self, population: List[Dict[str, Any]]):
+        # قياس بسيط: نسبة تنوّع tokens المتوسطة (Jaccard-based)
+        token_sets = [set(ind['genome'].architecture) for ind in population if ind.get('genome')]
+        if not token_sets:
+            return 0.0
+        sizes = [len(s) for s in token_sets]
+        uniq = len(set(map(tuple, token_sets)))
+        # score = uniq / population_size normalised
+        return uniq / max(1, len(token_sets))
+
+    # ---------- التدخّلات ----------
+    def check_and_adapt(self, optimizer, gen: int, islands: List[List[Dict[str, Any]]], history: List[float]):
+        """
+        تُستدعى كل جيل بعد تحديث history. يمكن تعديل optimizer attributes مباشرة.
+        سياسة آمنة: لا تغيّر إلا عندما تتأكد من الركود أو مشكلة التنوع.
+        """
+        best = history[-1] if history else None
+        self.update_history(gen, best if best is not None else float('-inf'))
+
+        # 1) رصد الركود
+        if gen - self.last_improvement_gen >= self.stagnation_window:
+            # حساب مقدار التحسّن خلال النافذة
+            imp = self.moving_average_improvement(self.stagnation_window)
+            if imp <= self.stagnation_threshold:
+                # الركود موجود — قم بتدخل تدريجي
+                old_mr = optimizer.mutation_rate
+                new_mr = min(self.max_mutation, old_mr * self.mutation_increase_factor)
+                optimizer.mutation_rate = new_mr
+                self.logger(f"[Controller] Gen {gen}: stagnation detected (imp={imp:.6e}). Increasing mutation_rate {old_mr:.4f} -> {new_mr:.4f}")
+                self.suggestions.append((gen, "increase_mutation", old_mr, new_mr))
+                # إدخال تنويع: استبدال آخر k أفراد بسكان عشوائيين
+                for isl in islands:
+                    for _ in range(self.diversify_k):
+                        if len(isl) > 0:
+                            idx = random.randrange(len(isl))
+                            isl[idx] = optimizer._random_individual()
+                self.logger(f"[Controller] injected {self.diversify_k} random individuals per island to boost diversity.")
+                self.suggestions.append((gen, "inject_random", self.diversify_k))
+                # تقليل الضغط الاختياري (تقليل حجم البطولة)
+                # (ينفذ عبر ضبط معامل أو عبر تغيير اختيار الوالدين إذا كان متاحًا)
+                # نوّه فقط إن لم يكن قابلًا للتعديل:
+                try:
+                    if hasattr(optimizer, '_tournament_k'):
+                        old_k = optimizer._tournament_k
+                        optimizer._tournament_k = max(2, int(old_k * 0.8))
+                        self.logger(f"[Controller] lowered tournament_k: {old_k} -> {optimizer._tournament_k}")
+                        self.suggestions.append((gen, "lower_tournament_k", old_k, optimizer._tournament_k))
+                except Exception:
+                    pass
+
+        # 2) تفعيل الوكيل (surrogate) إن استوفى الشروط
+        total_evals = len(optimizer.surrogate_data_y) if hasattr(optimizer, 'surrogate_data_y') else 0
+        if not self.surrogate_enabled and total_evals >= self.enable_surrogate_after:
+            self.surrogate_enabled = True
+            optimizer.surrogate_enabled = True
+            if self.surrogate_enable_callback:
+                try:
+                    self.surrogate_enable_callback()
+                except Exception:
+                    pass
+            self.logger(f"[Controller] Gen {gen}: surrogate enabled (data points={total_evals}).")
+            self.suggestions.append((gen, "enable_surrogate", total_evals))
+
+        # 3) قياس التنوع وتعديل الهجرة إذا لزم
+        flat_pop = [ind for isl in islands for ind in isl]
+        div_score = self.diversity_score(flat_pop)
+        if div_score < self.diversity_threshold:
+            # زد الـmigration_k مؤقتا
+            old_mig = optimizer.migration_k
+            optimizer.migration_k = min(max(1, old_mig+1), max(1, int(len(flat_pop)/4)))
+            self.logger(f"[Controller] Low diversity ({div_score:.3f}). Increased migration_k {old_mig}->{optimizer.migration_k}")
+            self.suggestions.append((gen, "increase_migration_k", old_mig, optimizer.migration_k))
+
+        # 4) local search trial on best individual occasionally
+        if gen % max(1, int(self.stagnation_window*2)) == 0:
+            # قم بتجربة سريعة (1-2 طفرات) على أفضل فرد وحاول تحسينه عبر تقييم محلي
+            try:
+                best_ind = optimizer.best_individual
+                if best_ind:
+                    improved = self._local_hill_climb(optimizer, best_ind, budget=3)
+                    if improved:
+                        self.logger(f"[Controller] Gen {gen}: local hill-climb improved best candidate.")
+                        self.suggestions.append((gen, "local_hill_climb_improved", improved.get('fitness')))
+            except Exception as e:
+                # لا تفشل التجربة لو فشل local search
+                self.logger(f"[Controller] local hill-climb failed: {e}")
+
+    def _local_hill_climb(self, optimizer, best_individual, budget=3):
+        """
+        إجراء محلي محدود: تطبيق طفرات طفيفة على النسخة الأفضل وتقييمها.
+        إن وجد أفضل، يُرجع الفرد الجديد (ويُخزّن أحيانًا في optimizer).
+        """
+        base = deepcopy(best_individual)
+        best = deepcopy(base)
+        for i in range(budget):
+            cand_genome = optimizer._mutate(base['genome'], mutation_rate=min(optimizer.mutation_rate, 0.05))
+            cand = {'genome': cand_genome, 'fitness': None, 'meta': {}}
+            stats = optimizer.fitness_fn(cand_genome)
+            cand['fitness'] = float(stats.get('fitness', 0.0))
+            cand['val_acc'] = stats.get('val_acc', 0.0)
+            if cand['fitness'] > best.get('fitness', -1e9):
+                best = cand
+        if best.get('fitness', -1e9) > base.get('fitness', -1e9):
+            # ضع أفضل مكان الفرد القديم في الpopulation إن أمكن (تحفظ كـelite)
+            optimizer.best_individual = deepcopy(best)
+            return best
+        return None
+
+    def report(self):
+        return {
+            'best_history': self.best_history,
+            'suggestions': self.suggestions,
+            'surrogate_enabled': self.surrogate_enabled
+        }
+
+
+# ---------- تعديل SpokNASOptimizer: تشغيل مع controller ----------
+def spoknas_run_with_controller(self,
+                                 population_size: int = None,
+                                 generations: int = 20,
+                                 num_islands: int = 4,
+                                 migrate_every: Optional[int] = None,
+                                 controller: Optional[ExperimentController] = None):
+    """
+    Replacement/alternative to SpokNASOptimizer.run that supports on-line adaptation.
+    استخدمه كـ: optimizer.run_with_controller(..., controller=ctrl)
+    """
+    pop_size = population_size or self.population_size
+    migrate_every = migrate_every if migrate_every is not None else self.migrate_every
+    self.num_islands = max(1, num_islands)
+
+    # init population
+    population = self._init_population(pop_size)
+    islands = self._split_to_islands(population, self.num_islands)
+    history = []
+    best = None
+
+    for gen in range(1, generations+1):
+        gen_start = time.time()
+        # Evo steps per island (نفس منطق القديم)
+        for i_idx, isl in enumerate(islands):
+            self._evaluate_population(isl)
+            isl.sort(key=lambda x: x['fitness'] if x.get('fitness') is not None else -1e9, reverse=True)
+            elites = isl[:self.elitism]
+            new_pop = elites.copy()
+            while len(new_pop) < len(isl):
+                p1 = self._tournament_select(isl)
+                p2 = self._tournament_select(isl)
+                if random.random() < self.crossover_rate:
+                    child_genome = self._crossover(p1['genome'], p2['genome'])
+                else:
+                    child_genome = deepcopy(p1['genome'])
+                mr = self.mutation_rate * (1.0 + 0.5 * (1.0 - (gen / max(1, generations))))
+                child = {'genome': self._mutate(child_genome, mutation_rate=mr), 'fitness': None, 'meta': {}}
+                new_pop.append(child)
+            islands[i_idx] = new_pop
+
+        # migration
+        if migrate_every and gen % migrate_every == 0 and self.num_islands > 1:
+            migrants = []
+            for isl in islands:
+                isl.sort(key=lambda x: x.get('fitness', -1e9), reverse=True)
+                migrants.append([deepcopy(ind) for ind in isl[:self.migration_k]])
+            for i_idx in range(len(islands)):
+                dest = (i_idx + 1) % len(islands)
+                islands[dest][-self.migration_k:] = migrants[i_idx]
+
+        # global evaluation snapshot
+        all_inds = [ind for isl in islands for ind in isl]
+        self._evaluate_population(all_inds)
+
+        # update best
+        all_inds.sort(key=lambda x: x.get('fitness', -1e9), reverse=True)
+        current_best = all_inds[0]
+        if best is None or current_best['fitness'] > best['fitness']:
+            best = deepcopy(current_best)
+            self.best_individual = deepcopy(best)
+
+        history.append(best['fitness'] if best and best.get('fitness') is not None else float('nan'))
+
+        # --- نقطة التدخّل: نفّذ مراقب التجربة هنا --- #
+        if controller is not None:
+            try:
+                controller.check_and_adapt(self, gen, islands, history)
+            except Exception as e:
+                print(f"[Controller Error] {e}")
+
+        gen_time = time.time() - gen_start
+        print(f"Gen {gen}/{generations} | Best fitness: {history[-1]:.6f} | params: {best.get('params', 'N/A')} | time: {gen_time:.1f}s")
+
+    final_pop = [ind for isl in islands for ind in isl]
+    return best, history, (controller.report() if controller else None)
+
+# --- لصق الوظيفة داخل الصنف (runtime attach) إذا أردت دون تحرير الملف الأصلي ---
+# setattr(SpokNASOptimizer, 'run_with_controller', spoknas_run_with_controller)
+# مثال استخدام:
+# ctrl = ExperimentController(...)
+# best, history, report = optimizer.run_with_controller(population_size=32, generations=50, num_islands=4, controller=ctrl)

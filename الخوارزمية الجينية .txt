@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ga_master.py
+متكامل: Advanced Genetic Algorithm engine
+يدعم: string_matching (عربي)، knapsack (with DP baseline), tsp (permutation)
+ميزات: islands, adaptive mutation, local-opt (2-opt / hill-climb),
+LRU+frequency memoization for DP, per-generation logging, CSV output.
+"""
+
+import argparse
+import json
+import math
+import os
+import random
+import time
+import csv
+import statistics as stats
+from collections import deque, defaultdict
+from typing import List, Tuple, Dict, Any
+
+# ---------------------------
+# Utilities & Smart Memoize
+# ---------------------------
+
+class SmartMemo:
+    """
+    LRU + Frequency-based cache for memoization.
+    Usage: memo = SmartMemo(maxsize=2000)
+           @memo.decorate
+           def f(...): ...
+    Tracks hits/misses.
+    """
+    def __init__(self, maxsize=2000):
+        self.maxsize = maxsize
+        self.cache = dict()
+        self.freq = defaultdict(int)
+        self.last = dict()
+        self.hits = 0
+        self.misses = 0
+
+    def decorate(self, fn):
+        def wrapped(*args):
+            key = args
+            if key in self.cache:
+                self.freq[key] += 1
+                self.last[key] = time.time()
+                self.hits += 1
+                return self.cache[key]
+            res = fn(*args)
+            # eviction when needed
+            if len(self.cache) >= self.maxsize:
+                worst_key = None
+                worst_score = float('inf')
+                nowt = time.time()
+                for k in list(self.cache.keys()):
+                    f = self.freq.get(k, 1)
+                    rec = nowt - self.last.get(k, nowt)
+                    score = f / (rec + 1e-9)
+                    if score < worst_score:
+                        worst_score = score
+                        worst_key = k
+                if worst_key is not None:
+                    self.cache.pop(worst_key, None)
+                    self.freq.pop(worst_key, None)
+                    self.last.pop(worst_key, None)
+            self.cache[key] = res
+            self.freq[key] = 1
+            self.last[key] = time.time()
+            self.misses += 1
+            return res
+        wrapped.cache = self.cache
+        return wrapped
+
+# ---------------------------
+# Problem Implementations
+# ---------------------------
+
+ARABIC_CHARS = list('ابتثجحخدذرزسشصضطظعغفقكلمنهويءآأؤإئى ')
+
+def create_random_string(target):
+    return ''.join(random.choice(ARABIC_CHARS) for _ in range(len(target)))
+
+def fitness_string(ind: str, target: str) -> float:
+    # fraction of matching chars
+    matches = sum(1 for a, b in zip(ind, target) if a == b)
+    return matches / len(target)
+
+def one_point_crossover_str(a: str, b: str) -> Tuple[str, str]:
+    L = len(a)
+    p = random.randrange(1, L)
+    return a[:p] + b[p:], b[:p] + a[p:]
+
+def mutate_string(s: str, rate: float) -> str:
+    out = []
+    for ch in s:
+        if random.random() < rate:
+            out.append(random.choice(ARABIC_CHARS))
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+# -------- Knapsack --------
+def knapsack_optimal_dp(items: List[Tuple[int, int]], capacity: int) -> Tuple[int, List[int]]:
+    """Iterative DP returns optimal value and a chosen index list (small n)."""
+    n = len(items)
+    dp = [[0] * (capacity + 1) for _ in range(n + 1)]
+    take = [[False] * (capacity + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        w, v = items[i - 1]
+        for cap in range(0, capacity + 1):
+            dp[i][cap] = dp[i - 1][cap]
+            take[i][cap] = False
+            if w <= cap:
+                val = dp[i - 1][cap - w] + v
+                if val > dp[i][cap]:
+                    dp[i][cap] = val
+                    take[i][cap] = True
+    # reconstruct
+    cap = capacity
+    chosen = []
+    for i in range(n, 0, -1):
+        if take[i][cap]:
+            chosen.append(i - 1)
+            cap -= items[i - 1][0]
+    return dp[n][capacity], chosen[::-1]
+
+def create_random_knapsack(n):
+    return [random.random() < 0.5 for _ in range(n)]
+
+def fitness_knapsack(ind: List[bool], items: List[Tuple[int, int]], capacity: int, optimal_value=None) -> float:
+    tw = 0; tv = 0
+    for i, bit in enumerate(ind):
+        if bit:
+            tw += items[i][0]; tv += items[i][1]
+    if tw > capacity:
+        return 0.0
+    if optimal_value is None or optimal_value == 0:
+        # normalize by sum values to avoid division by zero
+        s = sum(v for _, v in items)
+        return tv / max(1, s)
+    return tv / optimal_value
+
+def crossover_knapsack(a: List[bool], b: List[bool]) -> Tuple[List[bool], List[bool]]:
+    L = len(a)
+    p = random.randrange(1, L)
+    return a[:p] + b[p:], b[:p] + a[p:]
+
+def mutate_knapsack(ind: List[bool], rate: float) -> List[bool]:
+    out = ind[:]
+    if random.random() < rate * 5:
+        i = random.randrange(len(out))
+        out[i] = not out[i]
+    return out
+
+def hill_climb_knapsack(ind: List[bool], items, capacity, fitness_fn, tries=10):
+    best = ind[:]; best_f = fitness_fn(best)
+    for _ in range(tries):
+        i = random.randrange(len(ind))
+        cand = best[:]
+        cand[i] = not cand[i]
+        f = fitness_fn(cand)
+        if f > best_f:
+            return cand
+    return best
+
+# -------- TSP (permutation) --------
+def create_random_tsp(n):
+    route = list(range(n))
+    random.shuffle(route)
+    return route
+
+def tour_length(route: List[int], cities: List[Tuple[float, float]]) -> float:
+    total = 0.0
+    for i in range(len(route)):
+        a = cities[route[i]]; b = cities[route[(i + 1) % len(route)]]
+        total += math.hypot(a[0] - b[0], a[1] - b[1])
+    return total
+
+def fitness_tsp(route: List[int], cities: List[Tuple[float, float]], heavy_ops=0) -> float:
+    # heavy_ops simulates expensive evaluation (industrial)
+    if heavy_ops > 0:
+        # cheap heavy work but deterministic-ish
+        s = 0.0
+        for i in range(heavy_ops):
+            s += math.sin(i) * 0.000001
+    return 1.0 / (1.0 + tour_length(route, cities))
+
+def order_crossover(p1: List[int], p2: List[int]) -> Tuple[List[int], List[int]]:
+    n = len(p1)
+    a = random.randrange(n); b = random.randrange(n)
+    i, j = min(a, b), max(a, b)
+    child1 = [-1] * n; child2 = [-1] * n
+    child1[i:j+1] = p1[i:j+1]; child2[i:j+1] = p2[i:j+1]
+    s1 = set(child1[i:j+1]); s2 = set(child2[i:j+1])
+    donor2 = [x for x in p2 if x not in s1]
+    donor1 = [x for x in p1 if x not in s2]
+    pos = (j + 1) % n
+    for v in donor2:
+        child1[pos] = v; pos = (pos + 1) % n
+    pos = (j + 1) % n
+    for v in donor1:
+        child2[pos] = v; pos = (pos + 1) % n
+    return child1, child2
+
+def mutate_tsp(route: List[int], rate: float) -> List[int]:
+    r = route[:]
+    if random.random() < rate * 5:
+        i = random.randrange(len(r)); j = random.randrange(len(r))
+        r[i], r[j] = r[j], r[i]
+    return r
+
+def two_opt(route: List[int], cities: List[Tuple[float, float]], tries=20) -> List[int]:
+    n = len(route)
+    best = route; best_len = tour_length(route, cities)
+    for _ in range(tries):
+        i = random.randrange(n - 1); j = random.randrange(i + 1, n)
+        cand = route[:]; cand[i:j + 1] = reversed(cand[i:j + 1])
+        L = tour_length(cand, cities)
+        if L < best_len:
+            return cand
+    return route
+
+# ---------------------------
+# GA Engine
+# ---------------------------
+
+class GAEngine:
+    def __init__(self, cfg: Dict[str, Any], problem: str, case: str = "baseline"):
+        self.cfg = cfg
+        self.problem = problem
+        self.case = case  # "baseline" or "advanced"
+        # basic params
+        gcfg = cfg.get("ga", {})
+        self.pop_size = int(gcfg.get("population_size", 100))
+        self.generations = int(gcfg.get("generations", 200))
+        self.elitism_rate = float(gcfg.get("elitism_rate", 0.1))
+        self.base_mutation = float(gcfg.get("base_mutation", 0.01))
+        self.tournament_k = int(gcfg.get("tournament_k", 3))
+
+        adv = cfg.get("advanced", {})
+        self.use_memo = adv.get("use_memo", False) and case != "baseline"
+        self.memo_maxsize = int(adv.get("memo_maxsize", 2000))
+        self.use_islands = adv.get("use_islands", False) and case != "baseline"
+        self.island_count = int(adv.get("island_count", 4))
+        self.island_every = int(adv.get("island_every", 10))
+        self.island_iters = int(adv.get("island_iters", 2))
+        self.use_local = adv.get("use_local_opt", False) and case != "baseline"
+        self.local_rate = float(adv.get("local_opt_rate", 0.1))
+        self.use_adaptive = adv.get("adaptive", False) and case != "baseline"
+        self.adaptive_params = adv.get("adaptive_params", {"mutation_min": 0.001, "mutation_max": 0.5, "stagnation_window": 5})
+        self.heavy_work = int(cfg.get("industrial_sim", {}).get("heavy_work", 0)) if cfg.get("industrial_sim", {}).get("expensive_eval", False) else 0
+
+        # internal memo for DP if needed
+        self.memo = SmartMemo(maxsize=self.memo_maxsize) if self.use_memo else None
+
+        # placeholders for problem-specific attributes
+        self.items = None
+        self.opt_knapsack_val = None
+        self.target_string = None
+        self.cities = None
+        self.n_cities = None
+
+        # population
+        self.population = []
+        self.fitnesses = []
+
+    # ---------- problem setup ----------
+    def setup_problem(self):
+        if self.problem == "string_matching":
+            smcfg = self.cfg.get("string_matching", {})
+            self.target_string = smcfg.get("target_string") or "".join(random.choice(ARABIC_CHARS) for _ in range(smcfg.get("target_length", 30)))
+            # initial population
+            self.population = [create_random_string(self.target_string) for _ in range(self.pop_size)]
+            self.eval_fn = lambda ind: fitness_string(ind, self.target_string)
+            self.cross_fn = one_point_crossover_str
+            self.mutate_fn = lambda ind, mr: mutate_string(ind, mr)
+            self.diversity_fn = lambda pop: sum(sum(a != b for a, b in zip(pop[i], pop[j])) / len(pop[i]) for i in range(len(pop)) for j in range(i + 1, len(pop))) / max(1, (len(pop) * (len(pop) - 1) / 2))
+        elif self.problem == "knapsack":
+            kcfg = self.cfg.get("knapsack", {})
+            n = int(kcfg.get("n", 100))
+            cap = int(kcfg.get("capacity", 1000))
+            seed = int(kcfg.get("seed", 42))
+            r = random.Random(seed)
+            # items as (weight, value)
+            self.items = [(r.randint(1, 50), r.randint(5, 200)) for _ in range(n)]
+            self.opt_knapsack_val = knapsack_optimal_dp(self.items, cap)[0] if n <= 4000 else None
+            self.capacity = cap
+            self.population = [create_random_knapsack(n) for _ in range(self.pop_size)]
+            self.eval_fn = lambda ind: fitness_knapsack(ind, self.items, self.capacity, self.opt_knapsack_val)
+            self.cross_fn = crossover_knapsack
+            self.mutate_fn = lambda ind, mr: mutate_knapsack(ind, mr)
+            self.diversity_fn = lambda pop: (
+                sum(sum(1 for a, b in zip(pop[i], pop[j]) if a != b) / len(pop[i]) for i in range(len(pop) - 1) for j in range(i + 1, len(pop))) /
+                max(1, (len(pop) * (len(pop) - 1) / 2))
+            )
+        elif self.problem == "tsp":
+            tcfg = self.cfg.get("tsp", {})
+            self.n_cities = int(tcfg.get("num_cities", 20))
+            seed = int(tcfg.get("seed", 42))
+            r = random.Random(seed)
+            self.cities = [(r.uniform(0, 1000), r.uniform(0, 1000)) for _ in range(self.n_cities)]
+            self.population = [create_random_tsp(self.n_cities) for _ in range(self.pop_size)]
+            self.eval_fn = lambda ind: fitness_tsp(ind, self.cities, heavy_ops=self.heavy_work)
+            self.cross_fn = order_crossover
+            self.mutate_fn = lambda ind, mr: mutate_tsp(ind, mr)
+            self.diversity_fn = lambda pop: (
+                sum(sum(1 for a, b in zip(pop[i], pop[j]) if a != b) / len(pop[i]) for i in range(len(pop) - 1) for j in range(i + 1, len(pop))) /
+                max(1, (len(pop) * (len(pop) - 1) / 2))
+            )
+        else:
+            raise ValueError("Unsupported problem: " + str(self.problem))
+        # initial evaluation
+        self.fitnesses = self.evaluate_population(self.population)
+
+    def evaluate_population(self, pop: List[Any]) -> List[float]:
+        # evaluate with optional memoization for deterministic subproblems
+        fits = []
+        if self.use_memo and self.memo:
+            # simple key generator: convert list/tuple to tuple; strings hash directly
+            @self.memo.decorate
+            def _eval_fn(key):
+                # key is same as args passed
+                # if key came as tuple of ints/booleans/str => reconstruct
+                item = key[0]
+                return self._raw_eval(item)
+            for ind in pop:
+                # convert to immutable
+                if isinstance(ind, list):
+                    key = tuple(ind)
+                else:
+                    key = ind
+                fits.append(_eval_fn((key,)))
+        else:
+            for ind in pop:
+                fits.append(self._raw_eval(ind))
+        return fits
+
+    def _raw_eval(self, ind):
+        # call the problem-specific evaluation function
+        return float(self.eval_fn(ind))
+
+    # ---------- selection / operators ----------
+    def tournament_select(self, pop: List[Any], fits: List[float], k=None):
+        k = k or self.tournament_k
+        best_idx = None
+        for _ in range(k):
+            i = random.randrange(len(pop))
+            if best_idx is None or fits[i] > fits[best_idx]:
+                best_idx = i
+        return pop[best_idx]
+
+    # ---------- island model ----------
+    def evolve_islands(self, pop: List[Any], mutation_rate: float) -> List[Any]:
+        size = len(pop)
+        island_size = max(6, size // max(1, self.island_count))
+        # partition by round-robin for diversity
+        islands = [[] for _ in range(self.island_count)]
+        for idx, ind in enumerate(pop):
+            islands[idx % self.island_count].append(ind)
+        # evolve each island a bit
+        new_islands = []
+        for isl in islands:
+            if len(isl) == 0:
+                new_islands.append([])
+                continue
+            local = isl[:]
+            for _ in range(self.island_iters):
+                fits = [self._raw_eval(ind) for ind in local]
+                ranked = [x for _, x in sorted(zip(fits, local), key=lambda t: -t[0])]
+                elites = ranked[:max(1, int(0.2 * len(ranked)))]
+                newloc = elites[:]
+                while len(newloc) < len(local):
+                    p1 = random.choice(ranked); p2 = random.choice(ranked)
+                    c1, c2 = self.cross_fn(p1, p2)
+                    m1 = self.mutate_fn(c1, mutation_rate)
+                    newloc.append(m1)
+                local = newloc[:len(local)]
+            new_islands.append(local)
+        # migration: best of island i replaces worst of island (i+1)
+        for i in range(len(new_islands)):
+            src = new_islands[i]; dst = new_islands[(i + 1) % len(new_islands)]
+            if src and dst:
+                best_src = max(src, key=lambda x: self._raw_eval(x))
+                worst_idx = min(range(len(dst)), key=lambda j: self._raw_eval(dst[j]))
+                dst[worst_idx] = best_src
+        merged = [ind for isl in new_islands for ind in isl]
+        # ensure length
+        if len(merged) >= size:
+            return merged[:size]
+        while len(merged) < size:
+            # fill with random individuals depending on problem
+            if self.problem == "string_matching":
+                merged.append(create_random_string(self.target_string))
+            elif self.problem == "knapsack":
+                merged.append(create_random_knapsack(len(self.items)))
+            elif self.problem == "tsp":
+                merged.append(create_random_tsp(self.n_cities))
+        return merged
+
+    # ---------- local optimization ----------
+    def apply_local_opt(self, ind):
+        if not self.use_local or random.random() >= self.local_rate:
+            return ind
+        if self.problem == "tsp":
+            return two_opt(ind, self.cities, tries=20)
+        elif self.problem == "knapsack":
+            return hill_climb_knapsack(ind, self.items, self.capacity, lambda x: fitness_knapsack(x, self.items, self.capacity, self.opt_knapsack_val), tries=10)
+        return ind
+
+    # ---------- main evolution ----------
+    def evolve_generation(self, current_pop: List[Any], current_fits: List[float], mutation_rate: float) -> Tuple[List[Any], List[float]]:
+        # If island event
+        if self.use_islands and (self.island_every > 0) and (self._current_gen % self.island_every == 0) and self._current_gen > 0:
+            # run island evolution then recompute fits
+            new_pop = self.evolve_islands(current_pop, mutation_rate)
+            new_fits = self.evaluate_population(new_pop)
+            return new_pop, new_fits
+
+        # elitism
+        zipped = sorted(zip(current_pop, current_fits), key=lambda x: x[1], reverse=True)
+        elite_count = max(1, int(self.elitism_rate * self.pop_size))
+        newpop = []
+        # local-opt on elites
+        for i in range(elite_count):
+            ind = zipped[i][0]
+            if self.use_local and random.random() < 0.5:
+                ind2 = self.apply_local_opt(ind)
+                newpop.append(ind2)
+            else:
+                newpop.append(ind)
+        while len(newpop) < self.pop_size:
+            p1 = self.tournament_select(current_pop, current_fits)
+            p2 = self.tournament_select(current_pop, current_fits)
+            c1, c2 = self.cross_fn(p1, p2)
+            m1 = self.mutate_fn(c1, mutation_rate)
+            # occasional local on offspring (small probability)
+            if self.use_local and self.problem == "tsp" and random.random() < 0.08:
+                m1 = two_opt(m1, self.cities, tries=10)
+            newpop.append(m1)
+            if len(newpop) < self.pop_size:
+                m2 = self.mutate_fn(c2, mutation_rate)
+                if self.use_local and self.problem == "tsp" and random.random() < 0.08:
+                    m2 = two_opt(m2, self.cities, tries=10)
+                newpop.append(m2)
+        newpop = newpop[:self.pop_size]
+        newfits = self.evaluate_population(newpop)
+        return newpop, newfits
+
+    # ---------- run GA ----------
+    def run(self, rng_seed:int=0, per_gen_log:bool=False):
+        random.seed(rng_seed)
+        self.setup_problem()
+        self._current_gen = 0
+        mutation = self.base_mutation
+        history = []
+        start = time.perf_counter()
+        best_track = []
+        for gen in range(1, self.generations + 1):
+            self._current_gen = gen
+            # evolve one generation
+            self.population, self.fitnesses = self.evolve_generation(self.population, self.fitnesses, mutation)
+            best = max(self.fitnesses); avg = sum(self.fitnesses) / len(self.fitnesses); div = self.diversity_fn(self.population)
+            best_track.append(best)
+            if per_gen_log:
+                history.append({"generation": gen, "best": best, "avg": avg, "diversity": div, "mutation": mutation})
+            # adaptive mutation rule (simple)
+            if self.use_adaptive and gen > max(1, self.adaptive_params.get("stagnation_window", 5)):
+                window = int(self.adaptive_params.get("stagnation_window", 5))
+                if abs(best_track[-1] - best_track[-window]) < 1e-6:
+                    mutation = min(self.adaptive_params.get("mutation_max", 0.5), mutation * 1.2)
+                else:
+                    mutation = max(self.adaptive_params.get("mutation_min", 0.001), mutation * 0.98)
+        end = time.perf_counter()
+        total = end - start
+        result = {
+            "best_fitness": max(self.fitnesses),
+            "avg_fitness": sum(self.fitnesses) / len(self.fitnesses),
+            "time_s": total,
+            "generations": self.generations,
+            "history": history,
+            "memo_hits": self.memo.hits if self.memo else None,
+            "memo_misses": self.memo.misses if self.memo else None,
+        }
+        return result
+
+# ---------------------------
+# Experiment Runner (CLI)
+# ---------------------------
+
+def load_config(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def run_trials(cfg: Dict[str, Any], problem: str, case: str, trials: int, quick: bool=False, out_dir: str="results"):
+    os.makedirs(out_dir, exist_ok=True)
+    # quick adjustments
+    if quick:
+        cfg = dict(cfg)  # shallow copy
+        cfg["ga"] = dict(cfg.get("ga", {}))
+        cfg["ga"]["generations"] = max(50, int(cfg["ga"].get("generations", 200) / 5))
+        trials = min(4, trials)
+    rows = []
+    for t in range(trials):
+        seed = int(time.time() * 1000) % 1000000 ^ t  # varied seed
+        print(f"[trial {t+1}/{trials}] seed={seed} case={case} problem={problem}")
+        engine = GAEngine(cfg, problem, case=case)
+        res = engine.run(rng_seed=seed, per_gen_log=cfg.get("logging", {}).get("per_gen_logging", False))
+        rows.append({
+            "trial": t + 1,
+            "seed": seed,
+            "case": case,
+            "problem": problem,
+            "best_fitness": res["best_fitness"],
+            "avg_fitness": res["avg_fitness"],
+            "time_s": res["time_s"],
+            "generations": res["generations"],
+            "memo_hits": res.get("memo_hits"),
+            "memo_misses": res.get("memo_misses")
+        })
+    # save CSV
+    out_csv = os.path.join(out_dir, f"{problem}_{case}_results.csv")
+    keys = list(rows[0].keys()) if rows else ["trial", "case", "problem", "best_fitness"]
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+    print("[OK] saved:", out_csv)
+    return out_csv, rows
+
+def ablation_summary(cfg: Dict[str, Any], problem: str, trials: int, out_dir: str="results"):
+    variants = {
+        "baseline": lambda c: c,
+        "advanced": lambda c: c,
+        "adv_no_islands": lambda c: (c["advanced"].update({"use_islands": False}) or c),
+        "adv_no_local": lambda c: (c["advanced"].update({"use_local_opt": False}) or c),
+        "adv_no_adaptive": lambda c: (c["advanced"].update({"adaptive": False}) or c),
+        "adv_low_local_rate": lambda c: (c["advanced"].update({"use_local_opt": True, "local_opt_rate": 0.02}) or c),
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    summary = []
+    for name, modifier in variants.items():
+        cfg_copy = json.loads(json.dumps(cfg))  # deep-ish copy
+        cfg_copy = modifier(cfg_copy)
+        case = "baseline" if name == "baseline" else "advanced"
+        _, rows = run_trials(cfg_copy, problem, case, trials, quick=True, out_dir=out_dir)
+        mean_best = stats.mean(r["best_fitness"] for r in rows)
+        mean_time = stats.mean(r["time_s"] for r in rows)
+        summary.append({"variant": name, "mean_best": mean_best, "mean_time_s": mean_time})
+    out_csv = os.path.join(out_dir, f"{problem}_ablation_summary.csv")
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["variant", "mean_best", "mean_time_s"])
+        writer.writeheader()
+        writer.writerows(summary)
+    print("[OK] ablation summary saved:", out_csv)
+    return out_csv
+
+# ---------------------------
+# Main (CLI)
+# ---------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Advanced GA master runner")
+    ap.add_argument("--config", default="config.json", help="path to JSON config")
+    ap.add_argument("--problem", default="tsp", choices=["tsp", "knapsack", "string_matching"])
+    ap.add_argument("--case", default=None, choices=[None, "baseline", "advanced"], help="run baseline or advanced or both")
+    ap.add_argument("--trials", type=int, default=None)
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--ablation", action="store_true")
+    ap.add_argument("--out_dir", default="results")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config) if os.path.exists(args.config) else {
+        "ga": {"population_size":100, "generations":200, "elitism_rate":0.1, "base_mutation":0.01, "tournament_k":3},
+        "advanced": {"use_memo":True, "memo_maxsize":2000, "use_islands":True, "island_count":4, "island_every":10, "island_iters":2, "use_local_opt": True, "local_opt_rate":0.1, "adaptive":True, "adaptive_params":{"mutation_min":0.001,"mutation_max":0.5,"stagnation_window":5}},
+        "logging": {"per_gen_logging": False},
+        "industrial_sim": {"expensive_eval": False, "heavy_work": 10000}
+    }
+    problem = args.problem
+    trials = args.trials or int(cfg.get("trials", 6))
+    if args.case:
+        cases = [args.case]
+    else:
+        cases = ["baseline", "advanced"]
+    os.makedirs(args.out_dir, exist_ok=True)
+    if args.ablation:
+        ablation_summary(cfg, problem, trials, out_dir=args.out_dir)
+    else:
+        for case in cases:
+            run_trials(cfg, problem, case, trials, quick=args.quick, out_dir=args.out_dir)
+
+if __name__ == "__main__":
+    main()
