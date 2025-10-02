@@ -1,0 +1,492 @@
+1uimport numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque, defaultdict
+import math
+import time
+
+class MathPuzzleEnv:
+    def __init__(self, target_number=10, max_steps=10):
+        self.target_number = target_number
+        self.max_steps = max_steps
+        self.current_number = 0
+        self.steps = 0
+
+    def reset(self):
+        self.current_number = 0
+        self.steps = 0
+        return self.current_number
+
+    def step(self, action):
+        self.current_number += action
+        self.steps += 1
+
+        if self.is_solved():
+            reward = 20
+            done = True
+        elif self.steps >= self.max_steps:
+            reward = -10
+            done = True
+        else:
+            reward = -1
+            done = False
+
+        return self.current_number, reward, done
+
+    def is_solved(self):
+        return self.current_number == self.target_number
+
+class MultiForbiddenNumberEnv(MathPuzzleEnv):
+    def __init__(self, target_number=60, max_steps=30, forbidden_numbers=None):
+        super().__init__(target_number, max_steps)
+        self.forbidden_numbers = forbidden_numbers if forbidden_numbers is not None else [15, 30, 45]
+
+    def step(self, action):
+        self.current_number += action
+        self.steps += 1
+
+        if self.current_number in self.forbidden_numbers:
+            reward = -50  # Large penalty for hitting a forbidden number
+            done = True
+        elif self.is_solved():
+            reward = 20
+            done = True
+        elif self.steps >= self.max_steps:
+            reward = -10
+            done = True
+        else:
+            reward = -1
+            done = False
+
+        return self.current_number, reward, done
+
+class HierarchicalState:
+    """
+    Multi-scale state representation that works across different target sizes.
+    Combines local and global features for better long-term planning.
+    """
+    def __init__(self, current, target, step, max_steps, forbidden_states=None):
+        self.current = current
+        self.target = target
+        self.step = step
+        self.max_steps = max_steps
+        self.forbidden_states = forbidden_states or set()
+
+    def to_features(self):
+        """Multi-scale feature representation"""
+        if self.target == 0:
+            return np.zeros(12)
+
+        # Scale-invariant features
+        progress_ratio = self.current / self.target if self.target != 0 else 0
+        remaining_ratio = (self.target - self.current) / self.target if self.target != 0 else 0
+        time_ratio = self.step / self.max_steps
+
+        # Multi-scale gap analysis
+        gap = abs(self.target - self.current)
+        log_gap = math.log(gap + 1) / math.log(abs(self.target) + 1) if self.target != 0 else 0 # Logarithmic scale
+        gap_magnitude = gap / abs(self.target) if self.target != 0 else 0 # Relative scale
+
+        # Strategic features
+        is_close = 1.0 if gap <= 10 else 0.0  # Near-target flag
+        is_far = 1.0 if gap >= abs(self.target) * 0.5 else 0.0  # Far-target flag
+
+        # Constraint features
+        danger_proximity = self._compute_danger_proximity()
+        constraint_pressure = self._compute_constraint_pressure()
+
+        # Phase identification
+        phase = self._identify_phase()
+
+        # Efficiency features
+        theoretical_min_steps = self._compute_min_steps()
+        efficiency_ratio = theoretical_min_steps / (self.max_steps - self.step + 1) if (self.max_steps - self.step + 1) != 0 else 0
+
+        return np.array([
+            progress_ratio, remaining_ratio, time_ratio,
+            log_gap, gap_magnitude, is_close, is_far,
+            danger_proximity, constraint_pressure,
+            phase, theoretical_min_steps, efficiency_ratio
+        ])
+
+    def _compute_danger_proximity(self):
+        """Distance to nearest forbidden state"""
+        if not self.forbidden_states:
+            return 0.0
+
+        distances = [abs(self.current - forbidden) for forbidden in self.forbidden_states]
+        min_distance = min(distances) if distances else 0
+        return 1.0 / (min_distance + 1)  # Closer = higher value
+
+    def _compute_constraint_pressure(self):
+        """How constrained is the current position"""
+        if not self.forbidden_states:
+            return 0.0
+
+        # Count forbidden states in the path to target
+        if self.current < self.target:
+            path_range = range(self.current + 1, self.target + 1)
+        else:
+            path_range = range(self.target, self.current)
+
+        blocked_path_states = sum(1 for state in path_range if state in self.forbidden_states)
+        path_length = len(path_range)
+
+        return blocked_path_states / (path_length + 1) if path_length > 0 else 0.0
+
+    def _identify_phase(self):
+        """Identify problem-solving phase: exploration(0), navigation(1), precision(2)"""
+        gap = abs(self.target - self.current)
+
+        if self.target != 0 and gap > abs(self.target) * 0.7:
+            return 0.0  # Exploration phase
+        elif gap > 10:
+            return 1.0  # Navigation phase
+        else:
+            return 2.0  # Precision phase
+
+    def _compute_min_steps(self):
+        """Theoretical minimum steps to target"""
+        gap = abs(self.target - self.current)
+        # Assuming max action is 5
+        return math.ceil(gap / 5.0)
+
+class HierarchicalQNetwork(nn.Module):
+    """
+    Multi-head network that learns different strategies for different phases
+    """
+    def __init__(self, state_dim=12, action_dim=3, hidden_dim=256):
+        super().__init__()
+
+        # Shared feature extractor
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        # Phase-specific heads
+        self.exploration_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        self.navigation_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        self.precision_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        # Phase classifier
+        self.phase_classifier = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, state_features):
+        # Extract shared features
+        features = self.feature_extractor(state_features)
+
+        # Classify phase
+        phase_probs = self.phase_classifier(features)
+
+        # Compute Q-values for each phase
+        exploration_q = self.exploration_head(features)
+        navigation_q = self.navigation_head(features)
+        precision_q = self.precision_head(features)
+
+        # Weighted combination based on phase probabilities
+        q_values = (phase_probs[:, 0:1] * exploration_q +
+                   phase_probs[:, 1:2] * navigation_q +
+                   phase_probs[:, 2:3] * precision_q)
+
+        return q_values, phase_probs
+class MetaController(nn.Module):
+    def __init__(self, state_dim=12, hidden_dim=128):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),  # Output a single value representing the sub-goal
+            nn.Tanh()  # Ensure the output is between -1 and 1
+        )
+
+    def forward(self, state_features):
+        return self.network(state_features)
+
+class GoalDecompositionAgent:
+    """
+    Agent that decomposes large targets into manageable sub-goals
+    """
+    def __init__(self, actions=[1, 3, 5], lr=0.0005, meta_lr=0.0001):
+        self.actions = actions
+        self.max_action = max(actions)
+
+        # Networks
+        self.q_network = HierarchicalQNetwork(action_dim=len(actions))
+        self.target_network = HierarchicalQNetwork(action_dim=len(actions))
+        self.meta_controller = MetaController()
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.meta_optimizer = optim.Adam(self.meta_controller.parameters(), lr=meta_lr)
+
+        # Experience replay
+        self.experience_buffer = deque(maxlen=10000)
+        self.meta_experience_buffer = deque(maxlen=1000)
+
+        # Goal decomposition
+        self.subgoal_stack = []
+        self.current_subgoal = None
+
+        # Adaptive exploration
+        self.epsilon_schedule = self._create_epsilon_schedule()
+        self.step_count = 0
+
+    def _create_epsilon_schedule(self):
+        """Adaptive epsilon that increases for harder problems"""
+        def epsilon_fn(step, target_difficulty):
+            base_epsilon = 0.1
+            difficulty_bonus = min(0.2, target_difficulty / 1000)
+            decay = max(0.01, base_epsilon * (0.995 ** (step / 100)))
+            return decay + difficulty_bonus
+        return epsilon_fn
+
+    def set_subgoal(self, current, target, step, max_steps, forbidden_states=None):
+        """Use the meta-controller to set a sub-goal"""
+        state_features = self.get_state_features(current, target, step, max_steps, forbidden_states)
+        state_tensor = torch.FloatTensor(state_features).unsqueeze(0)
+        with torch.no_grad():
+            subgoal_offset = self.meta_controller(state_tensor).item()
+
+        # The meta-controller outputs a value between -1 and 1, which we scale to a reasonable offset
+        subgoal = current + int(subgoal_offset * (target - current))
+        return subgoal
+
+    def get_state_features(self, current, target, step, max_steps, forbidden_states=None):
+        """Enhanced state representation"""
+        hierarchical_state = HierarchicalState(current, target, step, max_steps, forbidden_states)
+        return hierarchical_state.to_features()
+
+    def choose_action(self, current, target, step, max_steps, forbidden_states=None, training=True):
+        """Choose action with hierarchical reasoning"""
+        # Update current subgoal if needed
+        if self.current_subgoal is None or current == self.current_subgoal:
+            self.current_subgoal = self.set_subgoal(current, target, step, max_steps, forbidden_states)
+            print(f"New subgoal set: {self.current_subgoal}")
+
+
+        # Use current subgoal for decision making
+        working_target = self.current_subgoal if self.current_subgoal else target
+
+        # Adaptive exploration
+        difficulty = abs(target - current)
+        epsilon = self.epsilon_schedule(self.step_count, difficulty)
+
+        if training and random.random() < epsilon:
+            return random.choice(self.actions)
+
+        # Neural network decision
+        state_features = self.get_state_features(current, working_target, step, max_steps, forbidden_states)
+        state_tensor = torch.FloatTensor(state_features).unsqueeze(0)
+
+        with torch.no_grad():
+            q_values, phase_probs = self.q_network(state_tensor)
+
+        # Constraint checking
+        valid_actions = []
+        for i, action in enumerate(self.actions):
+            next_state = current + action
+            if forbidden_states and next_state in forbidden_states:
+                continue  # Skip forbidden states
+            valid_actions.append((i, action))
+
+        if not valid_actions:
+            # Emergency backtracking
+            return -self.actions[0] if -self.actions[0] in self.actions else self.actions[0]
+
+        # Choose best valid action
+        best_idx = -1
+        best_value = float('-inf')
+
+        for idx, action in valid_actions:
+            if q_values[0, idx] > best_value:
+                best_value = q_values[0, idx]
+                best_idx = idx
+        if best_idx == -1:
+            return random.choice(self.actions)
+        return self.actions[best_idx]
+
+
+    def store_experience(self, current, target, step, max_steps, action, reward,
+                        next_current, next_step, done, forbidden_states=None):
+        """Store experience with enhanced state representation"""
+        experience = {
+            'state': self.get_state_features(current, target, step, max_steps, forbidden_states),
+            'action': self.actions.index(action) if action in self.actions else 0,
+            'reward': reward,
+            'next_state': self.get_state_features(next_current, target, next_step, max_steps, forbidden_states),
+            'done': done
+        }
+        self.experience_buffer.append(experience)
+
+        if done and reward > 0: # We only store positive experiences for the meta-controller
+            meta_experience = {
+                'state': self.get_state_features(0, target, 0, max_steps, forbidden_states),
+                'reward': reward,
+            }
+            self.meta_experience_buffer.append(meta_experience)
+
+
+    def learn_from_experience(self, batch_size=64):
+        """Enhanced learning with prioritized experience replay"""
+        if len(self.experience_buffer) < batch_size:
+            return
+
+        # Sample batch
+        batch = random.sample(self.experience_buffer, batch_size)
+
+        states = torch.FloatTensor([exp['state'] for exp in batch])
+        actions = torch.LongTensor([exp['action'] for exp in batch])
+        rewards = torch.FloatTensor([exp['reward'] for exp in batch])
+        next_states = torch.FloatTensor([exp['next_state'] for exp in batch])
+        dones = torch.BoolTensor([exp['done'] for exp in batch])
+
+        # Current Q-values
+        current_q_values, _ = self.q_network(states)
+        current_q_values = current_q_values.gather(1, actions.unsqueeze(1))
+
+        # Next Q-values from target network
+        with torch.no_grad():
+            next_q_values, _ = self.target_network(next_states)
+            next_q_values = next_q_values.max(1)[0]
+            target_q_values = rewards + (0.99 * next_q_values * ~dones)
+
+        # Loss computation
+        loss = nn.SmoothL1Loss()(current_q_values.squeeze(), target_q_values)
+
+        # Optimization
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def learn_meta_controller(self, batch_size=32):
+        if len(self.meta_experience_buffer) < batch_size:
+            return
+
+        batch = random.sample(self.meta_experience_buffer, batch_size)
+
+        for experience in batch:
+            state_features = torch.FloatTensor(experience['state']).unsqueeze(0)
+            reward = experience['reward']
+
+            subgoal_offset = self.meta_controller(state_features)
+
+            # We want to maximize the reward, so we use a simple reward maximization loss
+            loss = -subgoal_offset * reward
+
+            self.meta_optimizer.zero_grad()
+            loss.backward()
+            self.meta_optimizer.step()
+
+def train_and_test_agent(agent, episodes=5000, batch_size=64):
+    """
+    Trains and tests the GoalDecompositionAgent.
+    """
+    start_time = time.time()
+
+    # --- Training Phase ---
+    print("--- Starting Training ---")
+    for episode in range(episodes):
+        target_number = random.randint(50, 200)
+        max_steps = 100
+        forbidden_numbers = {random.randint(20, 80) for _ in range(3)}
+
+        env = MultiForbiddenNumberEnv(target_number=target_number, max_steps=max_steps, forbidden_numbers=forbidden_numbers)
+        current_number = env.reset()
+
+        agent.subgoal_stack = []
+        agent.current_subgoal = None
+
+        done = False
+        step = 0
+
+        while not done:
+            action = agent.choose_action(current_number, target_number, step, max_steps, forbidden_numbers, training=True)
+            next_number, reward, done = env.step(action)
+
+            agent.store_experience(current_number, target_number, step, max_steps, action, reward,
+                                   next_number, step + 1, done, forbidden_numbers)
+
+            current_number = next_number
+            step += 1
+
+            if len(agent.experience_buffer) > batch_size:
+                agent.learn_from_experience(batch_size)
+                agent.learn_meta_controller()
+
+        # Update target network
+        if episode % 10 == 0:
+            agent.target_network.load_state_dict(agent.q_network.state_dict())
+
+        if (episode + 1) % 500 == 0:
+            print(f"Episode {episode + 1}/{episodes} completed.")
+            if agent.current_subgoal is not None:
+                print(f"Current subgoal: {agent.current_subgoal}")
+
+
+    training_time = time.time() - start_time
+    print(f"--- Training Finished in {training_time:.2f} seconds ---")
+
+    # --- Testing Phase ---
+    print("\n--- Starting Testing ---")
+    test_targets = [123, 278, 431]
+
+    for target in test_targets:
+        max_steps = 200
+        forbidden_numbers = {random.randint(50, 200) for _ in range(5)}
+
+        print(f"\nTesting with target: {target}, forbidden: {sorted(list(forbidden_numbers))}")
+
+        current_number = 0
+        agent.subgoal_stack = []
+        agent.current_subgoal = None
+
+        path = [current_number]
+
+        done = False
+        step = 0
+
+        while not done and step < max_steps:
+            action = agent.choose_action(current_number, target, step, max_steps, forbidden_numbers, training=False)
+
+            # Simple environment step for testing
+            current_number += action
+            path.append(current_number)
+
+            if current_number == target:
+                done = True
+
+            step += 1
+
+        if done:
+            print(f"Success! Solved in {step} steps.")
+            print(f"Path: {path}")
+        else:
+            print(f"Failure. Could not solve in {max_steps} steps.")
+            print(f"Final path: {path}")
+
+hierarchical_agent = GoalDecompositionAgent(actions=[1, 5, 10, -2, -7])
+train_and_test_agent(hierarchical_agent)

@@ -1,0 +1,211 @@
+""" Polaris_Full_Pipeline.py (inline copy)
+
+Consolidated script for:
+
+Relational graph env
+
+GAT encoder + SB3 feature extractor
+
+simple Pareto-like GA seeds generator
+
+PPO training helper
+
+demo CLI for Colab or local execution
+
+
+Usage examples (in Colab):
+
+1. Upload this file and run: !python Polaris_Full_Pipeline.py --demo
+
+
+2. Or train briefly: !python Polaris_Full_Pipeline.py --train --timesteps 20000
+
+
+
+Note: Requires: torch, numpy, gym, stable-baselines3, scikit-learn, matplotlib, networkx Optional: astropy, astroquery for Gaia fetching """ import os, sys, argparse, random, math, time from dataclasses import dataclass, field from typing import Dict, Tuple, List, Any import numpy as np import torch, torch.nn as nn, torch.nn.functional as F import gym from gym import spaces from stable_baselines3 import PPO from stable_baselines3.common.vec_env import DummyVecEnv from stable_baselines3.common.evaluation import evaluate_policy from sklearn.manifold import TSNE import matplotlib.pyplot as plt
+
+------------------ RelationalGraphState ------------------
+
+@dataclass class RelationalGraphState: nodes: Dict[str, np.ndarray] = field(default_factory=dict) edges: Dict[Tuple[str,str], np.ndarray] = field(default_factory=dict)
+
+def add_node(self, label: str, feat: np.ndarray):
+    self.nodes[label] = np.array(feat, dtype=float)
+
+def add_edge(self, u: str, v: str, feat: np.ndarray = None):
+    if feat is None:
+        feat = np.array([1.0], dtype=float)
+    self.edges[(u,v)] = np.array(feat, dtype=float)
+
+def node_feature_matrix(self, node_order: List[str] = None) -> np.ndarray:
+    if node_order is None:
+        node_order = list(self.nodes.keys())
+    return np.vstack([self.nodes[n] for n in node_order])
+
+def adj_matrix(self, node_order: List[str] = None) -> np.ndarray:
+    if node_order is None:
+        node_order = list(self.nodes.keys())
+    idx = {n:i for i,n in enumerate(node_order)}
+    N = len(node_order)
+    A = np.zeros((N,N), dtype=float)
+    for (u,v) in self.edges.keys():
+        if u in idx and v in idx:
+            A[idx[u], idx[v]] = 1.0
+    return A
+
+------------------ Gym env ------------------
+
+class RelationalGymEnvDict(gym.Env): metadata = {'render.modes': []} def init(self, base_state: RelationalGraphState, node_order: List[str]=None, manager_interval:int=4, max_steps:int=100): super().init() self.base_state = base_state self.node_order = node_order if node_order is not None else list(base_state.nodes.keys()) self.N = len(self.node_order) self.node_feat_dim = next(iter(base_state.nodes.values())).shape[0] self.manager_interval = manager_interval self.max_steps = max_steps self.step_count = 0
+
+self.observation_space = spaces.Dict({
+        'node_features': spaces.Box(low=0.0, high=1.0, shape=(self.N, self.node_feat_dim), dtype=np.float32),
+        'adj': spaces.Box(low=0.0, high=1.0, shape=(self.N, self.N), dtype=np.float32)
+    })
+    self.action_dim = 2 * self.N * self.node_feat_dim
+    self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float32)
+    self.reset()
+
+def reset(self):
+    self.state = RelationalGraphState(nodes={k: v.copy() for k,v in self.base_state.nodes.items()},
+                                      edges={k: v.copy() for k,v in self.base_state.edges.items()})
+    self.step_count = 0
+    return self._get_obs()
+
+def _get_obs(self):
+    return {'node_features': self.state.node_feature_matrix(self.node_order).astype(np.float32),
+            'adj': self.state.adj_matrix(self.node_order).astype(np.float32)}
+
+def step(self, action: np.ndarray):
+    self.step_count += 1
+    act = np.asarray(action, dtype=float).reshape(-1)
+    if act.shape[0] != self.action_dim:
+        raise ValueError('Action dim mismatch')
+    half = self.action_dim // 2
+    mg = act[:half].reshape((self.N, self.node_feat_dim))
+    wk = act[half:].reshape((self.N, self.node_feat_dim))
+
+    # manager application: every manager_interval steps
+    if self.step_count % self.manager_interval == 1:
+        delta_m = np.clip(mg, -1.0, 1.0) * 0.08
+        for i,n in enumerate(self.node_order):
+            self.state.nodes[n] = np.clip(self.state.nodes[n] + delta_m[i], 0.0, 1.0)
+    # worker always applied
+    delta_w = np.clip(wk, -1.0, 1.0) * 0.03
+    for i,n in enumerate(self.node_order):
+        self.state.nodes[n] = np.clip(self.state.nodes[n] + delta_w[i], 0.0, 1.0)
+
+    obs = self._get_obs()
+    reward = self._compute_reward()
+    done = (self.step_count >= self.max_steps)
+    info = {'step': self.step_count, 'profile': {n:self.state.nodes[n].tolist() for n in self.node_order}}
+    return obs, float(reward), bool(done), info
+
+def _compute_reward(self):
+    arr = self.state.node_feature_matrix(self.node_order)
+    mean_all = float(arr.mean())
+    bonus = 0.0
+    if 'scientific_rigor' in self.node_order:
+        bonus += arr[self.node_order.index('scientific_rigor')].mean()*0.2
+    if 'wisdom' in self.node_order:
+        bonus += arr[self.node_order.index('wisdom')].mean()*0.2
+    return mean_all + bonus
+
+------------------ GAT Encoder ------------------
+
+class GATLayer(nn.Module): def init(self, in_dim:int, out_dim:int, edge_feat_dim:int=0): super().init() self.W = nn.Linear(in_dim, out_dim, bias=False) self.a_src = nn.Linear(out_dim, 1, bias=False) self.a_dst = nn.Linear(out_dim, 1, bias=False) self.a_edge = nn.Linear(edge_feat_dim,1,bias=False) if edge_feat_dim>0 else None self.leakyrelu = nn.LeakyReLU(0.2)
+
+def forward(self, h: torch.Tensor, adj: torch.Tensor, edge_feats: torch.Tensor=None):
+    Wh = self.W(h)
+    src = self.a_src(Wh)
+    dst = self.a_dst(Wh)
+    e = src + dst.t()
+    if self.a_edge is not None and edge_feats is not None:
+        e = e + self.a_edge(edge_feats).squeeze(-1)
+    e = self.leakyrelu(e)
+    neg_inf = -9e15
+    e = torch.where(adj>0, e, torch.full_like(e, neg_inf))
+    alpha = torch.softmax(e, dim=1)
+    h_prime = torch.matmul(alpha, Wh)
+    return torch.nn.functional.elu(h_prime)
+
+class SimpleGATEncoder(nn.Module): def init(self, node_feat_dim:int, hidden_dim:int=64, n_layers:int=2, edge_feat_dim:int=0): super().init() layers = [] for i in range(n_layers): in_d = node_feat_dim if i==0 else hidden_dim layers.append(GATLayer(in_d, hidden_dim, edge_feat_dim=edge_feat_dim)) self.layers = nn.ModuleList(layers)
+
+def forward(self, node_feats: torch.Tensor, adj: torch.Tensor, edge_feats: torch.Tensor=None):
+    h = node_feats
+    for layer in self.layers:
+        h = layer(h, adj, edge_feats)
+    return h
+
+------------------ Graph Feature Extractor for SB3 ------------------
+
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor class GraphFeaturesExtractor(BaseFeaturesExtractor): def init(self, observation_space: gym.spaces.Dict, gat_hidden:int=64, n_layers:int=2): node_shape = observation_space.spaces['node_features'].shape N = node_shape[0] node_feat_dim = node_shape[1] super().init(observation_space, features_dim=N*gat_hidden) self.gat = SimpleGATEncoder(node_feat_dim, hidden_dim=gat_hidden, n_layers=n_layers) self.gat_hidden = gat_hidden
+
+def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
+    node_feats = observations['node_features']
+    adj = observations['adj']
+    batch_size = node_feats.shape[0]
+    outs = []
+    for b in range(batch_size):
+        nf = node_feats[b]
+        a = adj[b]
+        emb = self.gat(nf, a)
+        outs.append(emb.flatten())
+    return torch.stack(outs, dim=0)
+
+------------------ Simple Pareto-like GA (diversity seeds) ------------------
+
+import numpy as np
+
+def pareto_front(pop_objs): pop = np.array(pop_objs) n = pop.shape[0] is_pareto = np.ones(n, dtype=bool) for i in range(n): for j in range(n): if i==j: continue if np.all(pop[j] <= pop[i]) and np.any(pop[j] < pop[i]): is_pareto[i] = False break return np.where(is_pareto)[0]
+
+def generate_diverse_profiles(n_profiles:int=40): profiles = [] labels = ['wisdom','justice','education','communal_harmony','material_wellbeing','scientific_rigor','sustainability'] for _ in range(n_profiles): vec = np.random.rand(len(labels)) vec = vec / vec.sum() prof = {labels[i]: float(vec[i]) for i in range(len(labels))} profiles.append(prof) return profiles
+
+def evaluate_profile_objectives(profile: Dict[str,float]): return (-profile['scientific_rigor'], -profile['justice'])
+
+------------------ Training & evaluation helpers ------------------
+
+from stable_baselines3.common.evaluation import evaluate_policy
+
+def build_sample_state_from_profile(profile: Dict[str,float]): labels = ['wisdom','justice','education','communal_harmony','material_wellbeing','scientific_rigor','sustainability'] st = RelationalGraphState() for lab in labels: val = profile.get(lab, 0.1) st.add_node(lab, np.array([val, max(0.01, 1.0-val)*0.1, 1.0 if val>0.2 else 0.0, 0.0])) for i in range(len(labels)): for j in range(i+1, len(labels)): if random.random() < 0.35: st.add_edge(labels[i], labels[j]); st.add_edge(labels[j], labels[i]) return st
+
+def train_with_seeds(env_creator, seed_profiles: List[Dict[str,float]], total_timesteps:int=20000, chunk:int=2000, eval_episodes:int=5, save_path:str='./models'): os.makedirs(save_path, exist_ok=True) models = [] history = [] for idx, prof in enumerate(seed_profiles): print(f'-- Training seed {idx+1}/{len(seed_profiles)} --') st = build_sample_state_from_profile(prof) env = env_creator(st) vec_env = DummyVecEnv([lambda: env]) policy_kwargs = dict(features_extractor_class=GraphFeaturesExtractor, features_extractor_kwargs=dict(gat_hidden=64, n_layers=2), net_arch=[dict(pi=[256,128], vf=[256,128])]) model = PPO('MlpPolicy', vec_env, verbose=0, policy_kwargs=policy_kwargs) steps = 0; perf = [] while steps < total_timesteps: model.learn(total_timesteps=chunk) steps += chunk mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=eval_episodes, deterministic=True) print(f'  steps {steps}/{total_timesteps} - eval mean {mean_reward:.3f}') perf.append(mean_reward) model_file = os.path.join(save_path, f'ppo_seed_{idx}.zip') model.save(model_file) models.append(model_file) history.append(perf) np.save(os.path.join(save_path, 'training_history.npy'), np.array(history, dtype=object)) print('Training complete. Models and history saved to', save_path) return models, history
+
+------------------ Visualization helpers ------------------
+
+from sklearn.manifold import TSNE
+
+def plot_training_history(history): plt.figure(figsize=(8,5)) for i,h in enumerate(history): plt.plot(h, label=f'seed_{i}') plt.xlabel('Evaluation step'); plt.ylabel('Mean reward'); plt.legend(); plt.grid(True); plt.show()
+
+def compute_and_plot_embeddings(state: RelationalGraphState, gat: SimpleGATEncoder): node_order = list(state.nodes.keys()) nf = torch.tensor(state.node_feature_matrix(node_order), dtype=torch.float32) adj = torch.tensor(state.adj_matrix(node_order), dtype=torch.float32) with torch.no_grad(): emb = gat(nf, adj).numpy() tsne = TSNE(n_components=2, random_state=0) emb2 = tsne.fit_transform(emb) plt.figure(figsize=(6,6)) for i,lab in enumerate(node_order): x,y = emb2[i]; plt.scatter(x,y); plt.text(x+0.3, y+0.3, lab) plt.title('Node embeddings (t-SNE)'); plt.show()
+
+------------------ CLI / demo ------------------
+
+def main(argv): parser = argparse.ArgumentParser() parser.add_argument('--demo', action='store_true') parser.add_argument('--train', action='store_true') parser.add_argument('--timesteps', type=int, default=20000) args = parser.parse_args(argv)
+
+if args.demo:
+    profiles = generate_diverse_profiles(12)
+    objs = [evaluate_profile_objectives(p) for p in profiles]
+    pi = pareto_front(objs)
+    seeds = [profiles[i] for i in pi[:4]]
+    print('Using seeds:', seeds)
+    env_creator = lambda st: RelationalGymEnvDict(st, max_steps=80)
+    models, history = train_with_seeds(env_creator, seeds, total_timesteps=min(4000,args.timesteps), chunk=1000, eval_episodes=2, save_path='./demo_models')
+    plot_training_history(history)
+    # embeddings
+    st = build_sample_state_from_profile(seeds[0])
+    gat = SimpleGATEncoder(node_feat_dim=4, hidden_dim=64, n_layers=2)
+    compute_and_plot_embeddings(st, gat)
+    print('Demo complete. Models saved to ./demo_models')
+elif args.train:
+    profiles = generate_diverse_profiles(24)
+    objs = [evaluate_profile_objectives(p) for p in profiles]
+    pi = pareto_front(objs)
+    seeds = [profiles[i] for i in pi[:6]]
+    env_creator = lambda st: RelationalGymEnvDict(st, max_steps=100)
+    models, history = train_with_seeds(env_creator, seeds, total_timesteps=args.timesteps, chunk=2000, eval_episodes=3, save_path='./polaris_models')
+    plot_training_history(history)
+    print('Training complete.')
+else:
+    print('No action. Use --demo or --train.')
+
+if name == 'main': main(sys.argv[1:])
+

@@ -1,0 +1,459 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import math
+import time
+from collections import deque, namedtuple
+from typing import List, Tuple, Optional, Dict, Any
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+
+# Experience tuple for replay buffer
+Experience = namedtuple('Experience', ['state_features', 'action', 'reward', 'next_state_features', 'done'])
+
+class HierarchicalState:
+    """Enhanced relational state representation with caching and validation."""
+
+    def __init__(self, current: float, target: float, step: int,
+                 max_steps: int, forbidden_states: Optional[set] = None):
+        self.current = current
+        self.target = target
+        self.step = step
+        self.max_steps = max_steps
+        self.forbidden_states = forbidden_states or set()
+        self._cached_features = None
+
+    def to_features(self) -> np.ndarray:
+        """Convert to 12-dimensional relational feature vector with caching."""
+        if self._cached_features is not None:
+            return self._cached_features
+
+        if self.target == 0:
+            self._cached_features = np.zeros(12)
+            return self._cached_features
+
+        # Core relational features
+        progress_ratio = self.current / self.target
+        remaining_ratio = (self.target - self.current) / self.target
+        time_ratio = self.step / self.max_steps
+
+        # Multi-scale gap analysis
+        gap = abs(self.target - self.current)
+        log_gap = math.log(gap + 1) / math.log(self.target + 1)
+        gap_magnitude = gap / self.target
+
+        # Strategic phase indicators
+        is_close = 1.0 if gap <= 10 else 0.0
+        is_far = 1.0 if gap >= self.target * 0.5 else 0.0
+
+        # Constraint awareness
+        danger_proximity = self._compute_danger_proximity()
+        constraint_pressure = self._compute_constraint_pressure()
+
+        # Problem phase and efficiency
+        phase = self._identify_phase()
+        theoretical_min_steps = math.ceil(gap / 5.0)  # Assuming max action is 5
+        efficiency_ratio = theoretical_min_steps / (self.max_steps - self.step + 1)
+
+        self._cached_features = np.array([
+            progress_ratio, remaining_ratio, time_ratio,
+            log_gap, gap_magnitude, is_close, is_far,
+            danger_proximity, constraint_pressure,
+            phase, theoretical_min_steps, efficiency_ratio
+        ], dtype=np.float32)
+
+        return self._cached_features
+
+    def _compute_danger_proximity(self) -> float:
+        """Calculate normalized proximity to nearest forbidden state."""
+        if not self.forbidden_states:
+            return 0.0
+
+        distances = [abs(self.current - forbidden) for forbidden in self.forbidden_states]
+        min_distance = min(distances)
+        return 1.0 / (min_distance + 1)
+
+    def _compute_constraint_pressure(self) -> float:
+        """Calculate fraction of direct path that is blocked."""
+        if not self.forbidden_states:
+            return 0.0
+
+        start = min(self.current, self.target)
+        end = max(self.current, self.target)
+        path_states = set(range(int(start) + 1, int(end) + 1))
+
+        if not path_states:
+            return 0.0
+
+        blocked_states = path_states.intersection(self.forbidden_states)
+        return len(blocked_states) / len(path_states)
+
+    def _identify_phase(self) -> float:
+        """Identify current problem-solving phase."""
+        gap = abs(self.target - self.current)
+
+        if gap > self.target * 0.7:
+            return 0.0  # Exploration phase
+        elif gap > 10:
+            return 1.0  # Navigation phase
+        else:
+            return 2.0  # Precision phase
+
+
+class HierarchicalQNetwork(nn.Module):
+    """Phase-adaptive neural network with improved architecture."""
+
+    def __init__(self, state_dim: int = 12, action_dim: int = 6, hidden_dim: int = 256):
+        super().__init__()
+
+        # Enhanced shared feature extractor with batch normalization
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+        # Phase-specific strategy heads
+        self.exploration_head = self._build_head(hidden_dim, action_dim)
+        self.navigation_head = self._build_head(hidden_dim, action_dim)
+        self.precision_head = self._build_head(hidden_dim, action_dim)
+
+        # Enhanced phase classifier
+        self.phase_classifier = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 3),
+            nn.Softmax(dim=-1)
+        )
+
+    def _build_head(self, input_dim: int, output_dim: int) -> nn.Module:
+        """Build specialized strategy head with residual connection."""
+        return nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(input_dim // 2, output_dim)
+        )
+
+    def forward(self, state_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with phase-adaptive strategy blending."""
+        # Handle single sample (add batch dimension)
+        if len(state_features.shape) == 1:
+            state_features = state_features.unsqueeze(0)
+
+        # Extract shared features
+        shared_features = self.feature_extractor(state_features)
+
+        # Classify current phase
+        phase_probs = self.phase_classifier(shared_features)
+
+        # Compute phase-specific Q-values
+        exploration_q = self.exploration_head(shared_features)
+        navigation_q = self.navigation_head(shared_features)
+        precision_q = self.precision_head(shared_features)
+
+        # Adaptive strategy blending
+        blended_q = (phase_probs[:, 0:1] * exploration_q +
+                    phase_probs[:, 1:2] * navigation_q +
+                    phase_probs[:, 2:3] * precision_q)
+
+        return blended_q, phase_probs
+
+
+class AdaptiveGoalDecomposer:
+    """Enhanced goal decomposition with dynamic spacing."""
+
+    @staticmethod
+    def decompose_target(current: float, target: float,
+                        forbidden_states: Optional[set] = None,
+                        max_subgoals: int = 8) -> List[float]:
+        """
+        Intelligently decompose target with adaptive subgoal spacing.
+        """
+        gap = abs(target - current)
+        forbidden_states = forbidden_states or set()
+
+        # Small problems: direct approach
+        if gap <= 50:
+            return [target]
+
+        # Calculate optimal number of subgoals
+        # Rule: Balance between manageability (~75 units) and complexity
+        optimal_subgoals = min(max_subgoals, max(2, int(gap // 75)))
+
+        # Adjust for constraint density
+        if forbidden_states:
+            constraint_density = len(forbidden_states) / gap
+            if constraint_density > 0.1:  # High constraint density
+                optimal_subgoals = min(max_subgoals, optimal_subgoals + 2)
+
+        # Generate subgoals
+        direction = 1 if target > current else -1
+        step_size = gap / optimal_subgoals
+
+        subgoals = []
+        for i in range(1, optimal_subgoals):
+            subgoal = current + (step_size * i * direction)
+            # Adjust to avoid forbidden states
+            adjusted_subgoal = AdaptiveGoalDecomposer._avoid_forbidden(
+                subgoal, forbidden_states, direction
+            )
+            subgoals.append(adjusted_subgoal)
+
+        subgoals.append(target)
+        return subgoals
+
+    @staticmethod
+    def _avoid_forbidden(subgoal: float, forbidden_states: set, direction: int) -> float:
+        """Smart subgoal adjustment to avoid forbidden states."""
+        if not forbidden_states or subgoal not in forbidden_states:
+            return subgoal
+
+        # Try progressive adjustments
+        for offset in [1, 2, 3, -1, -2, -3]:
+            candidate = subgoal + offset
+            if candidate not in forbidden_states:
+                return candidate
+
+        # If no good alternative, use original (will be handled in action selection)
+        return subgoal
+
+
+class PrioritizedReplayBuffer:
+    """Enhanced experience replay with prioritization."""
+
+    def __init__(self, capacity: int = 10000, alpha: float = 0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = []
+        self.priorities = np.zeros(capacity)
+        self.position = 0
+        self.max_priority = 1.0
+
+    def push(self, experience: Experience, td_error: float = None):
+        """Add experience with priority based on TD error."""
+        priority = self.max_priority if td_error is None else abs(td_error) + 1e-6
+
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(experience)
+        else:
+            self.buffer[self.position] = experience
+
+        self.priorities[self.position] = priority ** self.alpha
+        self.max_priority = max(self.max_priority, priority)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size: int, beta: float = 0.4):
+        """Sample experiences with importance sampling weights."""
+        if len(self.buffer) < batch_size:
+            return None, None, None
+
+        # Calculate sampling probabilities
+        priorities = self.priorities[:len(self.buffer)]
+        probs = priorities / priorities.sum()
+
+        # Sample indices
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+
+        # Get experiences
+        experiences = [self.buffer[idx] for idx in indices]
+
+        # Calculate importance sampling weights
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights /= weights.max()  # Normalize
+
+        return experiences, indices, weights
+
+    def update_priorities(self, indices: List[int], td_errors: List[float]):
+        """Update priorities based on new TD errors."""
+        for idx, td_error in zip(indices, td_errors):
+            priority = abs(td_error) + 1e-6
+            self.priorities[idx] = priority ** self.alpha
+            self.max_priority = max(self.max_priority, priority)
+
+
+class HierarchicalRelationalAgent:
+    """Complete HRRL agent with all enhancements."""
+
+    def __init__(self, actions: List[float] = [1, 3, 5, -1, -2, -3],
+                 learning_rate: float = 0.0005,
+                 use_prioritized_replay: bool = True):
+        self.actions = actions
+        self.max_action = max(actions)
+
+        # Neural networks
+        self.q_network = HierarchicalQNetwork(action_dim=len(actions))
+        self.target_network = HierarchicalQNetwork(action_dim=len(actions))
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
+
+        # Experience replay
+        if use_prioritized_replay:
+            self.replay_buffer = PrioritizedReplayBuffer()
+        else:
+            self.replay_buffer = deque(maxlen=10000)
+        self.use_prioritized_replay = use_prioritized_replay
+
+        # Training state
+        self.step_count = 0
+        self.episode_count = 0
+
+        # Subgoal management
+        self.subgoal_stack = []
+        self.current_subgoal = None
+        self.completed_subgoals = []
+
+        # Exploration strategy
+        self.exploration_strategy = EnhancedExplorationStrategy()
+
+    def choose_action(self, current: float, target: float, step: int,
+                    max_steps: int, forbidden_states: set) -> float:
+        """Choose action using a blend of exploration and exploitation."""
+
+        # Determine if we should explore
+        should_explore, _ = self.exploration_strategy.should_explore(
+            current, target, step, forbidden_states, []
+        )
+
+        if should_explore:
+            return self.exploration_strategy.select_exploration_action(
+                current, target, forbidden_states, self.actions
+            )
+
+        # Exploitation: use the Q-network
+        state_features = HierarchicalState(current, target, step, max_steps, forbidden_states).to_features()
+        state_tensor = torch.FloatTensor(state_features)
+
+        with torch.no_grad():
+            q_values, _ = self.q_network(state_tensor)
+
+        # Choose best valid action
+        best_action = None
+        max_q = float('-inf')
+
+        for i, action in enumerate(self.actions):
+            if current + action not in forbidden_states:
+                if q_values[0, i] > max_q:
+                    max_q = q_values[0, i]
+                    best_action = action
+
+        return best_action if best_action is not None else random.choice(self.actions)
+
+    def learn(self, batch_size: int, beta: float = 0.4):
+        """Learn from a batch of experiences."""
+        if self.use_prioritized_replay:
+            experiences, indices, weights = self.replay_buffer.sample(batch_size, beta)
+            if experiences is None:
+                return
+        else:
+            if len(self.replay_buffer) < batch_size:
+                return
+            experiences = random.sample(self.replay_buffer, batch_size)
+            weights = torch.ones(batch_size)
+
+        # Unpack experiences
+        states = torch.FloatTensor(np.array([e.state_features for e in experiences]))
+        actions = torch.LongTensor([self.actions.index(e.action) if e.action in self.actions else 0 for e in experiences])
+        rewards = torch.FloatTensor([e.reward for e in experiences])
+        next_states = torch.FloatTensor(np.array([e.next_state_features for e in experiences]))
+        dones = torch.BoolTensor([e.done for e in experiences])
+        weights = torch.FloatTensor(weights)
+
+        # Current Q-values
+        current_q_values, _ = self.q_network(states)
+        current_q_values = current_q_values.gather(1, actions.unsqueeze(1))
+
+        # Next Q-values from target network
+        with torch.no_grad():
+            next_q_values, _ = self.target_network(next_states)
+            next_q_values = next_q_values.max(1)[0]
+            target_q_values = rewards + (0.99 * next_q_values * ~dones)
+
+        # Compute TD errors and loss
+        td_errors = (target_q_values - current_q_values.squeeze()).detach().numpy()
+        loss = (weights * F.smooth_l1_loss(current_q_values.squeeze(), target_q_values, reduction='none')).mean()
+
+        # Optimization
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Update priorities in PER
+        if self.use_prioritized_replay:
+            self.replay_buffer.update_priorities(indices, td_errors)
+
+    def update_target_network(self):
+        """Update target network with weights from main network."""
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+def train_agent(agent: HierarchicalRelationalAgent, episodes: int = 2000,
+                target_range: Tuple[int, int] = (50, 500),
+                max_steps_per_episode: int = 300):
+    """Main training loop for the HRRL agent."""
+
+    start_time = time.time()
+
+    for episode in range(episodes):
+        target = random.randint(*target_range)
+        forbidden_states = {random.randint(20, target - 10) for _ in range(random.randint(5, 15))}
+
+        current_pos = 0
+
+        for step in range(max_steps_per_episode):
+            # Choose action
+            action = agent.choose_action(current_pos, target, step, max_steps_per_episode, forbidden_states)
+
+            # Environment step
+            next_pos = current_pos + action
+            done = next_pos >= target
+            reward = 20 if done else -1
+
+            # Store experience
+            state_features = HierarchicalState(current_pos, target, step, max_steps_per_episode, forbidden_states).to_features()
+            next_state_features = HierarchicalState(next_pos, target, step + 1, max_steps_per_episode, forbidden_states).to_features()
+
+            experience = Experience(state_features, action, reward, next_state_features, done)
+
+            if agent.use_prioritized_replay:
+                 # Calculate initial TD error for PER
+                 with torch.no_grad():
+                     state_tensor = torch.FloatTensor(state_features).unsqueeze(0)
+                     next_state_tensor = torch.FloatTensor(next_state_features).unsqueeze(0)
+
+                     current_q, _ = agent.q_network(state_tensor)
+                     next_q, _ = agent.target_network(next_state_tensor)
+
+                     target_q = reward + 0.99 * next_q.max() * (1-done)
+                     td_error = (target_q - current_q.max()).item()
+
+                 agent.replay_buffer.push(experience, td_error)
+            else:
+                agent.replay_buffer.append(experience)
+
+
+            # Learn from experience
+            agent.learn(batch_size=64)
+
+            current_pos = next_pos
+            if done:
+                break
+
+        # Update target network periodically
+        if (episode + 1) % 10 == 0:
+            agent.update_target_network()
+
+        if (episode + 1) % 100 == 0:
+            print(f"Episode {episode + 1}/{episodes} completed.")
+
+    print(f"Training finished in {time.time() - start_time:.2f} seconds.")
+
+# Instantiate and train the agent
+hrrl_agent = HierarchicalRelationalAgent()
+train_agent(hrrl_agent)

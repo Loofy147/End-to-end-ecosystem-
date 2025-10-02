@@ -1,0 +1,469 @@
+import numpy as np
+import torch
+import gymnasium as gym
+from gymnasium.vector import VectorEnv, SubprocVecEnv, AsyncVectorEnv
+from typing import Dict, Any, List, Tuple, Optional, Union
+from abc import ABC, abstractmethod
+from collections import deque, defaultdict
+import json
+import yaml
+from pathlib import Path
+import time
+
+# =============================================================================
+# 1. Logger System with TensorBoard & W&B Integration
+# =============================================================================
+class RLLogger:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.use_tensorboard = config.get('use_tensorboard', False)
+        self.use_wandb = config.get('use_wandb', False)
+        self.metrics_buffer = defaultdict(list)
+        
+        if self.use_tensorboard:
+            from torch.utils.tensorboard import SummaryWriter
+            self.tb_writer = SummaryWriter(log_dir=config.get('tb_logdir', './logs'))
+        
+        if self.use_wandb:
+            import wandb
+            wandb.init(project=config.get('wandb_project', 'rl_experiments'), 
+                      config=config, name=config.get('exp_name', None))
+    
+    def log_metrics(self, metrics: Dict[str, float], step: int):
+        for key, value in metrics.items():
+            self.metrics_buffer[key].append(value)
+            
+            if self.use_tensorboard:
+                self.tb_writer.add_scalar(key, value, step)
+            
+            if self.use_wandb:
+                import wandb
+                wandb.log({key: value, 'step': step})
+    
+    def get_moving_average(self, key: str, window: int = 100) -> float:
+        if key in self.metrics_buffer and len(self.metrics_buffer[key]) > 0:
+            recent_values = self.metrics_buffer[key][-window:]
+            return np.mean(recent_values)
+        return 0.0
+
+# =============================================================================
+# 2. Replay Buffer Interface & Implementations
+# =============================================================================
+class ReplayBuffer(ABC):
+    @abstractmethod
+    def add(self, state, action, reward, next_state, done):
+        pass
+    
+    @abstractmethod
+    def sample(self, batch_size: int):
+        pass
+    
+    @abstractmethod
+    def __len__(self):
+        pass
+
+class UniformReplayBuffer(ReplayBuffer):
+    def __init__(self, capacity: int):
+        self.buffer = deque(maxlen=capacity)
+    
+    def add(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size: int):
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (np.array(states), np.array(actions), np.array(rewards),
+                np.array(next_states), np.array(dones))
+    
+    def __len__(self):
+        return len(self.buffer)
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta = beta
+        self.buffer = []
+        self.priorities = deque(maxlen=capacity)
+        self.pos = 0
+        
+    def add(self, state, action, reward, next_state, done):
+        max_priority = max(self.priorities) if self.priorities else 1.0
+        
+        if len(self.buffer) < self.capacity:
+            self.buffer.append((state, action, reward, next_state, done))
+        else:
+            self.buffer[self.pos] = (state, action, reward, next_state, done)
+        
+        self.priorities.append(max_priority)
+        self.pos = (self.pos + 1) % self.capacity
+    
+    def sample(self, batch_size: int):
+        if len(self.buffer) == 0:
+            return None
+            
+        priorities = np.array(self.priorities)
+        probabilities = priorities ** self.alpha
+        probabilities /= probabilities.sum()
+        
+        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
+        samples = [self.buffer[i] for i in indices]
+        
+        weights = (len(self.buffer) * probabilities[indices]) ** (-self.beta)
+        weights /= weights.max()
+        
+        states, actions, rewards, next_states, dones = zip(*samples)
+        return (np.array(states), np.array(actions), np.array(rewards),
+                np.array(next_states), np.array(dones), weights, indices)
+    
+    def update_priorities(self, indices, priorities):
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority
+    
+    def __len__(self):
+        return len(self.buffer)
+
+# =============================================================================
+# 3. Agent Interface & Metrics Tracking
+# =============================================================================
+class RLAgent(ABC):
+    def __init__(self, state_dim: int, action_dim: int, config: Dict[str, Any]):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.config = config
+        self.epsilon = config.get('epsilon_start', 1.0)
+        self.epsilon_decay = config.get('epsilon_decay', 0.995)
+        self.epsilon_min = config.get('epsilon_min', 0.01)
+        self.action_counts = defaultdict(int)
+        self.total_actions = 0
+        
+        # Initialize replay buffer
+        replay_type = config.get('replay_type', 'uniform')
+        capacity = config.get('replay_capacity', 10000)
+        
+        if replay_type == 'uniform':
+            self.memory = UniformReplayBuffer(capacity)
+        elif replay_type == 'prioritized':
+            self.memory = PrioritizedReplayBuffer(capacity, 
+                                                config.get('per_alpha', 0.6),
+                                                config.get('per_beta', 0.4))
+    
+    @abstractmethod
+    def select_action(self, state, explore: bool = True):
+        pass
+    
+    @abstractmethod
+    def learn(self) -> float:
+        pass
+    
+    def store_transition(self, state, action, reward, next_state, done):
+        self.memory.add(state, action, reward, next_state, done)
+        self.action_counts[action] += 1
+        self.total_actions += 1
+    
+    def update_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+    
+    def get_agent_metrics(self) -> Dict[str, float]:
+        metrics = {
+            'epsilon': self.epsilon,
+            'memory_size': len(self.memory),
+            'total_actions': self.total_actions
+        }
+        
+        # Action distribution
+        if self.total_actions > 0:
+            for action, count in self.action_counts.items():
+                metrics[f'action_{action}_ratio'] = count / self.total_actions
+        
+        return metrics
+
+# =============================================================================
+# 4. Environment Factory & Vectorization
+# =============================================================================
+def create_environment(env_config: Dict[str, Any]):
+    env_name = env_config['name']
+    vectorized = env_config.get('vectorized', False)
+    num_envs = env_config.get('num_envs', 1)
+    
+    if vectorized and num_envs > 1:
+        env_fns = [lambda: gym.make(env_name) for _ in range(num_envs)]
+        if env_config.get('async', True):
+            return AsyncVectorEnv(env_fns)
+        else:
+            return SubprocVecEnv(env_fns)
+    else:
+        return gym.make(env_name)
+
+# =============================================================================
+# 5. Advanced RL Researcher with Comprehensive Metrics
+# =============================================================================
+class AdvancedRLResearcher:
+    def __init__(self, config_path: str = None, config: Dict[str, Any] = None):
+        # Load configuration
+        if config_path:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f) if config_path.endswith('.yaml') else json.load(f)
+        else:
+            self.config = config or self._default_config()
+        
+        # Initialize components
+        self.logger = RLLogger(self.config.get('logging', {}))
+        self.env = create_environment(self.config['environment'])
+        
+        # Get environment dimensions
+        if hasattr(self.env, 'single_observation_space'):
+            obs_dim = self.env.single_observation_space.shape[0]
+            action_dim = self.env.single_action_space.n
+        else:
+            obs_dim = self.env.observation_space.shape[0]
+            action_dim = self.env.action_space.n
+        
+        # Initialize agent (placeholder - would be implemented based on agent type)
+        self.agent = self._create_agent(obs_dim, action_dim)
+        
+        # Training metrics
+        self.episode_rewards = deque(maxlen=1000)
+        self.episode_lengths = deque(maxlen=1000)
+        self.losses = deque(maxlen=1000)
+        self.global_step = 0
+        self.episode_count = 0
+    
+    def _default_config(self):
+        return {
+            'environment': {'name': 'CartPole-v1', 'vectorized': False},
+            'agent': {'type': 'DQN', 'replay_type': 'uniform'},
+            'training': {'batch_size': 32, 'max_episodes': 1000},
+            'logging': {'use_tensorboard': True, 'use_wandb': False}
+        }
+    
+    def _create_agent(self, obs_dim: int, action_dim: int):
+        # Placeholder - implement specific agents (DQN, PPO, etc.)
+        from .agents import create_agent  # This would be implemented separately
+        return create_agent(self.config['agent']['type'], obs_dim, action_dim, self.config['agent'])
+    
+    def train_episode(self) -> Dict[str, float]:
+        is_vectorized = hasattr(self.env, 'single_observation_space')
+        
+        if is_vectorized:
+            return self._train_vectorized_episode()
+        else:
+            return self._train_single_episode()
+    
+    def _train_single_episode(self) -> Dict[str, float]:
+        state, info = self.env.reset()
+        total_reward, steps, episode_losses = 0, 0, []
+        
+        while True:
+            action = self.agent.select_action(state, explore=True)
+            next_state, reward, terminated, truncated, info = self.env.step(action)
+            done = terminated or truncated
+            
+            self.agent.store_transition(state, action, reward, next_state, done)
+            
+            # Learn if enough samples
+            if len(self.agent.memory) >= self.config['training']['batch_size']:
+                loss = self.agent.learn()
+                if loss is not None:
+                    episode_losses.append(loss)
+            
+            state = next_state
+            total_reward += reward
+            steps += 1
+            self.global_step += 1
+            
+            if done:
+                break
+        
+        self.agent.update_epsilon()
+        avg_loss = np.mean(episode_losses) if episode_losses else 0
+        
+        return {
+            'episode_reward': total_reward,
+            'episode_length': steps,
+            'avg_loss': avg_loss,
+            'epsilon': self.agent.epsilon
+        }
+    
+    def _train_vectorized_episode(self) -> Dict[str, float]:
+        # Implement vectorized training for parallel environments
+        states = self.env.reset()[0]
+        num_envs = len(states)
+        episode_rewards = np.zeros(num_envs)
+        episode_lengths = np.zeros(num_envs)
+        episode_losses = []
+        active_envs = np.ones(num_envs, dtype=bool)
+        
+        while active_envs.any():
+            actions = np.array([self.agent.select_action(state, explore=True) 
+                              for state in states])
+            
+            next_states, rewards, terminateds, truncateds, infos = self.env.step(actions)
+            dones = terminateds | truncateds
+            
+            for i in range(num_envs):
+                if active_envs[i]:
+                    self.agent.store_transition(states[i], actions[i], rewards[i], 
+                                              next_states[i], dones[i])
+                    episode_rewards[i] += rewards[i]
+                    episode_lengths[i] += 1
+                    
+                    if dones[i]:
+                        active_envs[i] = False
+            
+            # Learn from batch
+            if len(self.agent.memory) >= self.config['training']['batch_size']:
+                loss = self.agent.learn()
+                if loss is not None:
+                    episode_losses.append(loss)
+            
+            states = next_states
+            self.global_step += num_envs
+        
+        self.agent.update_epsilon()
+        
+        return {
+            'episode_reward': np.mean(episode_rewards),
+            'episode_length': np.mean(episode_lengths),
+            'avg_loss': np.mean(episode_losses) if episode_losses else 0,
+            'epsilon': self.agent.epsilon
+        }
+    
+    def train(self, max_episodes: int = None):
+        max_episodes = max_episodes or self.config['training']['max_episodes']
+        
+        print(f"Starting training for {max_episodes} episodes...")
+        start_time = time.time()
+        
+        for episode in range(max_episodes):
+            episode_metrics = self.train_episode()
+            self.episode_count += 1
+            
+            # Update metrics
+            self.episode_rewards.append(episode_metrics['episode_reward'])
+            self.episode_lengths.append(episode_metrics['episode_length'])
+            if episode_metrics['avg_loss'] > 0:
+                self.losses.append(episode_metrics['avg_loss'])
+            
+            # Comprehensive metrics logging
+            comprehensive_metrics = {
+                **episode_metrics,
+                **self.agent.get_agent_metrics(),
+                'moving_avg_reward_100': np.mean(list(self.episode_rewards)[-100:]),
+                'reward_std_100': np.std(list(self.episode_rewards)[-100:]),
+                'moving_avg_length_100': np.mean(list(self.episode_lengths)[-100:]),
+                'episodes_completed': self.episode_count,
+                'training_time': time.time() - start_time
+            }
+            
+            self.logger.log_metrics(comprehensive_metrics, self.global_step)
+            
+            # Periodic evaluation and reporting
+            if episode % 100 == 0:
+                eval_reward = self.evaluate(n_episodes=10)
+                comprehensive_metrics['eval_reward'] = eval_reward
+                self.logger.log_metrics({'eval_reward': eval_reward}, self.global_step)
+                
+                print(f"Episode {episode}: "
+                      f"Avg Reward: {comprehensive_metrics['moving_avg_reward_100']:.2f}, "
+                      f"Eval: {eval_reward:.2f}, "
+                      f"Epsilon: {episode_metrics['epsilon']:.3f}")
+    
+    def evaluate(self, n_episodes: int = 10) -> float:
+        rewards = []
+        for _ in range(n_episodes):
+            state, info = self.env.reset()
+            total_reward = 0
+            
+            while True:
+                action = self.agent.select_action(state, explore=False)
+                state, reward, terminated, truncated, info = self.env.step(action)
+                total_reward += reward
+                
+                if terminated or truncated:
+                    break
+            
+            rewards.append(total_reward)
+        
+        return np.mean(rewards)
+    
+    def save_checkpoint(self, filepath: str):
+        checkpoint = {
+            'config': self.config,
+            'episode_count': self.episode_count,
+            'global_step': self.global_step,
+            'agent_state': self.agent.get_state() if hasattr(self.agent, 'get_state') else None
+        }
+        
+        torch.save(checkpoint, filepath)
+        print(f"Checkpoint saved to {filepath}")
+    
+    def load_checkpoint(self, filepath: str):
+        checkpoint = torch.load(filepath)
+        self.episode_count = checkpoint['episode_count']
+        self.global_step = checkpoint['global_step']
+        
+        if checkpoint['agent_state'] and hasattr(self.agent, 'load_state'):
+            self.agent.load_state(checkpoint['agent_state'])
+        
+        print(f"Checkpoint loaded from {filepath}")
+
+# =============================================================================
+# 6. Hyperparameter Optimization with Optuna
+# =============================================================================
+def optimize_hyperparameters(base_config: Dict[str, Any], n_trials: int = 50):
+    import optuna
+    
+    def objective(trial):
+        # Suggest hyperparameters
+        config = base_config.copy()
+        config['agent']['learning_rate'] = trial.suggest_loguniform('lr', 1e-5, 1e-2)
+        config['training']['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64, 128])
+        config['agent']['epsilon_decay'] = trial.suggest_uniform('epsilon_decay', 0.99, 0.999)
+        
+        # Train and evaluate
+        researcher = AdvancedRLResearcher(config=config)
+        researcher.train(max_episodes=200)  # Shorter for hyperparameter search
+        
+        return researcher.evaluate(n_episodes=20)
+    
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    print("Best hyperparameters:", study.best_params)
+    return study.best_params
+
+# =============================================================================
+# Example Usage
+# =============================================================================
+if __name__ == "__main__":
+    # Example configuration
+    config = {
+        'environment': {
+            'name': 'CartPole-v1',
+            'vectorized': True,
+            'num_envs': 4,
+            'async': True
+        },
+        'agent': {
+            'type': 'DQN',
+            'replay_type': 'prioritized',
+            'replay_capacity': 50000,
+            'epsilon_start': 1.0,
+            'epsilon_decay': 0.995,
+            'epsilon_min': 0.01
+        },
+        'training': {
+            'batch_size': 64,
+            'max_episodes': 2000
+        },
+        'logging': {
+            'use_tensorboard': True,
+            'use_wandb': False,
+            'tb_logdir': './logs/experiment_1'
+        }
+    }
+    
+    researcher = AdvancedRLResearcher(config=config)
+    researcher.train()

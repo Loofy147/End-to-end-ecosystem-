@@ -1,0 +1,2 @@
+{"concept": "التعلم المعزز (Reinforcement Learning)", "description": "فرع من التعلم الآلي يهتم بكيفية اتخاذ الوكلاء قرارات في بيئة معينة لتحقيق أقصى قدر من المكافآت المتراكمة.", "related_terms": ["Agent", "Environment", "Reward", "Policy", "State", "Action"]}
+{"concept": "التعلم المعزز الهرمي (HRL)", "description": "نهج يهدف إلى معالجة تعقيد المهام طويلة الأمد عبر تقسيمها إلى تسلسل هرمي من المهام الفرعية الأبسط.", "related_terms": ["Temporal Abstraction", "Subgoal", "Meta-Controller"]}

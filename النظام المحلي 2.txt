@@ -1,0 +1,296 @@
+# Implementing full integration changes (LLM adapter supporting local server, Faiss fallback memory, signed certificate generator)
+import os, textwrap, json, shutil, zipfile, subprocess, shlex, time, hashlib, hmac, uuid
+BASE = "/mnt/data/hrl_agent_private_v2"
+if not os.path.exists(BASE):
+    raise FileNotFoundError("Base package not found. Run the previous package creation step first.")
+
+def write(path, content):
+    full = os.path.join(BASE, path)
+    d = os.path.dirname(full)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+
+# 1) LLM local server stub (simple HTTP POST /generate returning deterministic response)
+llm_server = textwrap.dedent("""
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, sys
+PORT = 8081
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != '/generate':
+            self.send_response(404); self.end_headers(); return
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8') if length else ''
+        try:
+            req = json.loads(body) if body else {}
+        except:
+            req = {}
+        # deterministic stub: echo plan from planner_v2 if task provided, else fixed message
+        task = req.get('task')
+        if task:
+            # import planner to generate plan
+            from planner_v2 import generate_plan
+            plan = generate_plan(task)
+            resp = {'plan': plan, 'source': 'local_server_stub'}
+        else:
+            resp = {'text': 'no task provided', 'source': 'local_server_stub'}
+        resp_b = json.dumps(resp).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length', str(len(resp_b)))
+        self.end_headers()
+        self.wfile.write(resp_b)
+
+if __name__=='__main__':
+    server = HTTPServer(('127.0.0.1', PORT), Handler)
+    print(f'LLM local server stub running on http://127.0.0.1:{PORT}/generate')
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('Server stopped')
+""").strip()
+write("llm_local_server.py", llm_server)
+
+# 2) Update llm_adapter.py to support local_server mode and fallback to local_stub
+llm_adapter = textwrap.dedent("""
+# LLM Adapter: supports 'local_stub' and 'local_server' modes.
+import os, json, requests
+
+MODE = os.environ.get('LLM_MODE','local_stub')
+SERVER_URL = os.environ.get('LLM_SERVER_URL','http://127.0.0.1:8081/generate')
+
+def plan_from_llm(task):
+    if MODE=='local_stub':
+        from planner_v2 import generate_plan
+        return generate_plan(task)
+    elif MODE=='local_server':
+        # call local HTTP server (must be running)
+        try:
+            payload = {'task': task}
+            r = requests.post(SERVER_URL, json=payload, timeout=5)
+            j = r.json()
+            return j.get('plan') or j.get('plan', j)
+        except Exception as e:
+            # fallback to stub on error
+            from planner_v2 import generate_plan
+            return generate_plan(task)
+    else:
+        # unknown mode: fallback stub
+        from planner_v2 import generate_plan
+        return generate_plan(task)
+""").strip()
+write("llm_adapter.py", llm_adapter)
+
+# Note: requests library might not be available in target environment; include a tiny pure-python http client fallback in llm_adapter_requests_fallback.py
+requests_fallback = textwrap.dedent("""
+# Minimal POST helper using urllib if 'requests' isn't installed
+import json, urllib.request, urllib.error
+
+def post_json(url, obj, timeout=5):
+    data = json.dumps(obj).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers={'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.URLError as e:
+        raise
+""").strip()
+write("llm_adapter_requests_fallback.py", requests_fallback)
+
+# 3) Memory Faiss integration file: use faiss if available else fallback to brute-force cosine search using embeddings in memory.sqlite
+memory_faiss = textwrap.dedent("""
+# memory_faiss.py - wrapper that uses faiss if available, else brute force cosine search
+import json, sqlite3, os
+from representation import embed, cosine
+
+DB = 'memory.sqlite'
+
+def init_db():
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, problem_id TEXT, goal TEXT, timestamp TEXT, run_json TEXT, embedding TEXT)''')
+    conn.commit(); conn.close()
+
+def save_run(record):
+    init_db()
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    rid = record.get('id')
+    pid = record.get('problem',{}).get('problem_id')
+    goal = str(record.get('problem',{}).get('goal_high'))
+    ts = record.get('timestamp')
+    rjson = json.dumps(record)
+    emb = json.dumps(embed({'problem_id':pid,'goal':goal}))
+    c.execute('INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?)', (rid, pid, goal, ts, rjson, emb))
+    conn.commit(); conn.close()
+
+def search_similar(query_obj, k=5):
+    # try to import faiss
+    try:
+        import faiss
+        return _search_with_faiss(query_obj, k)
+    except Exception:
+        return _bruteforce_search(query_obj, k)
+
+def _bruteforce_search(query_obj, k=5):
+    init_db()
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute('SELECT id, problem_id, goal, timestamp, run_json, embedding FROM runs')
+    rows = c.fetchall(); conn.close()
+    qemb = embed(query_obj)
+    scored = []
+    for r in rows:
+        rid, pid, goal, ts, rjson, emb_text = r
+        try:
+            emb = json.loads(emb_text)
+        except:
+            emb = embed(goal)
+        score = cosine(qemb, emb)
+        scored.append((score, json.loads(rjson)))
+    scored.sort(key=lambda x: -x[0])
+    return [r for s,r in scored[:k]]
+
+def _search_with_faiss(query_obj, k=5):
+    # simple implementation: load all embeddings and index (for demo)
+    init_db()
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute('SELECT id, run_json, embedding FROM runs')
+    rows = c.fetchall(); conn.close()
+    if not rows:
+        return []
+    emb_list = [json.loads(r[2]) for r in rows]
+    import numpy as np
+    xb = np.array(emb_list).astype('float32')
+    d = xb.shape[1]
+    index = faiss.IndexFlatIP(d)
+    faiss.normalize_L2(xb)
+    index.add(xb)
+    qemb = np.array([embed(query_obj)]).astype('float32')
+    faiss.normalize_L2(qemb)
+    D,I = index.search(qemb, k)
+    results = []
+    for idx in I[0]:
+        results.append(json.loads(rows[idx][1]))
+    return results
+""").strip()
+write("memory_faiss.py", memory_faiss)
+
+# 4) Add signing utilities and certificate generator
+# generate a secret key file for HMAC signing
+secret = os.urandom(32)
+with open(os.path.join(BASE, "secret.key"), "wb") as f:
+    f.write(secret)
+
+signing_py = textwrap.dedent("""
+# sign_certificate.py - sign a text with HMAC-SHA256 using secret.key
+import hmac, hashlib, json, os, time
+def sign_text(text):
+    key = open('secret.key','rb').read()
+    sig = hmac.new(key, text.encode('utf-8'), hashlib.sha256).hexdigest()
+    return sig
+
+def verify_signature(text, sig_hex):
+    key = open('secret.key','rb').read()
+    return hmac.new(key, text.encode('utf-8'), hashlib.sha256).hexdigest() == sig_hex
+""").strip()
+write("sign_certificate.py", signing_py)
+
+# certificate generator script - creates signed PDF and text
+cert_gen = textwrap.dedent("""
+# generate_certificate.py - reads runs/kpi_report.md and generates signed certificate PDF + text
+import os, json, time, textwrap
+from sign_certificate import sign_text
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+BASE = os.path.dirname(__file__)
+REPORT_MD = os.path.join(BASE, 'runs', 'kpi_report.md')
+OUT_PDF = os.path.join(BASE, 'runs', 'certificate_signed.pdf')
+OUT_TXT = os.path.join(BASE, 'runs', 'certificate_signed.txt')
+
+def load_report():
+    if not os.path.exists(REPORT_MD):
+        return None
+    return open(REPORT_MD,'r', encoding='utf-8').read()
+
+def generate_certificate(report_text):
+    # Prepare certificate content
+    ts = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+    header = f'Certificate generated by {os.path.basename(BASE)} on {ts}\\n\\n'
+    body = report_text + '\\n\\nThis certificate endorses the report contents and includes an HMAC-SHA256 signature.'
+    full = header + body
+    sig = sign_text(full)
+    # Write text file
+    with open(OUT_TXT,'w', encoding='utf-8') as f:
+        f.write(full + '\\n\\nSignature: ' + sig + '\\n')
+    # Create simple PDF
+    c = canvas.Canvas(OUT_PDF, pagesize=A4)
+    w,h = A4
+    y = h - 60
+    for line in full.splitlines():
+        if len(line) > 120:
+            chunks = [line[i:i+120] for i in range(0,len(line),120)]
+        else:
+            chunks = [line]
+        for ch in chunks:
+            c.drawString(40, y, ch)
+            y -= 12
+            if y < 60:
+                c.showPage(); y = h - 60
+    c.drawString(40, y-20, 'Signature: ' + sig)
+    c.save()
+    return OUT_PDF, OUT_TXT, sig
+
+if __name__=='__main__':
+    report = load_report() or 'No report found.'
+    pdf, txt, sig = generate_certificate(report)
+    print('Generated certificate:', pdf, txt, sig)
+""").strip()
+write("generate_certificate.py", cert_gen)
+
+# 5) Update run_service_v2 to optionally use memory_faiss and to call certificate generation if requested
+rsv2_path = os.path.join(BASE, "run_service_v2.py")
+rsv2 = open(rsv2_path).read()
+# Append imports and modify save_run calls to use memory_faiss if available
+rsv2_mod = rsv2.replace("from memory_sql import save_run, search_similar", "try:\n    from memory_faiss import save_run, search_similar\nexcept Exception:\n    from memory_sql import save_run, search_similar\n")
+write("run_service_v2.py", rsv2_mod)
+
+# 6) Add helper script to run LLM server (bash) and note how to enable local_server mode
+llm_run_sh = textwrap.dedent("""
+#!/bin/bash
+# Start the local LLM server stub (runs in foreground)
+python3 llm_local_server.py
+""")
+write("start_llm_server.sh", llm_run_sh)
+os.chmod(os.path.join(BASE, "start_llm_server.sh"), 0o755)
+
+# 7) Zip updated package
+zip_path = "/mnt/data/hrl_agent_private_v2_v3.zip"
+if os.path.exists(zip_path):
+    os.remove(zip_path)
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+    for foldername, subfolders, filenames in os.walk(BASE):
+        for filename in filenames:
+            filepath = os.path.join(foldername, filename)
+            arcname = os.path.relpath(filepath, BASE)
+            zf.write(filepath, arcname)
+
+# 8) Run a quick test: try memory_faiss search to confirm import works (fallback path)
+test_code = textwrap.dedent("""
+import os, json
+from memory_faiss import search_similar, save_run
+rec = {'id':'test1','timestamp':'now','problem':{'problem_id':'p_test','goal_high':'test'}, 'plan':{}, 'subgoals':[]}
+save_run(rec)
+res = search_similar({'problem_id':'p_test','goal':'test'}, k=1)
+print('search_similar returned', len(res))
+""")
+proc = subprocess.run([shlex.split(shlex.quote(__import__('sys').executable))[0], "-c", test_code], cwd=BASE, capture_output=True, text=True, timeout=20)
+test_out = proc.stdout + proc.stderr
+
+result = {"zip_path": zip_path, "test_out": test_out.strip()}
+print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+
+

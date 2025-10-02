@@ -1,0 +1,20 @@
+data_type: بيانات غير مؤكدة أو صاخبة
+associated_challenge: التعامل مع عدم اليقين (Handling Uncertainty)
+example: بيانات من مستشعرات روبوتية قد تكون غير دقيقة.
+
+data_type: بيانات ذات أبعاد عالية
+associated_challenge: لعنة الأبعاد (Curse of Dimensionality)
+example: مدخلات صور خام (مثل ألعاب Atari) حيث كل بكسل هو بُعد.
+
+data_type: بيانات ذات علاقات معقدة
+associated_challenge: تمثيل العلاقات (Representing Relations)
+example: بيانات من شبكات اجتماعية أو جزيئات كيميائية.
+
+data_type: بيانات قليلة أو نادرة
+associated_challenge: عدم كفاءة العينة (Sample Inefficiency)
+example: سيناريوهات طبية حيث يكون جمع بيانات المرضى مكلفًا ونادرًا.
+
+data_type: بيانات من توزيعات مختلفة
+associated_challenge: اختلاف توزيع البيانات (Data Distribution Mismatch)
+example: نموذج مدرب على صور نهارية ويُطلب منه العمل على صور ليلية.
+

@@ -1,0 +1,269 @@
+# Simulation of a large-scale "Attention-driven Meta-Consciousness" experiment
+# - Implements nodes (N agents) with internal states b_i, attention weights A_ij
+# - Dynamics follow the equations in the conversation (aggregation, update, learning of A)
+# - Includes enhancements: gating (top-k), audit layer for malicious nodes, energy budget
+# - Adaptive controller performs online parameter tuning every `intervene_every` steps
+# - Outputs: plots (S, avg A, energy, utility), and a metrics DataFrame
+#
+# NOTE: This code is intended to run in the notebook environment. It uses matplotlib (no seaborn).
+# The results (plots and a metrics table) will be displayed.
+# You can tweak parameters at the top (N, T, controller settings) to explore variants.
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from math import tanh
+import os
+
+np.random.seed(42)
+
+# --------------------------- Parameters ---------------------------------
+N = 200                  # number of nodes
+T = 800                  # time steps
+alpha = 0.35             # sensitivity of nodes to incoming I_j
+eta = 0.08               # initial attention learning rate
+lambda_base = 0.01      # base decay (cost) of attention per step
+noise_sigma = 0.03       # channel noise
+energy_cost_per_weight = 1.0  # cost per unit attention weight (for energy calculation)
+gate_topk = 12           # initial top-k gating active outgoing edges per node
+energy_budget = 1200.0   # soft budget for energy usage (controller manages to keep near this)
+intervene_every = 20     # control interval (steps) for adaptive tuning
+controller_perturb = 0.015  # perturbation step for controller tuning decisions
+audit_strength = 0.5     # how strongly audit reduces malicious outgoing A
+malicious_frac = 0.06    # fraction of malicious nodes that inject wrong signals intermittently
+
+# --------------------------- Initialization -----------------------------
+# Internal states b in [-1,1]
+b = np.random.uniform(-1, 1, size=N)
+
+# Initial attention weights A (NxN), zero diagonal (no self-attention)
+A = np.abs(np.random.normal(loc=0.02, scale=0.01, size=(N, N)))
+np.fill_diagonal(A, 0.0)
+
+# Some clustered structure: create several communities
+num_clusters = 6
+cluster_assign = np.random.randint(0, num_clusters, size=N)
+for i in range(N):
+    for j in range(N):
+        if cluster_assign[i] == cluster_assign[j]:
+            A[i, j] += 0.03  # stronger intra-cluster attention
+
+# Normalize scales a bit
+A = np.maximum(A, 0.0)
+
+# Malicious nodes (emit biased/wrong signals occasionally)
+malicious_idx = np.random.choice(np.arange(N), size=int(N*malicious_frac), replace=False)
+
+# Energy function utility weights
+w_S = 1.0      # weight for cohesion S in utility
+w_energy = 0.005  # penalty weight for energy used
+
+# Container for metrics
+records = []
+
+# Helper functions
+eps = 1e-9
+def aggregate_inputs(A, b):
+    # compute I_j for all j
+    numer = A.T.dot(b)          # sum_i A_ij * b_i for each j (shape N)
+    denom = A.sum(axis=0) + eps # sum_i A_ij for each j
+    I = numer / denom
+    return I
+
+def update_states(b, I, alpha, sigma):
+    # simple update: tanh activation of linear blend + Gaussian noise
+    noise = np.random.normal(0, sigma, size=b.shape)
+    new_b = np.tanh((1-alpha)*b + alpha*I + noise)
+    return new_b
+
+def reward_function(b_i, b_j):
+    # similarity-based reward (1 - abs diff) clipped
+    return np.maximum(0.0, 1.0 - np.abs(b_i - b_j))
+
+def compute_S(b):
+    # cohesion measure: 1 - normalized variance
+    var = np.var(b)
+    # map variance to [0,1] using expected variance range (max 1)
+    S = 1.0 - var
+    if S < -1.0: S = -1.0
+    return S
+
+def energy_of_A(A):
+    # energy proportional to sum of A (and count of active edges)
+    return energy_cost_per_weight * A.sum()
+
+def apply_gating(A, topk):
+    # keep only topk outgoing edges per node (rows), zero out others (soft gating)
+    if topk >= A.shape[1]:
+        return A.copy()
+    A2 = np.zeros_like(A)
+    for i in range(A.shape[0]):
+        row = A[i].copy()
+        if row.sum() <= 0: continue
+        idxs = np.argpartition(-row, topk)[:topk]  # indices of topk largest
+        A2[i, idxs] = row[idxs]
+    return A2
+
+# Controller state
+controller_state = {
+    'eta': eta,
+    'lambda': lambda_base,
+    'gate_topk': gate_topk,
+}
+
+def compute_utility(S_val, energy_val, w_S=1.0, w_energy=0.005):
+    return w_S * S_val - w_energy * energy_val
+
+# Adaptive controller: simple hill-climbing at intervene intervals
+def controller_step(metrics_hist, ctrl_state):
+    # metrics_hist is list of dicts with last metrics; look at last utility
+    last = metrics_hist[-1]
+    current_util = last['utility']
+    # try small perturbations to eta, lambda, gate_topk and accept if utility improves after short probe
+    # We'll attempt adjustments and keep the one that improves the utility under the budget expectation.
+    best = dict(ctrl_state)
+    best_util = current_util
+    # candidate moves: increase/decrease eta, increase/decrease lambda, +- gate_topk by 2
+    candidates = []
+    for delt in (+controller_perturb, -controller_perturb):
+        candidates.append({'eta': max(0.0, ctrl_state['eta'] + delt), 'lambda': ctrl_state['lambda'], 'gate_topk': ctrl_state['gate_topk']})
+        candidates.append({'eta': ctrl_state['eta'], 'lambda': max(0.0, ctrl_state['lambda'] + delt), 'gate_topk': ctrl_state['gate_topk']})
+    for dk in (-2, 2):
+        candidates.append({'eta': ctrl_state['eta'], 'lambda': ctrl_state['lambda'], 'gate_topk': max(1, ctrl_state['gate_topk'] + dk)})
+    # Evaluate candidates with a lightweight predictive heuristic: prefer increased S and lower energy.
+    # We'll use last S and energy and simple expectation: raising eta tends to increase cohesion if S low; increasing lambda reduces energy.
+    for cand in candidates:
+        # heuristic score
+        expected_S = last['S'] + 0.02*(cand['eta'] - ctrl_state['eta']) - 0.01*(cand['lambda'] - ctrl_state['lambda'])
+        expected_energy = last['energy'] + 40*(cand['gate_topk'] - ctrl_state['gate_topk']) - 300*(cand['lambda'] - ctrl_state['lambda'])
+        expected_util = compute_utility(expected_S, expected_energy, w_S, w_energy)
+        # penalize extreme changes
+        if abs(cand['eta'] - ctrl_state['eta']) > 0.2: expected_util -= 0.2
+        if expected_util > best_util:
+            best_util = expected_util
+            best = cand
+    return best
+
+# --------------------------- Main Simulation Loop ------------------------
+for t in range(T):
+    # 1) apply gating (sparse attention for energy efficiency)
+    A_gated = apply_gating(A, controller_state['gate_topk'])
+    # 2) aggregate
+    I = aggregate_inputs(A_gated, b)
+    # 3) malicious perturbation: some malicious nodes occasionally send inverted signals
+    if t % 30 == 0:
+        # malicious nodes flip sign of their contribution for a short moment
+        b_malicious_mask = np.zeros_like(b)
+        b_malicious_mask[malicious_idx] = -1.0
+        # incorporate malicious signal by adjusting I at receiver side slightly
+        # We'll simulate by adding a small biased term to I: proportion to malicious contributions received
+        mal_influence = (A_gated.T[:, malicious_idx].sum(axis=1) * 0.2)
+        I = I + mal_influence * (np.mean(b[malicious_idx]) * -0.4)  # biasing towards wrong mean
+    
+    # 4) update internal states
+    b_new = update_states(b, I, alpha, noise_sigma)
+    # 5) compute rewards and update A (learning)
+    # reward is similarity(b_i, b_j) * local_gain (we use improvement in local state as proxy)
+    local_gain = np.tanh(np.abs(b_new - b))  # nodes that changed significantly count as active learning episodes
+    # compute reward matrix approx by outer product of similarity and local_gain as receiver effect
+    sim_mat = 1.0 - np.abs(b[:, None] - b[None, :])
+    sim_mat = np.clip(sim_mat, 0.0, 1.0)
+    reward_mat = sim_mat * local_gain[None, :]  # reward to edge i->j depends on receiver change
+    
+    # audit: reduce outgoing A from malicious nodes when they act maliciously
+    A_update = controller_state['eta'] * reward_mat - controller_state['lambda'] * A_gated
+    # apply audit reduction to malicious outgoing rows every malicious event window
+    if t % 30 == 0:
+        A_update[malicious_idx, :] -= audit_strength * np.abs(A_update[malicious_idx, :])
+    
+    A = A_gated + A_update
+    # ensure non-negative and zero diagonal
+    A = np.maximum(A, 0.0)
+    np.fill_diagonal(A, 0.0)
+    
+    # 6) energy and cohesion metrics
+    energy = energy_of_A(A)
+    S_val = compute_S(b_new)
+    utility = compute_utility(S_val, energy, w_S, w_energy)
+    avg_A = A.mean()
+    entropy_A = -np.sum((A.flatten()/ (A.sum()+eps)) * np.log((A.flatten()+eps)/(A.sum()+eps) + eps))
+    
+    # record
+    records.append({
+        't': t,
+        'S': S_val,
+        'energy': energy,
+        'utility': utility,
+        'avg_A': avg_A,
+        'entropy_A': entropy_A,
+        'eta': controller_state['eta'],
+        'lambda': controller_state['lambda'],
+        'gate_topk': controller_state['gate_topk'],
+        'malicious_count': len(malicious_idx)
+    })
+    
+    # 7) adaptive controller intervention occasionally
+    if (t+1) % intervene_every == 0 and t > 0:
+        ctrl_candidate = controller_step(records, controller_state)
+        # apply controller change (small steps only)
+        controller_state.update(ctrl_candidate)
+    
+    # 8) state advance
+    b = b_new.copy()
+
+# --------------------------- Results & Plots -----------------------------
+df = pd.DataFrame(records)
+
+# Save dataframe for download
+out_csv = '/mnt/data/attention_experiment_metrics.csv'
+df.to_csv(out_csv, index=False)
+
+# Plot metrics: each figure separately (matplotlib, no style/colors explicit)
+plt.figure(figsize=(10,3))
+plt.plot(df['t'], df['S'])
+plt.title('Cohesion S over time')
+plt.xlabel('time step')
+plt.ylabel('S')
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10,3))
+plt.plot(df['t'], df['energy'])
+plt.title('Energy (sum of attention weights) over time')
+plt.xlabel('time step')
+plt.ylabel('Energy')
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10,3))
+plt.plot(df['t'], df['utility'])
+plt.title('Utility (S - w_energy*Energy) over time')
+plt.xlabel('time step')
+plt.ylabel('Utility')
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10,3))
+plt.plot(df['t'], df['avg_A'])
+plt.title('Average attention weight over time')
+plt.xlabel('time step')
+plt.ylabel('avg A')
+plt.grid(True)
+plt.show()
+
+# Show controller parameter evolution
+plt.figure(figsize=(10,3))
+plt.plot(df['t'], df['eta'], label='eta')
+plt.plot(df['t'], df['lambda'], label='lambda')
+plt.plot(df['t'], df['gate_topk'], label='gate_topk')
+plt.title('Controller parameters over time (sampled at each record)')
+plt.xlabel('time step')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Display summary dataframe (last rows)
+import caas_jupyter_tools as tools
+tools.display_dataframe_to_user("Experiment metrics (last 40 rows)", df.tail(40))
+
+print(f"[Download CSV] The metrics were saved to: {out_csv}")

@@ -1,0 +1,152 @@
+import asyncio
+import random
+from typing import List, Callable, Dict
+
+# --- First, The Orchestra Members (Mock Services) ---
+# These are the services TheMaestro will conduct.
+# Each has a 'ping' method to report its readiness.
+
+class MockDatabaseService:
+    def __init__(self, is_moody=False):
+        self._is_moody = is_moody
+        self._ping_count = 0
+
+    async def ping(self) -> (bool, str):
+        await asyncio.sleep(random.uniform(0.1, 0.5))
+        if self._is_moody:
+            self._ping_count += 1
+            if self._ping_count < 2:
+                return False, "The Database is still waking up, it needs a moment."
+        return True, "The Database is tuned and ready."
+
+class MockCacheService:
+    async def ping(self) -> (bool, str):
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+        return True, "The Cache is warm and responsive."
+
+class MockBillingService:
+    async def ping(self) -> (bool, str):
+        await asyncio.sleep(random.uniform(0.1, 0.2))
+        return False, "The Billing Service is on a holiday and cannot be reached."
+
+# --- The Star of the Show: TheMaestro ---
+
+class TheMaestro:
+    """
+    TheMaestro is not a class; it's the soul of the codebase.
+    It conducts the various services as a choirmaster, not a taskmaster.
+    It is implemented as a Singleton, as there can only be one Maestro.
+    """
+    _instance = None
+
+    def __init__(self):
+        # We store our orchestra members here
+        self._services = {
+            "database": MockDatabaseService(is_moody=True),
+            "cache": MockCacheService(),
+            "billing": MockBillingService(),
+        }
+        self._current_awakening_list = []
+        self._patience = 1
+
+    @classmethod
+    def please(cls):
+        """The only polite way to get the Maestro's attention."""
+        if cls._instance is None:
+            print("The Maestro enters the room...")
+            cls._instance = cls()
+        return cls._instance
+
+    def awakenTheServices(self, services_to_awaken: List[str]):
+        """A gentle request to see which services are ready."""
+        print(f"\nThe Maestro prepares to awaken: {', '.join(services_to_awaken)}")
+        self._current_awakening_list = services_to_awaken
+        return self # Returning self allows for method chaining
+
+    def withPatience(self, retries: int):
+        """A grant of patience for services that may be slow to start."""
+        self._patience = max(1, retries)
+        print(f"The Maestro will try up to {self._patience} time(s).")
+        return self
+
+    async def onceEveryoneIsReady(self, callback: Callable):
+        """The performance begins once the choir is ready."""
+        is_ready = False
+        final_report = {}
+
+        for attempt in range(self._patience):
+            print(f"\n--- Attempt {attempt + 1} of {self._patience} ---")
+            
+            # Asynchronously ping all services
+            ping_tasks = [self._services[name].ping() for name in self._current_awakening_list]
+            ping_results = await asyncio.gather(*ping_tasks)
+            
+            # Check the readiness report
+            report = {name: result for name, result in zip(self._current_awakening_list, ping_results)}
+            final_report = report
+
+            ready_services = [name for name, (is_ready, msg) in report.items() if is_ready]
+            unready_services = {name: msg for name, (is_ready, msg) in report.items() if not is_ready}
+            
+            for name in ready_services:
+                 print(f"Cordial note: '{self._services[name].ping.__self__.__class__.__name__}' reports it is ready.")
+
+            if not unready_services:
+                is_ready = True
+                print("\nAll services are present. The performance can begin!")
+                break
+            else:
+                for name, msg in unready_services.items():
+                    print(f"A quiet whisper from '{name}': \"{msg}\"")
+                if attempt < self._patience - 1:
+                     await asyncio.sleep(1) # Pause before the next attempt
+
+        if is_ready:
+            callback(True, "The orchestra is ready and the symphony was a success.")
+        else:
+            print("\nAlas, the orchestra is not ready.")
+            dissonance_report = self._create_dissonance_report(final_report)
+            callback(False, dissonance_report)
+
+    def _create_dissonance_report(self, report: Dict) -> str:
+        """Instead of a stack trace, a gentle story about what went wrong."""
+        story = "My dearest developer,\n\nI regret to inform you that our performance could not begin. There was some dissonance in the orchestra.\n"
+        for name, (is_ready, msg) in report.items():
+            if not is_ready:
+                story += f"- The '{name}' service, a vital player, was out of tune. It whispered to me: '{msg}'\n"
+        story += "\nPerhaps we could attend to them? \n\nYours in collaboration,\nThe Maestro"
+        return story
+
+
+# --- The Main Performance (Example Usage) ---
+
+async def main():
+    def the_grand_finale(is_success: bool, report: str):
+        """This function is our main business logic, called only when the orchestra is ready."""
+        print("\n--- The Grand Finale ---")
+        if is_success:
+            print("✅ The Maestro reports a flawless performance.")
+            print(f"Report: {report}")
+        else:
+            print("\n❌ The Maestro reports a troubled performance.")
+            print(report)
+
+
+    # Scenario 1: Awaken services, but one is moody and another is absent.
+    # We grant patience, so the moody one will eventually respond.
+    print("================ SCENARIO 1: A Patient Awakening ================")
+    await TheMaestro.please() \
+        .awakenTheServices(["database", "cache", "billing"]) \
+        .withPatience(2) \
+        .onceEveryoneIsReady(the_grand_finale)
+
+    # Scenario 2: Just awaken the reliable services. This should be fast and easy.
+    print("\n================ SCENARIO 2: A Simple Duet ================")
+    await TheMaestro.please() \
+        .awakenTheServices(["cache"]) \
+        .withPatience(1) \
+        .onceEveryoneIsReady(the_grand_finale)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

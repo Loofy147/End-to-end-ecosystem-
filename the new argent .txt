@@ -1,0 +1,717 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque, defaultdict
+import math
+from typing import List, Tuple, Dict, Optional
+import time
+
+class HierarchicalState:
+    """
+    Multi-scale state representation that works across different target sizes.
+    Combines local and global features for better long-term planning.
+    """
+    def __init__(self, current, target, step, max_steps, forbidden_states=None):
+        self.current = current
+        self.target = target
+        self.step = step
+        self.max_steps = max_steps
+        self.forbidden_states = forbidden_states or set()
+
+    def to_features(self):
+        """Multi-scale feature representation"""
+        if self.target == 0:
+            return np.zeros(12)
+
+        # Scale-invariant features
+        progress_ratio = self.current / self.target if self.target != 0 else 0
+        remaining_ratio = (self.target - self.current) / self.target if self.target != 0 else 0
+        time_ratio = self.step / self.max_steps
+
+        # Multi-scale gap analysis
+        gap = abs(self.target - self.current)
+        log_gap = math.log(gap + 1) / math.log(abs(self.target) + 1) if self.target != 0 else 0 # Logarithmic scale
+        gap_magnitude = gap / abs(self.target) if self.target != 0 else 0 # Relative scale
+
+        # Strategic features
+        is_close = 1.0 if gap <= 10 else 0.0  # Near-target flag
+        is_far = 1.0 if gap >= abs(self.target) * 0.5 else 0.0  # Far-target flag
+
+        # Constraint features
+        danger_proximity = self._compute_danger_proximity()
+        constraint_pressure = self._compute_constraint_pressure()
+
+        # Phase identification
+        phase = self._identify_phase()
+
+        # Efficiency features
+        theoretical_min_steps = self._compute_min_steps()
+        efficiency_ratio = theoretical_min_steps / (self.max_steps - self.step + 1) if (self.max_steps - self.step + 1) != 0 else 0
+
+        return np.array([
+            progress_ratio, remaining_ratio, time_ratio,
+            log_gap, gap_magnitude, is_close, is_far,
+            danger_proximity, constraint_pressure,
+            phase, theoretical_min_steps, efficiency_ratio
+        ])
+
+    def _compute_danger_proximity(self):
+        """Distance to nearest forbidden state"""
+        if not self.forbidden_states:
+            return 0.0
+
+        distances = [abs(self.current - forbidden) for forbidden in self.forbidden_states]
+        min_distance = min(distances) if distances else 0
+        return 1.0 / (min_distance + 1)  # Closer = higher value
+
+    def _compute_constraint_pressure(self):
+        """How constrained is the current position"""
+        if not self.forbidden_states:
+            return 0.0
+
+        # Count forbidden states in the path to target
+        if self.current < self.target:
+            path_range = range(self.current + 1, self.target + 1)
+        else:
+            path_range = range(self.target, self.current)
+
+        blocked_path_states = sum(1 for state in path_range if state in self.forbidden_states)
+        path_length = len(path_range)
+
+        return blocked_path_states / (path_length + 1) if path_length > 0 else 0.0
+
+    def _identify_phase(self):
+        """Identify problem-solving phase: exploration(0), navigation(1), precision(2)"""
+        gap = abs(self.target - self.current)
+
+        if self.target != 0 and gap > abs(self.target) * 0.7:
+            return 0.0  # Exploration phase
+        elif gap > 10:
+            return 1.0  # Navigation phase
+        else:
+            return 2.0  # Precision phase
+
+    def _compute_min_steps(self):
+        """Theoretical minimum steps to target"""
+        gap = abs(self.target - self.current)
+        # Assuming max action is 5
+        return math.ceil(gap / 5.0)
+
+# from fixing.txt
+class EnhancedExplorationStrategy:
+    """
+    Solution 1: Advanced Exploration for Large-Scale Problems
+
+    Addresses the local optima problem by implementing:
+    - Adaptive exploration based on problem complexity
+    - Multi-step lookahead planning
+    - Constraint-escape mechanisms
+    """
+
+    def __init__(self, base_epsilon: float = 0.1):
+        self.base_epsilon = base_epsilon
+        self.stuck_threshold = 5  # Steps without progress
+        self.stuck_counter = 0
+        self.last_distance = float('inf')
+        self.exploration_boost_active = False
+
+    def should_explore(self, current: float, target: float, step: int,
+                      forbidden_states: set, recent_actions: List[float]) -> Tuple[bool, float]:
+        """
+        Determine if agent should explore and at what intensity.
+
+        Returns:
+            (should_explore, exploration_rate)
+        """
+        current_distance = abs(target - current)
+        gap_complexity = self._assess_gap_complexity(current, target, forbidden_states)
+
+        # Check if agent is stuck
+        if current_distance >= self.last_distance:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+
+        self.last_distance = current_distance
+
+        # Base exploration rate
+        base_rate = self.base_epsilon
+
+        # Complexity bonus (larger gaps need more exploration)
+        complexity_bonus = min(0.3, gap_complexity / 100)
+
+        # Stuck penalty (force exploration when stuck)
+        stuck_bonus = 0.0
+        if self.stuck_counter >= self.stuck_threshold:
+            stuck_bonus = 0.4  # High exploration when stuck
+            self.exploration_boost_active = True
+        elif self.stuck_counter == 0 and self.exploration_boost_active:
+            self.exploration_boost_active = False
+
+        total_exploration_rate = base_rate + complexity_bonus + stuck_bonus
+        should_explore = random.random() < total_exploration_rate
+
+        return should_explore, total_exploration_rate
+
+    def _assess_gap_complexity(self, current: float, target: float, forbidden_states: set) -> float:
+        """
+        Assess how complex the gap between current and target is.
+
+        Returns complexity score (higher = more complex)
+        """
+        gap = abs(target - current)
+
+        if not forbidden_states:
+            return gap * 0.1  # Simple gap
+
+        # Count constraints in direct path
+        start, end = min(current, target), max(current, target)
+        path_constraints = sum(1 for state in forbidden_states if start < state < end)
+
+        # Complexity = gap size + constraint density penalty
+        constraint_density = path_constraints / max(1, gap)
+        complexity = gap * 0.1 + constraint_density * 50
+
+        return complexity
+
+    def select_exploration_action(self, current: float, target: float,
+                                forbidden_states: set, available_actions: List[float]) -> float:
+        """
+        Select exploration action using smart randomization.
+
+        Prioritizes actions that:
+        1. Make significant progress toward target
+        2. Avoid forbidden states
+        3. Break out of local patterns
+        """
+        if not available_actions:
+            return 1  # Fallback
+
+        # Score each action
+        action_scores = []
+
+        for action in available_actions:
+            next_pos = current + action
+
+            # Skip forbidden states
+            if next_pos in forbidden_states:
+                continue
+
+            # Progress score
+            current_distance = abs(target - current)
+            next_distance = abs(target - next_pos)
+            progress_score = max(0, current_distance - next_distance)
+
+            # Bold action bonus (prefer larger steps during exploration)
+            boldness_score = abs(action) * 0.1
+
+            # Randomness for exploration
+            random_score = random.random() * 10
+
+            total_score = progress_score + boldness_score + random_score
+            action_scores.append((action, total_score))
+
+        if not action_scores:
+            # Emergency: all actions lead to forbidden states
+            return self._emergency_action(current, forbidden_states, available_actions)
+
+        # Select action with highest score
+        return max(action_scores, key=lambda x: x[1])[0]
+
+    def _emergency_action(self, current: float, forbidden_states: set,
+                         available_actions: List[float]) -> float:
+        """Emergency action when all forward moves are blocked."""
+        # Try backward actions
+        for action in [-1, -2, -3]:
+            if current + action not in forbidden_states and current + action >= 0:
+                return action
+
+        # Last resort: smallest forward action
+        return min(available_actions)
+
+
+class LearnedSubgoalOptimizer:
+    """
+    Solution 2: Intelligent Subgoal Selection
+
+    Replaces heuristic-based subgoal selection with learned optimization:
+    - Adapts subgoal spacing to problem characteristics
+    - Learns from success/failure patterns
+    - Considers constraint distribution in subgoal placement
+    """
+
+    def __init__(self):
+        self.success_patterns = defaultdict(list)  # Store successful decompositions
+        self.failure_patterns = defaultdict(list)  # Store failed decompositions
+        self.min_subgoal_gap = 30  # Minimum gap between subgoals
+        self.max_subgoal_gap = 80  # Maximum gap between subgoals
+
+    def decompose_target_intelligent(self, current: float, target: float,
+                                   forbidden_states: Optional[set] = None) -> List[float]:
+        """
+        Intelligently decompose target based on learned patterns and problem structure.
+        """
+        forbidden_states = forbidden_states or set()
+        gap = abs(target - current)
+
+        # Small problems: direct approach
+        if gap <= 50:
+            return [target]
+
+        # Analyze problem characteristics
+        problem_signature = self._create_problem_signature(current, target, forbidden_states)
+
+        # Check if we've seen similar problems before
+        similar_successes = self._find_similar_successes(problem_signature)
+
+        if similar_successes:
+            # Adapt successful pattern to current problem
+            return self._adapt_successful_pattern(current, target, similar_successes[0])
+        else:
+            # Create new decomposition using constraint-aware strategy
+            return self._create_constraint_aware_decomposition(current, target, forbidden_states)
+
+    def _create_problem_signature(self, current: float, target: float,
+                                forbidden_states: set) -> Dict:
+        """Create a signature that captures key problem characteristics."""
+        gap = abs(target - current)
+
+        # Constraint analysis
+        constraint_density = len(forbidden_states) / max(1, gap) if gap > 0 else 0
+        constraint_clusters = self._identify_constraint_clusters(current, target, forbidden_states)
+
+        return {
+            'gap_size': gap,
+            'constraint_density': constraint_density,
+            'constraint_clusters': len(constraint_clusters),
+            'gap_category': self._categorize_gap(gap)
+        }
+
+    def _categorize_gap(self, gap: float) -> str:
+        """Categorize gap size for pattern matching."""
+        if gap <= 100:
+            return 'small'
+        elif gap <= 300:
+            return 'medium'
+        elif gap <= 500:
+            return 'large'
+        else:
+            return 'extra_large'
+
+    def _find_similar_successes(self, problem_signature: Dict) -> List[List[float]]:
+        """Find previously successful decompositions for similar problems."""
+        similar_patterns = []
+
+        for stored_signature, patterns in self.success_patterns.items():
+            if self._signatures_similar(problem_signature, stored_signature):
+                similar_patterns.extend(patterns)
+
+        # Sort by success rate or efficiency if available
+        return similar_patterns[:3]  # Return top 3 patterns
+
+    def _signatures_similar(self, sig1: Dict, sig2: Dict, threshold: float = 0.7) -> bool:
+        """Check if two problem signatures are similar."""
+        if sig1['gap_category'] != sig2['gap_category']:
+            return False
+
+        # Compare constraint density
+        density_diff = abs(sig1['constraint_density'] - sig2['constraint_density'])
+        if density_diff > 0.1:  # Different constraint complexity
+            return False
+
+        return True
+
+    def _adapt_successful_pattern(self, current: float, target: float,
+                                pattern: List[float]) -> List[float]:
+        """Adapt a successful pattern to the current problem."""
+        gap = abs(target - current)
+        pattern_gap = pattern[-1] - pattern[0] if len(pattern) > 1 else gap
+
+        if pattern_gap == 0:
+            return [target]
+
+        # Scale pattern to current problem
+        scale_factor = gap / pattern_gap
+        direction = 1 if target > current else -1
+
+        adapted_subgoals = []
+        for i, subgoal in enumerate(pattern[:-1]):  # Exclude final target
+            relative_position = (subgoal - pattern[0]) / pattern_gap
+            adapted_position = current + (relative_position * gap * direction)
+            adapted_subgoals.append(adapted_position)
+
+        adapted_subgoals.append(target)
+        return adapted_subgoals
+
+    def _create_constraint_aware_decomposition(self, current: float, target: float,
+                                             forbidden_states: set) -> List[float]:
+        """
+        Create new decomposition that considers constraint distribution.
+
+        Strategy:
+        1. Identify constraint clusters
+        2. Place subgoals to avoid dense constraint regions
+        3. Ensure subgoal gaps are manageable (30-80 units)
+        """
+        gap = abs(target - current)
+        direction = 1 if target > current else -1
+
+        # Identify constraint clusters
+        clusters = self._identify_constraint_clusters(current, target, forbidden_states)
+
+        subgoals = []
+        position = current
+        remaining_gap = gap
+
+        while remaining_gap > self.max_subgoal_gap:
+            # Find next safe region
+            next_cluster = self._find_next_cluster(position, target, clusters)
+
+            if next_cluster and next_cluster['start'] - position > self.min_subgoal_gap:
+                # Place subgoal before cluster
+                safe_position = next_cluster['start'] - 10 * direction  # Safety margin
+                subgoals.append(safe_position)
+                position = next_cluster['end'] + 10 * direction  # Jump over cluster
+            else:
+                # No immediate cluster, use adaptive spacing
+                step_size = min(self.max_subgoal_gap, remaining_gap // 2)
+                position += step_size * direction
+                subgoals.append(position)
+
+            remaining_gap = abs(target - position)
+
+        subgoals.append(target)
+        return subgoals
+
+    def _identify_constraint_clusters(self, current: float, target: float, forbidden_states: set) -> List[Dict]:
+        """Identify clusters of forbidden states."""
+        if not forbidden_states:
+            return []
+
+        start, end = min(current, target), max(current, target)
+        sorted_states = sorted([s for s in forbidden_states if start <= s <= end])
+
+        if not sorted_states:
+            return []
+
+        clusters = []
+        current_cluster = {'start': sorted_states[0], 'end': sorted_states[0], 'count': 1}
+
+        for i in range(1, len(sorted_states)):
+            if sorted_states[i] - sorted_states[i-1] <= 5:  # States are close
+                current_cluster['end'] = sorted_states[i]
+                current_cluster['count'] += 1
+            else:
+                clusters.append(current_cluster)
+                current_cluster = {'start': sorted_states[i], 'end': sorted_states[i], 'count': 1}
+
+        clusters.append(current_cluster)
+        return clusters
+
+    def _find_next_cluster(self, position: float, target: float, clusters: List[Dict]) -> Optional[Dict]:
+        """Find the next constraint cluster in the path."""
+        direction = 1 if target > position else -1
+
+        for cluster in clusters:
+            if direction == 1 and cluster['start'] > position:
+                return cluster
+            elif direction == -1 and cluster['end'] < position:
+                return cluster
+
+        return None
+
+# from cdoe.txt
+class HierarchicalQNetwork(nn.Module):
+    """
+    Multi-head network that learns different strategies for different phases
+    """
+    def __init__(self, state_dim=12, action_dim=3, hidden_dim=256):
+        super().__init__()
+
+        # Shared feature extractor
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        # Phase-specific heads
+        self.exploration_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        self.navigation_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        self.precision_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        # Phase classifier
+        self.phase_classifier = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, state_features):
+        # Extract shared features
+        features = self.feature_extractor(state_features)
+
+        # Classify phase
+        phase_probs = self.phase_classifier(features)
+
+        # Compute Q-values for each phase
+        exploration_q = self.exploration_head(features)
+        navigation_q = self.navigation_head(features)
+        precision_q = self.precision_head(features)
+
+        # Weighted combination based on phase probabilities
+        q_values = (phase_probs[:, 0:1] * exploration_q +
+                   phase_probs[:, 1:2] * navigation_q +
+                   phase_probs[:, 2:3] * precision_q)
+
+        return q_values, phase_probs
+
+
+class HierarchicalRLAgent:
+    def __init__(self, actions: List[float], lr: float = 0.0005, meta_lr: float = 0.0001):
+        self.actions = actions
+        self.q_network = HierarchicalQNetwork(action_dim=len(actions))
+        self.target_network = HierarchicalQNetwork(action_dim=len(actions))
+        self.meta_controller = MetaController()
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.meta_optimizer = optim.Adam(self.meta_controller.parameters(), lr=meta_lr)
+        self.experience_buffer = deque(maxlen=20000)
+        self.meta_experience_buffer = deque(maxlen=1000)
+
+        self.exploration_strategy = EnhancedExplorationStrategy()
+        self.subgoal_optimizer = LearnedSubgoalOptimizer()
+
+        self.subgoal_stack = []
+        self.current_subgoal = None
+        self.recent_actions = []
+
+    def get_state_features(self, current, target, step, max_steps, forbidden_states=None):
+        """Enhanced state representation"""
+        state = HierarchicalState(current, target, step, max_steps, forbidden_states)
+        return state.to_features()
+
+    def set_subgoal(self, current, target, step, max_steps, forbidden_states=None):
+        """Use the meta-controller to set a sub-goal"""
+        state_features = self.get_state_features(current, target, step, max_steps, forbidden_states)
+        state_tensor = torch.FloatTensor(state_features).unsqueeze(0)
+        with torch.no_grad():
+            subgoal_offset = self.meta_controller(state_tensor).item()
+
+        # The meta-controller outputs a value between -1 and 1, which we scale to a reasonable offset
+        subgoal = current + int(subgoal_offset * (target - current))
+        return subgoal
+
+    def choose_action(self, current, target, step, max_steps, forbidden_states, training=True):
+        if self.current_subgoal is None or current == self.current_subgoal:
+            self.current_subgoal = self.set_subgoal(current, target, step, max_steps, forbidden_states)
+
+        working_target = self.current_subgoal or target
+
+        if training:
+            should_explore, _ = self.exploration_strategy.should_explore(current, working_target, step, forbidden_states, self.recent_actions)
+            if should_explore:
+                return self.exploration_strategy.select_exploration_action(current, working_target, forbidden_states, self.actions)
+
+        state_features = self.get_state_features(current, working_target, step, max_steps, forbidden_states)
+        state_tensor = torch.FloatTensor(state_features).unsqueeze(0)
+
+        with torch.no_grad():
+            q_values, _ = self.q_network(state_tensor)
+
+        # Select best valid action
+        best_action = None
+        best_q = -float('inf')
+        for i, action in enumerate(self.actions):
+            if current + action not in forbidden_states:
+                if q_values[0, i] > best_q:
+                    best_q = q_values[0, i]
+                    best_action = action
+
+        return best_action or self.exploration_strategy.select_exploration_action(current, working_target, forbidden_states, self.actions)
+
+    def store_experience(self, *args):
+        self.experience_buffer.append(args)
+        
+        # Store experience for meta-controller
+        _, _, reward, _, done = args
+        if done and reward > 0:
+            state, _, _, _, _ = args
+            meta_experience = {
+                'state': state,
+                'reward': reward,
+            }
+            self.meta_experience_buffer.append(meta_experience)
+
+
+    def learn(self, batch_size=64):
+        if len(self.experience_buffer) < batch_size:
+            return
+
+        batch = random.sample(self.experience_buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.LongTensor([self.actions.index(a) for a in actions])
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor(np.array(next_states))
+        dones = torch.BoolTensor(dones)
+
+        current_q_values, _ = self.q_network(states)
+        current_q_values = current_q_values.gather(1, actions.unsqueeze(1))
+
+        with torch.no_grad():
+            next_q_values, _ = self.target_network(next_states)
+            next_q_values = next_q_values.max(1)[0]
+            target_q_values = rewards + (0.99 * next_q_values * ~dones)
+
+        loss = nn.SmoothL1Loss()(current_q_values.squeeze(), target_q_values)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def learn_meta_controller(self, batch_size=32):
+        if len(self.meta_experience_buffer) < batch_size:
+            return
+
+        batch = random.sample(self.meta_experience_buffer, batch_size)
+
+        for experience in batch:
+            state_features = torch.FloatTensor(experience['state']).unsqueeze(0)
+            reward = experience['reward']
+
+            subgoal_offset = self.meta_controller(state_features)
+
+            # We want to maximize the reward, so we use a simple reward maximization loss
+            loss = -subgoal_offset * reward
+
+            self.meta_optimizer.zero_grad()
+            loss.backward()
+            self.meta_optimizer.step()
+
+    def update_target_network(self):
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+# from the training agent.txt
+class MathPuzzleEnv:
+    def __init__(self, target_number, max_steps, forbidden_numbers=None):
+        self.target_number = target_number
+        self.max_steps = max_steps
+        self.forbidden_numbers = forbidden_numbers or set()
+        self.reset()
+
+    def reset(self):
+        self.current_number = 0
+        self.steps = 0
+        return self.current_number
+
+    def step(self, action):
+        self.current_number += action
+        self.steps += 1
+
+        reward = -1  # Default step penalty
+        done = False
+
+        if self.current_number in self.forbidden_numbers:
+            reward = -50
+            done = True
+        elif self.current_number == self.target_number:
+            reward = 100
+            done = True
+        elif self.steps >= self.max_steps:
+            reward = -20
+            done = True
+
+        return self.current_number, reward, done
+
+def train_and_evaluate(agent, episodes=5000, test_targets=None):
+    if test_targets is None:
+        test_targets = [123, 278, 431, 555]
+
+    print("--- Starting Training ---")
+    start_time = time.time()
+
+    for episode in range(episodes):
+        target = random.randint(50, 500)
+        forbidden = {random.randint(20, 480) for _ in range(random.randint(3, 8))}
+        env = MathPuzzleEnv(target, 150, forbidden)
+
+        current = env.reset()
+        done = False
+
+        while not done:
+            action = agent.choose_action(current, target, env.steps, env.max_steps, forbidden)
+            next_state, reward, done = env.step(action)
+
+            state_features = agent.get_state_features(current, target, env.steps, env.max_steps, forbidden)
+            next_state_features = agent.get_state_features(next_state, target, env.steps + 1, env.max_steps, forbidden)
+
+            agent.store_experience(state_features, action, reward, next_state_features, done)
+            current = next_state
+
+            agent.learn()
+            agent.learn_meta_controller()
+
+        if episode % 10 == 0:
+            agent.update_target_network()
+
+        if (episode + 1) % 500 == 0:
+            print(f"Episode {episode + 1}/{episodes} completed.")
+
+    print(f"--- Training Finished in {time.time() - start_time:.2f}s ---")
+
+    print("\n--- Starting Evaluation ---")
+    for target in test_targets:
+        forbidden = {random.randint(20, target - 20) for _ in range(random.randint(5, 10))}
+        env = MathPuzzleEnv(target, 200, forbidden)
+
+        current = env.reset()
+        done = False
+        path = [current]
+
+        while not done:
+            action = agent.choose_action(current, target, env.steps, env.max_steps, forbidden, training=False)
+            next_state, _, done = env.step(action)
+            path.append(next_state)
+            current = next_state
+
+        if path[-1] == target:
+            print(f"Target {target}: Success in {len(path)-1} steps. Path: {path[:5]}...{path[-5:]}")
+        else:
+            print(f"Target {target}: Failure. Final state: {path[-1]}")
+
+class MetaController(nn.Module):
+    def __init__(self, state_dim=12, hidden_dim=128):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),  # Output a single value representing the sub-goal
+            nn.Tanh()  # Ensure the output is between -1 and 1
+        )
+
+    def forward(self, state_features):
+        return self.network(state_features)
+
+# Main execution
+agent = HierarchicalRLAgent(actions=[1, 5, 10, -1, -3, -7])
+train_and_evaluate(agent)

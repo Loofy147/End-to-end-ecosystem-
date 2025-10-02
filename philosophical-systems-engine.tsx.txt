@@ -1,0 +1,862 @@
+import React, { useState, useEffect } from 'react';
+import { 
+  Brain, Cpu, Database, Shield, Zap, Network, Code2, Layers, 
+  Target, TrendingUp, AlertTriangle, CheckCircle, Clock, 
+  GitBranch, Server, Cloud, Lock, Globe, Users, Lightbulb
+} from 'lucide-react';
+
+const AdvancedSystemsPhilosophicalEngine = () => {
+  const [selectedSystem, setSelectedSystem] = useState('distributed');
+  const [analysisResults, setAnalysisResults] = useState({});
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [optimizationInsights, setOptimizationInsights] = useState([]);
+  const [implementationPlan, setImplementationPlan] = useState([]);
+  const [performanceMetrics, setPerformanceMetrics] = useState({});
+
+  // أصعب الأنظمة البرمجية الحالية مع التحديات الفلسفية
+  const complexSystems = {
+    distributed: {
+      name: 'الأنظمة الموزعة والحوسبة السحابية',
+      icon: Network,
+      description: 'أنظمة معقدة تعمل عبر عدة خوادم وشبكات مع تحديات التزامن والثبات',
+      challenges: [
+        'CAP Theorem - الاتساق vs التوفر vs مقاومة التقسيم',
+        'Eventual Consistency - الثبات النهائي مقابل الفوري',
+        'Byzantine Fault Tolerance - مقاومة الأخطاء البيزنطية',
+        'Consensus Algorithms - خوارزميات الإجماع الموزع'
+      ],
+      philosophicalAspects: {
+        identity: {
+          question: 'ما هوية النظام الموزع؟ هل هو كائن واحد أم مجموعة كائنات؟',
+          scenarios: [
+            {
+              name: 'نظام واحد متماسك',
+              params: { unity: 90, distribution: 30, autonomy: 20 }
+            },
+            {
+              name: 'اتحاد من الخدمات المستقلة',
+              params: { unity: 30, distribution: 90, autonomy: 85 }
+            },
+            {
+              name: 'هجين متكيف',
+              params: { unity: 60, distribution: 70, autonomy: 50 }
+            }
+          ],
+          theories: {
+            monism: { name: 'الوحدوية', weights: { unity: 0.8, distribution: 0.1, autonomy: 0.1 }},
+            pluralism: { name: 'التعددية', weights: { unity: 0.1, distribution: 0.7, autonomy: 0.2 }},
+            emergentism: { name: 'الانبثاقية', weights: { unity: 0.4, distribution: 0.4, autonomy: 0.2 }}
+          }
+        },
+        consistency: {
+          question: 'كيف نحقق الثبات في عالم متغير؟',
+          scenarios: [
+            {
+              name: 'ثبات قوي فوري',
+              params: { immediacy: 95, availability: 60, partition: 40 }
+            },
+            {
+              name: 'ثبات نهائي مرن',
+              params: { immediacy: 40, availability: 90, partition: 80 }
+            }
+          ]
+        },
+        consensus: {
+          question: 'كيف تتخذ الأنظمة المتعددة قرارات جماعية؟',
+          scenarios: [
+            {
+              name: 'قيادة مركزية',
+              params: { centralization: 90, democracy: 20, efficiency: 85 }
+            },
+            {
+              name: 'إجماع ديمقراطي',
+              params: { centralization: 20, democracy: 90, efficiency: 60 }
+            }
+          ]
+        }
+      },
+      optimizations: [
+        'تصميم معمارية Microservices متوازنة',
+        'تطبيق Event Sourcing و CQRS',
+        'استخدام Distributed Caching الذكي',
+        'تحسين Load Balancing الفلسفي',
+        'تصميم Circuit Breakers فلسفية'
+      ]
+    },
+
+    ai_ml: {
+      name: 'أنظمة الذكاء الاصطناعي والتعلم الآلي',
+      icon: Brain,
+      description: 'خوارزميات معقدة تتعلم وتتخذ قرارات بطرق قد تكون غير مفهومة للبشر',
+      challenges: [
+        'Black Box Problem - مشكلة الصندوق الأسود',
+        'Bias and Fairness - التحيز والعدالة',
+        'Explainable AI - الذكاء الاصطناعي القابل للتفسير',
+        'AGI Safety - أمان الذكاء العام الاصطناعي'
+      ],
+      philosophicalAspects: {
+        knowledge: {
+          question: 'كيف تعرف الآلة؟ هل هو فهم حقيقي أم محاكاة؟',
+          scenarios: [
+            {
+              name: 'نموذج تجريبي خالص',
+              params: { empiricism: 95, rationalism: 20, intuition: 10 }
+            },
+            {
+              name: 'نموذج عقلاني منطقي',
+              params: { empiricism: 30, rationalism: 90, intuition: 15 }
+            },
+            {
+              name: 'نموذج حدسي انبثاقي',
+              params: { empiricism: 50, rationalism: 40, intuition: 80 }
+            }
+          ]
+        },
+        ethics: {
+          question: 'كيف تتخذ الآلة قرارات أخلاقية؟',
+          scenarios: [
+            {
+              name: 'نفعية محضة',
+              params: { utility: 95, duty: 20, virtue: 30 }
+            },
+            {
+              name: 'أخلاق الواجب',
+              params: { utility: 30, duty: 90, virtue: 40 }
+            },
+            {
+              name: 'أخلاق الفضيلة',
+              params: { utility: 40, duty: 50, virtue: 85 }
+            }
+          ]
+        },
+        consciousness: {
+          question: 'هل يمكن للآلة أن تكون واعية؟',
+          scenarios: [
+            {
+              name: 'وظيفية خالصة',
+              params: { behavior: 90, experience: 30, emergence: 40 }
+            },
+            {
+              name: 'تجربة ذاتية',
+              params: { behavior: 60, experience: 85, emergence: 70 }
+            }
+          ]
+        }
+      },
+      optimizations: [
+        'تطوير Explainable AI Frameworks',
+        'تصميم Ethical Decision Trees',
+        'بناء Bias Detection Systems',
+        'تطبيق Federated Learning الأخلاقي',
+        'تطوير Human-in-the-Loop Systems'
+      ]
+    },
+
+    blockchain: {
+      name: 'أنظمة البلوك تشين والعملات المشفرة',
+      icon: Lock,
+      description: 'أنظمة لامركزية تعتمد على الثقة الموزعة والتشفير',
+      challenges: [
+        'Scalability Trilemma - ثلاثية القابلية للتوسع',
+        'Energy Consumption - استهلاك الطاقة',
+        'Governance - الحوكمة اللامركزية',
+        'Smart Contract Security - أمان العقود الذكية'
+      ],
+      philosophicalAspects: {
+        trust: {
+          question: 'كيف نثق بدون سلطة مركزية؟',
+          scenarios: [
+            {
+              name: 'ثقة مطلقة بالكود',
+              params: { codeFirst: 95, humanJudgment: 20, flexibility: 30 }
+            },
+            {
+              name: 'ثقة هجينة',
+              params: { codeFirst: 60, humanJudgment: 70, flexibility: 80 }
+            }
+          ]
+        },
+        governance: {
+          question: 'كيف تحكم المجتمعات نفسها؟',
+          scenarios: [
+            {
+              name: 'ديمقراطية مباشرة',
+              params: { democracy: 95, efficiency: 40, expertise: 30 }
+            },
+            {
+              name: 'حكم الخبراء',
+              params: { democracy: 30, efficiency: 85, expertise: 90 }
+            }
+          ]
+        }
+      },
+      optimizations: [
+        'تصميم Consensus Mechanisms متوازنة',
+        'تطوير Layer 2 Solutions فلسفية',
+        'بناء Governance Frameworks ديمقراطية',
+        'تحسين Smart Contract Security',
+        'تطوير Sustainable Mining Algorithms'
+      ]
+    },
+
+    cybersecurity: {
+      name: 'أنظمة الأمن السيبراني المتقدمة',
+      icon: Shield,
+      description: 'أنظمة حماية معقدة تواجه تهديدات متطورة ومتغيرة',
+      challenges: [
+        'Zero Trust Architecture - معمارية عدم الثقة',
+        'AI-Powered Attacks - هجمات مدعومة بالذكاء الاصطناعي',
+        'Privacy vs Security - الخصوصية مقابل الأمان',
+        'Quantum Computing Threats - تهديدات الحوسبة الكمية'
+      ],
+      philosophicalAspects: {
+        privacy: {
+          question: 'ما هي حدود الخصوصية مقابل الأمان؟',
+          scenarios: [
+            {
+              name: 'خصوصية مطلقة',
+              params: { privacy: 95, security: 60, convenience: 40 }
+            },
+            {
+              name: 'أمان أقصى',
+              params: { privacy: 40, security: 95, convenience: 70 }
+            },
+            {
+              name: 'توازن عملي',
+              params: { privacy: 70, security: 75, convenience: 80 }
+            }
+          ]
+        },
+        trust: {
+          question: 'كيف نبني الثقة في عالم رقمي؟',
+          scenarios: [
+            {
+              name: 'عدم ثقة تام',
+              params: { verification: 95, assumption: 10, flexibility: 30 }
+            },
+            {
+              name: 'ثقة محسوبة',
+              params: { verification: 70, assumption: 50, flexibility: 70 }
+            }
+          ]
+        }
+      },
+      optimizations: [
+        'تطوير Zero Trust Architecture فلسفية',
+        'بناء AI Security Systems أخلاقية',
+        'تصميم Privacy-Preserving Systems',
+        'تطوير Quantum-Resistant Cryptography',
+        'بناء Threat Intelligence متكيفة'
+      ]
+    },
+
+    realtime: {
+      name: 'أنظمة الوقت الفعلي والحوسبة الحدية',
+      icon: Zap,
+      description: 'أنظمة تتطلب استجابة فورية مع قيود زمنية صارمة',
+      challenges: [
+        'Latency vs Throughput - زمن الاستجابة مقابل الإنتاجية',
+        'Edge Computing Complexity - تعقيد الحوسبة الحدية',
+        'Real-time Decision Making - اتخاذ القرارات الفوري',
+        'Resource Constraints - قيود الموارد'
+      ],
+      philosophicalAspects: {
+        time: {
+          question: 'ما هو الوقت الحقيقي؟ هل هو مطلق أم نسبي؟',
+          scenarios: [
+            {
+              name: 'زمن مطلق محدد',
+              params: { absoluteTime: 90, relativity: 20, flexibility: 30 }
+            },
+            {
+              name: 'زمن نسبي مرن',
+              params: { absoluteTime: 30, relativity: 85, flexibility: 80 }
+            }
+          ]
+        },
+        decision: {
+          question: 'كيف نتخذ قرارات سريعة وصحيحة؟',
+          scenarios: [
+            {
+              name: 'سرعة أولاً',
+              params: { speed: 95, accuracy: 60, completeness: 40 }
+            },
+            {
+              name: 'دقة أولاً',
+              params: { speed: 60, accuracy: 90, completeness: 80 }
+            }
+          ]
+        }
+      },
+      optimizations: [
+        'تصميم Event-Driven Architecture فلسفية',
+        'تطوير Edge Computing Strategies',
+        'بناء Real-time Analytics Systems',
+        'تحسين Stream Processing Pipelines',
+        'تطوير Predictive Caching Systems'
+      ]
+    },
+
+    quantum: {
+      name: 'الحوسبة الكمية والخوارزميات المتقدمة',
+      icon: Cpu,
+      description: 'تقنيات حوسبية تستغل مبادئ ميكانيكا الكم',
+      challenges: [
+        'Quantum Decoherence - فقدان التماسك الكمي',
+        'Quantum Error Correction - تصحيح الأخطاء الكمية',
+        'Classical-Quantum Interface - واجهة الكلاسيكي-الكمي',
+        'Quantum Algorithms Design - تصميم الخوارزميات الكمية'
+      ],
+      philosophicalAspects: {
+        reality: {
+          question: 'ما طبيعة الواقع الكمي؟',
+          scenarios: [
+            {
+              name: 'تفسير كوبنهاغن',
+              params: { superposition: 85, measurement: 90, locality: 30 }
+            },
+            {
+              name: 'متعدد العوالم',
+              params: { superposition: 95, measurement: 30, locality: 60 }
+            }
+          ]
+        },
+        computation: {
+          question: 'كيف تعمل الحوسبة مع التراكب الكمي؟',
+          scenarios: [
+            {
+              name: 'حوسبة احتمالية',
+              params: { probability: 90, determinism: 30, parallelism: 85 }
+            },
+            {
+              name: 'حوسبة هجينة',
+              params: { probability: 60, determinism: 70, parallelism: 60 }
+            }
+          ]
+        }
+      },
+      optimizations: [
+        'تطوير Quantum Error Correction Codes',
+        'تصميم Hybrid Classical-Quantum Algorithms',
+        'بناء Quantum-Safe Cryptography',
+        'تحسين Quantum Gate Operations',
+        'تطوير Quantum Programming Languages'
+      ]
+    }
+  };
+
+  // تشغيل التحليل الشامل
+  const runComprehensiveAnalysis = async () => {
+    setIsAnalyzing(true);
+    const system = complexSystems[selectedSystem];
+    const results = {};
+    const metrics = {};
+
+    // تحليل كل جانب فلسفي
+    for (const [aspectKey, aspect] of Object.entries(system.philosophicalAspects)) {
+      results[aspectKey] = {};
+      
+      for (const scenario of aspect.scenarios) {
+        const scenarioResults = {};
+        
+        if (aspect.theories) {
+          Object.entries(aspect.theories).forEach(([theoryKey, theory]) => {
+            let score = 0;
+            Object.entries(theory.weights).forEach(([param, weight]) => {
+              score += scenario.params[param] * weight;
+            });
+            scenarioResults[theoryKey] = {
+              score: Math.round(score),
+              theory: theory.name
+            };
+          });
+        } else {
+          // تحليل عام للسيناريوهات بدون نظريات محددة
+          const avgScore = Object.values(scenario.params).reduce((a, b) => a + b, 0) / Object.values(scenario.params).length;
+          scenarioResults['general'] = {
+            score: Math.round(avgScore),
+            theory: 'تحليل عام'
+          };
+        }
+        
+        results[aspectKey][scenario.name] = scenarioResults;
+      }
+
+      // حساب المقاييس
+      metrics[aspectKey] = calculateAspectMetrics(results[aspectKey]);
+      
+      // تأخير للمحاكاة
+      await new Promise(resolve => setTimeout(resolve, 800));
+    }
+
+    setAnalysisResults(results);
+    setPerformanceMetrics(metrics);
+    generateOptimizationInsights(results, system);
+    generateImplementationPlan(results, system);
+    setIsAnalyzing(false);
+  };
+
+  // حساب مقاييس الأداء
+  const calculateAspectMetrics = (aspectResults) => {
+    const allScores = [];
+    Object.values(aspectResults).forEach(scenarioResult => {
+      Object.values(scenarioResult).forEach(result => {
+        allScores.push(result.score);
+      });
+    });
+
+    return {
+      average: Math.round(allScores.reduce((a, b) => a + b, 0) / allScores.length),
+      max: Math.max(...allScores),
+      min: Math.min(...allScores),
+      variance: Math.round(calculateVariance(allScores))
+    };
+  };
+
+  const calculateVariance = (scores) => {
+    const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+    return scores.reduce((acc, score) => acc + Math.pow(score - avg, 2), 0) / scores.length;
+  };
+
+  // توليد رؤى التحسين
+  const generateOptimizationInsights = (results, system) => {
+    const insights = [];
+    
+    Object.entries(results).forEach(([aspectKey, aspectResults]) => {
+      const aspect = system.philosophicalAspects[aspectKey];
+      const bestScores = [];
+      
+      Object.values(aspectResults).forEach(scenarioResult => {
+        const maxScore = Math.max(...Object.values(scenarioResult).map(r => r.score));
+        bestScores.push(maxScore);
+      });
+      
+      const avgBestScore = bestScores.reduce((a, b) => a + b, 0) / bestScores.length;
+      
+      insights.push({
+        aspect: aspectKey,
+        question: aspect.question,
+        score: Math.round(avgBestScore),
+        priority: avgBestScore > 70 ? 'عالي' : avgBestScore > 50 ? 'متوسط' : 'منخفض',
+        recommendation: generateRecommendation(avgBestScore, aspectKey),
+        technicalSolutions: system.optimizations.filter((_, index) => index < 2)
+      });
+    });
+
+    insights.sort((a, b) => b.score - a.score);
+    setOptimizationInsights(insights);
+  };
+
+  const generateRecommendation = (score, aspect) => {
+    if (score > 80) return 'ممتاز - تطبيق فوري مع تحسينات تدريجية';
+    if (score > 70) return 'جيد جداً - تطبيق مع مراقبة مستمرة';
+    if (score > 60) return 'جيد - يحتاج تحسينات قبل التطبيق';
+    if (score > 40) return 'مقبول - يحتاج إعادة تصميم جزئي';
+    return 'ضعيف - يحتاج إعادة تصميم شامل';
+  };
+
+  // توليد خطة التنفيذ
+  const generateImplementationPlan = (results, system) => {
+    const phases = [
+      {
+        name: 'المرحلة التحضيرية',
+        duration: '2-4 أسابيع',
+        tasks: [
+          'تحليل البنية التحتية الحالية',
+          'تحديد نقاط الضعف الفلسفية',
+          'بناء فريق متعدد التخصصات',
+          'وضع معايير الأداء المستهدفة'
+        ],
+        risk: 'منخفض',
+        impact: 'أساسي'
+      },
+      {
+        name: 'مرحلة التصميم الفلسفي',
+        duration: '4-8 أسابيع',
+        tasks: [
+          'تطبيق النظريات الفلسفية عالية الأداء',
+          'تصميم معمارية متوازنة فلسفياً',
+          'إنشاء برتوتايبات تجريبية',
+          'تطوير مقاييس الأداء الشاملة'
+        ],
+        risk: 'متوسط',
+        impact: 'عالي'
+      },
+      {
+        name: 'مرحلة التطبيق التدريجي',
+        duration: '8-16 أسبوع',
+        tasks: [
+          'تطبيق النظام الجديد تدريجياً',
+          'مراقبة الأداء المستمرة',
+          'تحسين النظام بناءً على البيانات',
+          'تدريب الفرق على المفاهيم الجديدة'
+        ],
+        risk: 'عالي',
+        impact: 'حرج'
+      },
+      {
+        name: 'مرحلة التحسين المستمر',
+        duration: 'مستمرة',
+        tasks: [
+          'مراقبة المقاييس الفلسفية',
+          'تطوير التحسينات المستمرة',
+          'تحديث النظريات حسب التطورات',
+          'نشر المعرفة والممارسات الأفضل'
+        ],
+        risk: 'منخفض',
+        impact: 'متراكم'
+      }
+    ];
+
+    setImplementationPlan(phases);
+  };
+
+  const resetAnalysis = () => {
+    setIsAnalyzing(false);
+    setAnalysisResults({});
+    setOptimizationInsights([]);
+    setImplementationPlan([]);
+    setPerformanceMetrics({});
+  };
+
+  const currentSystem = complexSystems[selectedSystem];
+
+  return (
+    <div className="p-6 max-w-7xl mx-auto bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 min-h-screen" dir="rtl">
+      {/* العنوان */}
+      <div className="text-center mb-8">
+        <h1 className="text-4xl font-bold text-blue-800 mb-2 flex items-center justify-center gap-3">
+          <Target className="w-10 h-10" />
+          محرك التحليل الفلسفي للأنظمة البرمجية المتقدمة
+        </h1>
+        <p className="text-gray-600 text-lg">
+          تطبيق التحليل الفلسفي على أصعب التحديات البرمجية للحصول على أفضل النتائج من جميع الجوانب
+        </p>
+      </div>
+
+      {/* اختيار النظام */}
+      <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
+        <h2 className="text-2xl font-bold mb-4">اختر النظام المعقد للتحليل</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {Object.entries(complexSystems).map(([key, system]) => {
+            const IconComponent = system.icon;
+            return (
+              <button
+                key={key}
+                onClick={() => setSelectedSystem(key)}
+                className={`p-4 rounded-lg border-2 transition-all ${
+                  selectedSystem === key 
+                    ? 'border-blue-500 bg-blue-50' 
+                    : 'border-gray-200 hover:border-blue-300'
+                }`}
+              >
+                <IconComponent className="w-8 h-8 mx-auto mb-2 text-blue-600" />
+                <h3 className="font-bold mb-2 capitalize">{aspect}</h3>
+                <div className="space-y-2">
+                  <div className="flex justify-between">
+                    <span className="text-sm text-gray-600">متوسط:</span>
+                    <span className="font-semibold">{metrics.average}%</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-sm text-gray-600">أعلى:</span>
+                    <span className="font-semibold text-green-600">{metrics.max}%</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-sm text-gray-600">أقل:</span>
+                    <span className="font-semibold text-red-600">{metrics.min}%</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-sm text-gray-600">تباين:</span>
+                    <span className="font-semibold">{metrics.variance}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* نتائج التحليل */}
+      {Object.keys(analysisResults).length > 0 && (
+        <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
+          <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+            <Database className="w-6 h-6" />
+            نتائج التحليل الفلسفي
+          </h2>
+          
+          <div className="space-y-6">
+            {Object.entries(analysisResults).map(([aspectKey, aspectResults]) => (
+              <div key={aspectKey} className="border rounded-lg p-4">
+                <h3 className="font-bold text-lg mb-3 capitalize">{aspectKey}</h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  {currentSystem.philosophicalAspects[aspectKey]?.question}
+                </p>
+                
+                <div className="space-y-3">
+                  {Object.entries(aspectResults).map(([scenarioName, results]) => (
+                    <div key={scenarioName} className="bg-gray-50 rounded p-3">
+                      <h4 className="font-semibold mb-2">{scenarioName}</h4>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        {Object.entries(results).map(([theoryKey, result]) => (
+                          <div key={theoryKey} className="text-center p-2 bg-white rounded">
+                            <h5 className="text-xs font-semibold mb-1">{result.theory}</h5>
+                            <div className={`text-lg font-bold ${
+                              result.score >= 80 ? 'text-green-600' :
+                              result.score >= 60 ? 'text-yellow-600' : 
+                              result.score >= 40 ? 'text-orange-600' : 'text-red-600'
+                            }`}>
+                              {result.score}%
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* رؤى التحسين */}
+      {optimizationInsights.length > 0 && (
+        <div className="bg-gradient-to-r from-purple-50 to-pink-50 rounded-lg shadow-lg p-6 mb-6">
+          <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+            <Lightbulb className="w-6 h-6" />
+            رؤى التحسين والتطوير
+          </h2>
+          
+          <div className="space-y-4">
+            {optimizationInsights.map((insight, index) => (
+              <div key={index} className="bg-white rounded-lg p-4 border-r-4 border-purple-500">
+                <div className="flex justify-between items-start mb-3">
+                  <div>
+                    <h3 className="font-bold text-lg capitalize">{insight.aspect}</h3>
+                    <p className="text-sm text-gray-600 mt-1">{insight.question}</p>
+                  </div>
+                  <div className="text-left">
+                    <span className={`px-3 py-1 rounded-full text-sm font-semibold ${
+                      insight.score >= 80 ? 'bg-green-100 text-green-800' :
+                      insight.score >= 60 ? 'bg-yellow-100 text-yellow-800' :
+                      insight.score >= 40 ? 'bg-orange-100 text-orange-800' : 
+                      'bg-red-100 text-red-800'
+                    }`}>
+                      {insight.score}%
+                    </span>
+                    <div className={`text-xs mt-1 ${
+                      insight.priority === 'عالي' ? 'text-red-600' :
+                      insight.priority === 'متوسط' ? 'text-yellow-600' : 'text-green-600'
+                    }`}>
+                      أولوية {insight.priority}
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="mb-3 p-3 bg-blue-50 rounded">
+                  <h4 className="font-semibold text-blue-800 mb-1">التوصية:</h4>
+                  <p className="text-blue-700 text-sm">{insight.recommendation}</p>
+                </div>
+                
+                <div>
+                  <h4 className="font-semibold mb-2">الحلول التقنية المقترحة:</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {insight.technicalSolutions.map((solution, idx) => (
+                      <div key={idx} className="flex items-center gap-2 text-sm">
+                        <CheckCircle className="w-4 h-4 text-green-500" />
+                        <span>{solution}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* خطة التنفيذ */}
+      {implementationPlan.length > 0 && (
+        <div className="bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg shadow-lg p-6 mb-6">
+          <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+            <Clock className="w-6 h-6" />
+            خطة التنفيذ الشاملة
+          </h2>
+          
+          <div className="space-y-4">
+            {implementationPlan.map((phase, index) => (
+              <div key={index} className="bg-white rounded-lg p-4 border-l-4 border-blue-500">
+                <div className="flex justify-between items-start mb-3">
+                  <div>
+                    <h3 className="font-bold text-lg">{phase.name}</h3>
+                    <div className="flex gap-4 mt-2 text-sm">
+                      <span className="flex items-center gap-1">
+                        <Clock className="w-4 h-4 text-blue-500" />
+                        {phase.duration}
+                      </span>
+                      <span className={`px-2 py-1 rounded text-xs ${
+                        phase.risk === 'منخفض' ? 'bg-green-100 text-green-800' :
+                        phase.risk === 'متوسط' ? 'bg-yellow-100 text-yellow-800' : 
+                        'bg-red-100 text-red-800'
+                      }`}>
+                        مخاطر {phase.risk}
+                      </span>
+                      <span className={`px-2 py-1 rounded text-xs ${
+                        phase.impact === 'عالي' || phase.impact === 'حرج' ? 'bg-purple-100 text-purple-800' :
+                        phase.impact === 'متراكم' ? 'bg-blue-100 text-blue-800' : 
+                        'bg-gray-100 text-gray-800'
+                      }`}>
+                        تأثير {phase.impact}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                
+                <div>
+                  <h4 className="font-semibold mb-2">المهام الرئيسية:</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {phase.tasks.map((task, idx) => (
+                      <div key={idx} className="flex items-start gap-2 text-sm">
+                        <div className="w-2 h-2 bg-blue-500 rounded-full mt-1.5"></div>
+                        <span>{task}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* التحسينات المتقدمة */}
+      {Object.keys(analysisResults).length > 0 && (
+        <div className="bg-gradient-to-r from-indigo-50 to-purple-50 rounded-lg shadow-lg p-6">
+          <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+            <Code2 className="w-6 h-6" />
+            التحسينات التقنية المتقدمة
+          </h2>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {currentSystem.optimizations.map((optimization, index) => (
+              <div key={index} className="bg-white rounded-lg p-4 border">
+                <div className="flex items-start gap-3">
+                  <div className="w-8 h-8 bg-indigo-100 rounded-full flex items-center justify-center">
+                    <span className="text-indigo-600 font-bold text-sm">{index + 1}</span>
+                  </div>
+                  <div>
+                    <h3 className="font-semibold mb-1">{optimization}</h3>
+                    <p className="text-sm text-gray-600">
+                      تحسين مبني على التحليل الفلسفي لتحقيق أفضل أداء
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* ملخص النتائج */}
+          <div className="mt-6 p-4 bg-indigo-100 rounded-lg">
+            <h3 className="font-bold text-lg mb-3">ملخص النتائج والتوصيات</h3>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+              <div className="bg-white p-3 rounded">
+                <h4 className="font-semibold text-green-700 mb-1">نقاط القوة</h4>
+                <p className="text-gray-600">الجوانب التي حصلت على أعلى النتائج وتحتاج للتطوير المستمر</p>
+              </div>
+              <div className="bg-white p-3 rounded">
+                <h4 className="font-semibold text-yellow-700 mb-1">مجالات التحسين</h4>
+                <p className="text-gray-600">الجوانب التي تحتاج تركيز إضافي وتحسينات مستهدفة</p>
+              </div>
+              <div className="bg-white p-3 rounded">
+                <h4 className="font-semibold text-red-700 mb-1">التحديات الرئيسية</h4>
+                <p className="text-gray-600">المجالات التي تتطلب إعادة تصميم أو نهج جديد كلياً</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default AdvancedSystemsPhilosophicalEngine;d text-sm mb-1">{system.name}</h3>
+                <p className="text-xs text-gray-600">{system.description}</p>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* تفاصيل النظام المختار */}
+      <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
+        <div className="flex items-center gap-3 mb-4">
+          <currentSystem.icon className="w-8 h-8 text-blue-600" />
+          <h2 className="text-2xl font-bold">{currentSystem.name}</h2>
+        </div>
+        <p className="text-gray-700 mb-4">{currentSystem.description}</p>
+        
+        {/* التحديات الرئيسية */}
+        <h3 className="text-lg font-bold mb-3">التحديات الرئيسية:</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+          {currentSystem.challenges.map((challenge, index) => (
+            <div key={index} className="p-3 bg-red-50 border border-red-200 rounded-lg">
+              <AlertTriangle className="w-4 h-4 text-red-500 inline mr-2" />
+              <span className="text-sm text-red-700">{challenge}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* الجوانب الفلسفية */}
+        <h3 className="text-lg font-bold mb-3">الجوانب الفلسفية للتحليل:</h3>
+        <div className="space-y-3 mb-4">
+          {Object.entries(currentSystem.philosophicalAspects).map(([aspectKey, aspect]) => (
+            <div key={aspectKey} className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
+              <h4 className="font-semibold text-purple-800 mb-1">{aspect.question}</h4>
+              <p className="text-sm text-purple-600">
+                {aspect.scenarios.length} سيناريوهات تجريبية للتحليل
+              </p>
+            </div>
+          ))}
+        </div>
+
+        {/* أزرار التحكم */}
+        <div className="flex gap-3">
+          <button
+            onClick={runComprehensiveAnalysis}
+            disabled={isAnalyzing}
+            className="px-6 py-3 bg-blue-600 text-white rounded-lg flex items-center gap-2 disabled:bg-gray-400 disabled:cursor-not-allowed"
+          >
+            {isAnalyzing ? (
+              <>
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                جاري التحليل...
+              </>
+            ) : (
+              <>
+                <Target className="w-4 h-4" />
+                تشغيل التحليل الشامل
+              </>
+            )}
+          </button>
+          <button
+            onClick={resetAnalysis}
+            className="px-6 py-3 bg-gray-500 text-white rounded-lg flex items-center gap-2"
+          >
+            <GitBranch className="w-4 h-4" />
+            إعادة تعيين
+          </button>
+        </div>
+      </div>
+
+      {/* مقاييس الأداء */}
+      {Object.keys(performanceMetrics).length > 0 && (
+        <div className="bg-gradient-to-r from-green-50 to-blue-50 rounded-lg shadow-lg p-6 mb-6">
+          <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+            <TrendingUp className="w-6 h-6" />
+            مقاييس الأداء الفلسفي
+          </h2>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            {Object.entries(performanceMetrics).map(([aspect, metrics]) => (
+              <div key={aspect} className="bg-white rounded-lg p-4 border">
+                <h3 className="font-bol

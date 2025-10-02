@@ -1,0 +1,648 @@
+"""
+Multi-Agent Strategy Discovery System
+====================================
+
+This system implements autonomous strategy discovery for 4 collaborative agents
+using enhanced exploration, learned subgoal optimization, and dueling Q-networks.
+
+Key Innovation: Agents learn exploration strategies through interaction and
+develop emergent coordination without pre-programmed behaviors.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import math
+from collections import defaultdict, deque
+from typing import List, Tuple, Dict, Optional, Any
+import matplotlib.pyplot as plt
+
+class AdaptiveExplorationStrategy:
+    """
+    خطوة 1: استراتيجية الاستكشاف المعززة
+    
+    يتكيف كل وكيل مع تعقيد المشكلة ويطور استراتيجيات استكشاف مخصصة
+    بناءً على النجاحات والفشل السابق.
+    """
+    
+    def __init__(self, agent_id: int, learning_rate: float = 0.01):
+        self.agent_id = agent_id
+        self.learning_rate = learning_rate
+        
+        # متتبعات الأداء الشخصية
+        self.success_history = deque(maxlen=100)
+        self.exploration_effectiveness = defaultdict(float)
+        self.problem_complexity_memory = {}
+        
+        # معاملات الاستكشاف التكيفية
+        self.base_epsilon = 0.1
+        self.curiosity_factor = 0.2
+        self.social_learning_factor = 0.15  # التعلم من الوكلاء الآخرين
+        
+        # آليات الكشف عن الوقوع في الحلول المحلية
+        self.stagnation_detector = StagnationDetector()
+        self.escape_strategies = EscapeStrategyLibrary()
+        
+    def compute_exploration_rate(self, current_state: Dict, 
+                                other_agents_performance: List[Dict]) -> float:
+        """
+        حساب معدل الاستكشاف بناءً على:
+        1. تعقيد المشكلة الحالية
+        2. مدى نجاح الاستراتيجيات السابقة
+        3. أداء الوكلاء الآخرين (التعلم الاجتماعي)
+        """
+        # تحليل تعقيد المشكلة
+        problem_complexity = self._assess_problem_complexity(current_state)
+        
+        # تقييم فعالية الاستكشاف السابق
+        historical_effectiveness = self._get_historical_effectiveness(problem_complexity)
+        
+        # التعلم من الوكلاء الآخرين
+        social_learning_bonus = self._compute_social_learning_bonus(other_agents_performance)
+        
+        # كشف الجمود والحاجة للهروب
+        stagnation_penalty = self.stagnation_detector.assess_stagnation(current_state)
+        
+        # المعادلة التكيفية النهائية
+        exploration_rate = (
+            self.base_epsilon +
+            problem_complexity * 0.3 +
+            (1.0 - historical_effectiveness) * 0.4 +
+            social_learning_bonus +
+            stagnation_penalty
+        )
+        
+        return min(0.8, max(0.05, exploration_rate))  # حدود آمنة
+    
+    def _assess_problem_complexity(self, state: Dict) -> float:
+        """تقييم تعقيد المشكلة الحالية"""
+        gap = abs(state['target'] - state['current'])
+        constraint_density = len(state['forbidden_states']) / max(1, gap)
+        time_pressure = state['step'] / state['max_steps']
+        
+        # مؤشر التعقيد المركب
+        complexity = (
+            min(1.0, gap / 500) * 0.4 +           # حجم المشكلة
+            min(1.0, constraint_density * 10) * 0.4 +  # كثافة القيود
+            time_pressure * 0.2                        # ضغط الوقت
+        )
+        
+        return complexity
+    
+    def _get_historical_effectiveness(self, complexity_level: float) -> float:
+        """استرجاع فعالية الاستراتيجيات السابقة في مستوى التعقيد هذا"""
+        complexity_key = int(complexity_level * 10)  # تجميع للمستويات المتشابهة
+        
+        if complexity_key in self.exploration_effectiveness:
+            return self.exploration_effectiveness[complexity_key]
+        else:
+            return 0.5  # قيمة محايدة للمشاكل الجديدة
+    
+    def _compute_social_learning_bonus(self, other_agents_performance: List[Dict]) -> float:
+        """حساب مكافأة التعلم من نجاح الوكلاء الآخرين"""
+        if not other_agents_performance:
+            return 0.0
+        
+        # معدل نجاح الوكلاء الآخرين
+        others_success_rate = np.mean([perf['recent_success_rate'] 
+                                     for perf in other_agents_performance])
+        
+        # إذا كان الآخرون ينجحون أكثر، زد الاستكشاف للتعلم منهم
+        my_success_rate = np.mean(self.success_history) if self.success_history else 0.5
+        
+        if others_success_rate > my_success_rate + 0.1:
+            return self.social_learning_factor
+        else:
+            return 0.0
+    
+    def select_exploration_action(self, available_actions: List[float], 
+                                current_state: Dict) -> float:
+        """اختيار حركة استكشافية ذكية"""
+        
+        # استراتيجيات الاستكشاف المتعددة
+        strategies = [
+            self._curiosity_driven_action,
+            self._diversity_seeking_action,
+            self._escape_oriented_action,
+            self._social_imitation_action
+        ]
+        
+        # اختيار الاستراتيجية بناءً على الوضع الحالي
+        if self.stagnation_detector.is_stuck():
+            strategy = self._escape_oriented_action
+        elif self._should_imitate_others():
+            strategy = self._social_imitation_action
+        else:
+            strategy = random.choice(strategies[:2])  # فضول أو تنويع
+        
+        return strategy(available_actions, current_state)
+    
+    def _curiosity_driven_action(self, actions: List[float], state: Dict) -> float:
+        """اختيار حركة تعظم الفضول (المناطق غير المستكشفة)"""
+        curiosity_scores = []
+        
+        for action in actions:
+            next_pos = state['current'] + action
+            # منح نقاط أعلى للمواضع غير المستكشفة
+            visit_count = self.problem_complexity_memory.get(next_pos, 0)
+            curiosity_score = 1.0 / (visit_count + 1)
+            curiosity_scores.append((action, curiosity_score))
+        
+        return max(curiosity_scores, key=lambda x: x[1])[0]
+    
+    def _diversity_seeking_action(self, actions: List[float], state: Dict) -> float:
+        """اختيار حركة تزيد التنويع في الاستراتيجية"""
+        # تجنب تكرار الحركات الأخيرة
+        recent_actions = getattr(self, 'recent_actions', [])
+        
+        for action in actions:
+            if action not in recent_actions[-3:]:  # تجنب آخر 3 حركات
+                return action
+        
+        return random.choice(actions)  # عشوائي إذا كانت كلها مكررة
+    
+    def _escape_oriented_action(self, actions: List[float], state: Dict) -> float:
+        """اختيار حركة للهروب من الحلول المحلية"""
+        return self.escape_strategies.get_escape_action(actions, state)
+    
+    def _social_imitation_action(self, actions: List[float], state: Dict) -> float:
+        """محاولة تقليد استراتيجيات الوكلاء الناجحين"""
+        # سيتم تنفيذها من خلال مشاركة المعرفة بين الوكلاء
+        return random.choice(actions)  # مبسط للآن
+    
+    def update_from_experience(self, state: Dict, action: float, 
+                             reward: float, success: bool):
+        """تحديث استراتيجية الاستكشاف بناءً على النتائج"""
+        
+        # تحديث تاريخ النجاح
+        self.success_history.append(1.0 if success else 0.0)
+        
+        # تحديث فعالية الاستكشاف
+        complexity = self._assess_problem_complexity(state)
+        complexity_key = int(complexity * 10)
+        
+        # تعلم تدريجي للفعالية
+        current_effectiveness = self.exploration_effectiveness[complexity_key]
+        reward_signal = 1.0 if success else -0.1
+        
+        self.exploration_effectiveness[complexity_key] = (
+            current_effectiveness * (1 - self.learning_rate) +
+            reward_signal * self.learning_rate
+        )
+        
+        # تحديث ذاكرة المواضع
+        self.problem_complexity_memory[state['current']] = \
+            self.problem_complexity_memory.get(state['current'], 0) + 1
+
+
+class LearnedSubgoalOptimizer:
+    """
+    خطوة 2: محسن الأهداف الفرعية المكتسبة
+    
+    يتعلم كل وكيل كيفية اختيار الأهداف الفرعية الأمثل بناءً على:
+    - النجاحات والفشل السابق
+    - تشارك المعرفة مع الوكلاء الآخرين
+    - التكيف مع أنماط المشاكل المختلفة
+    """
+    
+    def __init__(self, agent_id: int):
+        self.agent_id = agent_id
+        
+        # شبكة عصبية لتعلم اختيار الأهداف الفرعية
+        self.subgoal_network = SubgoalSelectionNetwork()
+        self.optimizer = optim.Adam(self.subgoal_network.parameters(), lr=0.001)
+        
+        # مكتبة الأنماط الناجحة
+        self.success_patterns = PatternLibrary()
+        self.failure_patterns = PatternLibrary()
+        
+        # آلية التعلم الاجتماعي
+        self.social_knowledge = SharedKnowledgeBase()
+        
+    def discover_optimal_subgoals(self, current: float, target: float,
+                                forbidden_states: set, 
+                                other_agents_knowledge: List[Dict]) -> List[float]:
+        """
+        اكتشاف الأهداف الفرعية المثلى من خلال:
+        1. التحليل الذكي للمشكلة
+        2. استخدام الأنماط المتعلمة
+        3. دمج معرفة الوكلاء الآخرين
+        """
+        
+        # تحليل خصائص المشكلة
+        problem_features = self._analyze_problem_structure(current, target, forbidden_states)
+        
+        # البحث عن أنماط مشابهة ناجحة
+        similar_successes = self.success_patterns.find_similar(problem_features)
+        
+        # دمج معرفة الوكلاء الآخرين
+        social_insights = self._integrate_social_knowledge(other_agents_knowledge, problem_features)
+        
+        # توليد مجموعة من الاقتراحات
+        candidate_decompositions = self._generate_candidate_decompositions(
+            current, target, problem_features, similar_successes, social_insights
+        )
+        
+        # تقييم واختيار أفضل تحليل
+        best_decomposition = self._evaluate_and_select_best(candidate_decompositions, problem_features)
+        
+        return best_decomposition
+    
+    def _analyze_problem_structure(self, current: float, target: float, 
+                                 forbidden_states: set) -> Dict:
+        """تحليل البنية الرياضية للمشكلة"""
+        gap = abs(target - current)
+        
+        # تحليل توزيع القيود
+        constraint_clusters = self._identify_constraint_clusters(current, target, forbidden_states)
+        constraint_density = len(forbidden_states) / max(1, gap)
+        
+        # تحليل الصعوبة المتوقعة
+        expected_difficulty = self._estimate_difficulty(gap, constraint_density, constraint_clusters)
+        
+        return {
+            'gap_size': gap,
+            'constraint_density': constraint_density,
+            'constraint_clusters': constraint_clusters,
+            'expected_difficulty': expected_difficulty,
+            'problem_signature': hash((gap // 50, len(constraint_clusters)))
+        }
+    
+    def _generate_candidate_decompositions(self, current: float, target: float,
+                                         problem_features: Dict,
+                                         similar_successes: List[Dict],
+                                         social_insights: List[Dict]) -> List[List[float]]:
+        """توليد مجموعة متنوعة من التحليلات المرشحة"""
+        candidates = []
+        
+        # 1. التحليل المبني على الأنماط الناجحة
+        for success in similar_successes:
+            adapted = self._adapt_successful_pattern(current, target, success['subgoals'])
+            candidates.append(adapted)
+        
+        # 2. التحليل المبني على المعرفة الاجتماعية
+        for insight in social_insights:
+            social_decomposition = self._apply_social_insight(current, target, insight)
+            candidates.append(social_decomposition)
+        
+        # 3. التحليل المبني على الشبكة العصبية
+        neural_decomposition = self._neural_subgoal_generation(current, target, problem_features)
+        candidates.append(neural_decomposition)
+        
+        # 4. التحليل التكيفي الذكي
+        adaptive_decomposition = self._adaptive_decomposition(current, target, problem_features)
+        candidates.append(adaptive_decomposition)
+        
+        return candidates
+    
+    def _neural_subgoal_generation(self, current: float, target: float, 
+                                 problem_features: Dict) -> List[float]:
+        """استخدام الشبكة العصبية لتوليد الأهداف الفرعية"""
+        
+        # إعداد مدخلات الشبكة
+        network_input = self._prepare_network_input(current, target, problem_features)
+        
+        # التنبؤ بالأهداف الفرعية
+        with torch.no_grad():
+            subgoal_predictions = self.subgoal_network(network_input)
+        
+        # تحويل التنبؤات إلى أهداف فرعية حقيقية
+        subgoals = self._decode_neural_output(current, target, subgoal_predictions)
+        
+        return subgoals
+    
+    def learn_from_outcome(self, problem_features: Dict, subgoals_used: List[float],
+                          success: bool, efficiency: float, step_count: int):
+        """التعلم من نتائج التجربة"""
+        
+        # تحديث مكتبة الأنماط
+        outcome_data = {
+            'subgoals': subgoals_used,
+            'success': success,
+            'efficiency': efficiency,
+            'step_count': step_count,
+            'timestamp': time.time()
+        }
+        
+        if success and efficiency > 0.7:
+            self.success_patterns.add_pattern(problem_features, outcome_data)
+        else:
+            self.failure_patterns.add_pattern(problem_features, outcome_data)
+        
+        # تدريب الشبكة العصبية
+        if len(self.success_patterns.patterns) % 10 == 0:  # كل 10 تجارب
+            self._retrain_neural_network()
+
+
+class DuelingQNetwork(nn.Module):
+    """
+    خطوة 3: بنية الشبكة العصبية الهرمية (Dueling Q-Network)
+    
+    تفصل بين تقييم قيمة الحالة ومزايا الأفعال، مما يؤدي إلى:
+    - تعلم أفضل لقيم الحالات
+    - قرارات أكثر دقة في البيئات المعقدة
+    - تقارب أسرع في التدريب
+    """
+    
+    def __init__(self, state_dim: int = 18, action_dim: int = 3, hidden_dim: int = 512):
+        super().__init__()
+        
+        # مستخرج الميزات المشترك المحسن
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # تطبيع الطبقات للاستقرار
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2)
+        )
+        
+        # فرع تقييم قيمة الحالة V(s)
+        self.value_stream = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1)  # قيمة واحدة للحالة
+        )
+        
+        # فرع مزايا الأفعال A(s,a)
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, action_dim)  # ميزة لكل فعل
+        )
+        
+        # آلية الانتباه للتركيز على الميزات المهمة ديناميكياً
+        self.attention_mechanism = AttentionLayer(hidden_dim // 2)
+        
+    def forward(self, state_features: torch.Tensor) -> torch.Tensor:
+        """
+        التمرير الأمامي لـ Dueling Q-Network
+        
+        Q(s,a) = V(s) + A(s,a) - mean(A(s,·))
+        """
+        
+        # استخراج الميزات
+        features = self.feature_extractor(state_features)
+        
+        # تطبيق آلية الانتباه
+        attended_features = self.attention_mechanism(features)
+        
+        # حساب قيمة الحالة
+        state_value = self.value_stream(attended_features)
+        
+        # حساب مزايا الأفعال
+        action_advantages = self.advantage_stream(attended_features)
+        
+        # دمج القيمة والمزايا (Dueling Architecture)
+        # Q(s,a) = V(s) + [A(s,a) - mean(A(s,·))]
+        mean_advantage = action_advantages.mean(dim=1, keepdim=True)
+        q_values = state_value + (action_advantages - mean_advantage)
+        
+        return q_values
+
+
+class MultiAgentCoordinationSystem:
+    """
+    نظام التنسيق متعدد الوكلاء
+    
+    يدير التفاعل والتعلم المشترك بين الوكلاء الأربعة
+    """
+    
+    def __init__(self, num_agents: int = 4):
+        self.num_agents = num_agents
+        self.agents = []
+        
+        # إنشاء الوكلاء مع تخصصات مختلفة
+        specializations = ['explorer', 'optimizer', 'conservative', 'adaptive']
+        
+        for i in range(num_agents):
+            agent = AutonomousDiscoveryAgent(
+                agent_id=i,
+                specialization=specializations[i],
+                actions=[1, 3, 5]
+            )
+            self.agents.append(agent)
+        
+        # نظام مشاركة المعرفة
+        self.knowledge_sharing_system = KnowledgeSharingHub()
+        
+        # مدير التنسيق
+        self.coordination_manager = CoordinationManager(self.agents)
+        
+    def collaborative_training_session(self, training_problems: List[Dict],
+                                     episodes_per_problem: int = 50) -> Dict:
+        """
+        جلسة تدريب تعاونية حيث يتعلم الوكلاء من بعضهم البعض
+        """
+        
+        training_results = {
+            'individual_performance': {i: [] for i in range(self.num_agents)},
+            'collaborative_discoveries': [],
+            'emergent_strategies': [],
+            'knowledge_transfer_events': []
+        }
+        
+        for problem_idx, problem in enumerate(training_problems):
+            print(f"\n🎯 Problem {problem_idx + 1}: Target {problem['target']}")
+            
+            # كل وكيل يجرب المشكلة
+            problem_results = []
+            
+            for episode in range(episodes_per_problem):
+                episode_results = []
+                
+                for agent in self.agents:
+                    # جمع أداء الوكلاء الآخرين للتعلم الاجتماعي
+                    others_performance = [a.get_recent_performance() 
+                                        for a in self.agents if a != agent]
+                    
+                    # حل المشكلة
+                    result = agent.solve_with_discovery(
+                        problem=problem,
+                        others_performance=others_performance
+                    )
+                    
+                    episode_results.append(result)
+                    training_results['individual_performance'][agent.agent_id].append(result)
+                
+                # تحليل النتائج وتبادل المعرفة
+                knowledge_transfer = self.knowledge_sharing_system.process_episode_results(
+                    episode_results, self.agents
+                )
+                
+                if knowledge_transfer:
+                    training_results['knowledge_transfer_events'].append(knowledge_transfer)
+                
+                # كشف الاستراتيجيات الناشئة
+                emergent_strategies = self.coordination_manager.analyze_emergent_strategies(
+                    episode_results
+                )
+                
+                if emergent_strategies:
+                    training_results['emergent_strategies'].extend(emergent_strategies)
+        
+        return training_results
+    
+    def evaluate_collaborative_performance(self, test_problems: List[Dict]) -> Dict:
+        """تقييم الأداء التعاوني للوكلاء"""
+        
+        evaluation_results = {
+            'individual_success_rates': {},
+            'best_agent_per_problem': {},
+            'collaborative_improvement': {},
+            'strategy_diversity': {},
+            'knowledge_utilization': {}
+        }
+        
+        for problem in test_problems:
+            problem_results = []
+            
+            # كل وكيل يحل المشكلة بشكل مستقل
+            for agent in self.agents:
+                others_knowledge = [a.share_knowledge() for a in self.agents if a != agent]
+                
+                result = agent.solve_with_discovery(
+                    problem=problem,
+                    others_performance=others_knowledge,
+                    training=False
+                )
+                
+                problem_results.append({
+                    'agent_id': agent.agent_id,
+                    'result': result,
+                    'strategies_used': agent.get_strategies_used(),
+                    'knowledge_sources': agent.get_knowledge_sources()
+                })
+            
+            # تحليل النتائج
+            self._analyze_problem_results(problem, problem_results, evaluation_results)
+        
+        return evaluation_results
+
+
+class AutonomousDiscoveryAgent:
+    """
+    الوكيل المستقل لاكتشاف الاستراتيجيات
+    
+    يدمج جميع المكونات الثلاثة:
+    1. الاستكشاف التكيفي
+    2. تحسين الأهداف الفرعية المتعلم
+    3. Dueling Q-Network
+    """
+    
+    def __init__(self, agent_id: int, specialization: str, actions: List[float]):
+        self.agent_id = agent_id
+        self.specialization = specialization
+        self.actions = actions
+        
+        # المكونات الأساسية
+        self.exploration_strategy = AdaptiveExplorationStrategy(agent_id)
+        self.subgoal_optimizer = LearnedSubgoalOptimizer(agent_id)
+        
+        # الشبكة العصبية المتقدمة
+        self.q_network = DuelingQNetwork(state_dim=18, action_dim=len(actions))
+        self.target_network = DuelingQNetwork(state_dim=18, action_dim=len(actions))
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=0.0003)
+        
+        # إدارة الاستراتيجيات المكتشفة
+        self.discovered_strategies = StrategyLibrary()
+        self.performance_tracker = PerformanceTracker()
+        
+        # ذاكرة الخبرات المحسنة
+        self.experience_replay = PrioritizedExperienceReplay(capacity=50000)
+        
+        # متتبع الأداء
+        self.episode_count = 0
+        self.discovery_log = []
+        
+    def solve_with_discovery(self, problem: Dict, 
+                           others_performance: List[Dict],
+                           training: bool = True) -> Dict:
+        """
+        حل المشكلة مع اكتشاف استراتيجيات جديدة
+        """
+        
+        # إعداد المشكلة
+        current = problem['start'] 
+        target = problem['target']
+        forbidden_states = problem.get('forbidden_states', set())
+        max_steps = problem.get('max_steps', int(abs(target - current) / max(self.actions) * 1.5))
+        
+        # اكتشاف الأهداف الفرعية بذكاء
+        others_knowledge = [perf.get('knowledge', {}) for perf in others_performance]
+        subgoals = self.subgoal_optimizer.discover_optimal_subgoals(
+            current, target, forbidden_states, others_knowledge
+        )
+        
+        # تنفيذ الحل مع الاكتشاف التكيفي
+        path = [current]
+        step = 0
+        strategies_used = []
+        discoveries_made = []
+        
+        current_subgoal_idx = 0
+        
+        while step < max_steps and current != target:
+            # الحصول على الهدف الفرعي الحالي
+            working_target = (subgoals[current_subgoal_idx] 
+                            if current_subgoal_idx < len(subgoals) 
+                            else target)
+            
+            # تحديد استراتيجية الاستكشاف
+            state_dict = {
+                'current': current,
+                'target': working_target,
+                'step': step,
+                'max_steps': max_steps,
+                'forbidden_states': forbidden_states
+            }
+            
+            exploration_rate = self.exploration_strategy.compute_exploration_rate(
+                state_dict, others_performance
+            )
+            
+            # اختيار الحركة
+            if training and random.random() < exploration_rate:
+                # اكتشاف استراتيجية جديدة
+                action = self.exploration_strategy.select_exploration_action(
+                    self.actions, state_dict
+                )
+                strategy_type = 'exploration'
+            else:
+                # استخدام المعرفة المكتسبة
+                action = self._neural_action_selection(state_dict)
+                strategy_type = 'exploitation'
+            
+            # تنفيذ الحركة
+            next_current = current + action
+            reward = self._compute_reward(current, next_current, working_target, 
+                                        step, forbidden_states)
+            
+            # تسجيل الخبرة
+            if training:
+                self._store_experience(state_dict, action, reward, next_current, step + 1)
+            
+            # تتبع الاستراتيجيات
+            strategies_used.append({
+                'step': step,
+                'strategy_type': strategy_type,
+                'action': action,
+                'exploration_rate': exploration_rate
+            })
+            
+            # تحديث الحالة
+            current = next_current
+            step += 1
+            path.append(current)
+            
+            # فحص إكمال الهدف الفرعي
+            if (current_subgoal_idx < len(subgoals) and 
+                abs(current - subgoals[current_subgoal_idx]) < 0.5):
+                current_subgoal_idx += 1
+                
+                # اكت

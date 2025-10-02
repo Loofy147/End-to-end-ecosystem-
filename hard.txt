@@ -1,0 +1,212 @@
+# ---------- continue inside HardTradingEnv class ----------
+
+    def build_observation(self) -> np.ndarray:
+        """
+        Build the flattened observation vector from padded node features and adjacency.
+        Node layout: first n_assets nodes = assets, last node = agent.
+        """
+        # padded node features: (n_total_nodes, node_feat_dim_padded)
+        node_features = np.zeros(self._padded_node_features_shape, dtype=np.float32)
+
+        # Fill asset nodes with simple features: [mid_price, best_bid, best_ask, top_bid_vol, top_ask_vol, position, ...]
+        for i, asset in enumerate(self.asset_list):
+            lob = self.lobs[asset]
+            # safe access
+            best_bid = lob.bids_price[0] if lob.bids_vol.size > 0 else lob.mid - lob.tick
+            best_ask = lob.asks_price[0] if lob.asks_vol.size > 0 else lob.mid + lob.tick
+            top_bid_vol = lob.bids_vol[0] if lob.bids_vol.size > 0 else 0.0
+            top_ask_vol = lob.asks_vol[0] if lob.asks_vol.size > 0 else 0.0
+
+            # Place some meaningful numbers in the first entries
+            node_features[i, 0] = float(self.current_prices.get(asset, lob.mid))  # mid or current price
+            node_features[i, 1] = float(best_bid)
+            node_features[i, 2] = float(best_ask)
+            node_features[i, 3] = float(top_bid_vol)
+            node_features[i, 4] = float(top_ask_vol)
+            # position exposure for this asset
+            node_features[i, 5] = float(self.agent_state.position.get(asset, 0.0))
+            # leave the rest zeros (padded)
+
+        # Agent node (last node)
+        agent_idx = self.n_total_nodes - 1
+        node_features[agent_idx, 0] = float(self.agent_state.cash)
+        node_features[agent_idx, 1] = float(sum(self.agent_state.position.values()))
+        node_features[agent_idx, 2] = float(self.agent_state.realized_pnl)
+        node_features[agent_idx, 3] = float(self.agent_state.unrealized_pnl)
+        node_features[agent_idx, 4] = float(self.agent_state.max_intraday_drawdown)
+        # rest remain zero (padded)
+
+        # adjacency: fully connected (could be graph-structured). Use symmetric adjacency
+        adj = np.ones(self._adjacency_matrix_shape, dtype=np.float32)
+        # optionally remove self-connections
+        np.fill_diagonal(adj, 0.0)
+
+        # Flatten to final observation vector
+        flat = np.concatenate([node_features.ravel(), adj.ravel()]).astype(np.float32)
+        assert flat.shape == (self.flat_obs_dim,)
+        return flat
+
+    def step(self, action: np.ndarray):
+        """
+        Standard Gymnasium step API:
+         obs, reward, terminated, truncated, info
+        Ensure reward is a Python float and terminated/truncated are bools.
+        """
+
+        # Ensure ndarray and copy (defensive)
+        action = np.asarray(action, dtype=np.float32).copy()
+        # Reshape into (n_assets, 2)
+        try:
+            action = action.reshape(self.n_assets, 2)
+        except Exception:
+            # If action shape unexpected, try to flatten then reshape
+            action = action.flatten()[: self.action_dim].reshape(self.n_assets, 2)
+
+        max_order_size = float(self.config.max_position * 0.1)
+        buy_amounts = (action[:, 0] * max_order_size).astype(float)
+        sell_amounts = (action[:, 1] * max_order_size).astype(float)
+
+        # Build orders
+        orders = []
+        for i, asset in enumerate(self.asset_list):
+            if buy_amounts[i] > 1e-9:
+                orders.append({'asset': asset, 'side': 'buy', 'size': float(buy_amounts[i]), 'type': 'market'})
+            if sell_amounts[i] > 1e-9:
+                orders.append({'asset': asset, 'side': 'sell', 'size': float(sell_amounts[i]), 'type': 'market'})
+
+        # Process orders and collect execution metrics
+        fill_info = []
+        total_exec_cost = 0.0
+        total_exec_volume = 0.0
+        for order in orders:
+            asset = order['asset']
+            side = order['side']
+            size = float(order['size'])
+            if asset in self.lobs:
+                exec_price, exec_vol = self.lobs[asset].apply_market_order(side, size)
+                if exec_vol > 0:
+                    is_taker = True
+                    fee_rate = self.config.taker_fee if is_taker else self.config.maker_fee
+                    self.agent_state.process_fill(asset, exec_vol, exec_price, side, fee_rate, is_taker)
+                    fill_info.append({
+                        'asset': asset,
+                        'side': side,
+                        'order_size': size,
+                        'executed_volume': float(exec_vol),
+                        'executed_price': float(exec_price),
+                        'fee_paid': float(exec_vol * exec_price * fee_rate),
+                        'type': order['type']
+                    })
+                    total_exec_volume += float(exec_vol)
+                    total_exec_cost += float(exec_vol * exec_price)
+
+        # Advance market dynamics (price processes + LOB reseed)
+        for asset in self.asset_list:
+            dt = max(1e-9, (self.config.step_seconds / 60.0))
+            new_price = self.price_processes[asset].step(dt)
+            self.current_prices[asset] = float(new_price)
+            self.lobs[asset].mid = float(new_price)
+            self.lobs[asset].seed_liquidity(self.config.avg_volume, self.rng)
+
+        # Update agent PnL and statistics
+        self.agent_state.update_pnl(self.current_prices)
+
+        # Compute step PnL reward: change in equity
+        current_equity = self.agent_state.cash + self.agent_state.realized_pnl
+        for asset, pos in self.agent_state.position.items():
+            current_equity += self.current_prices.get(asset, 0.0) * pos
+
+        if not hasattr(self, "_prev_equity") or self._prev_equity is None:
+            self._prev_equity = current_equity
+
+        pnl_reward = float(current_equity - self._prev_equity)
+        self._prev_equity = current_equity
+
+        # Penalties
+        risk_penalty = - float(self.config.pnl_risk_lambda * (self.agent_state.max_intraday_drawdown))
+        execution_penalty = - float(self.config.exec_penalty_lambda * total_exec_cost)
+        safety_penalty = 0.0  # placeholder, e.g., for violating risk limits
+
+        total_reward = float(pnl_reward + risk_penalty + execution_penalty + safety_penalty)
+
+        # Increment step counter and check termination/truncation
+        self.current_step += 1
+        terminated = False
+        truncated = False
+
+        # Example termination/truncation criteria
+        if self.current_step >= self.config.episode_steps:
+            truncated = True
+        if current_equity <= 0.0:
+            terminated = True
+
+        # Build observation & info
+        obs = self.build_observation()
+        info = {
+            'step': int(self.current_step),
+            'equity': float(current_equity),
+            'pnl_reward': float(pnl_reward),
+            'risk_penalty': float(risk_penalty),
+            'execution_penalty': float(execution_penalty),
+            'total_exec_volume': float(total_exec_volume),
+            'fills': fill_info
+        }
+
+        # Optional logging to file (JSONL-like)
+        if self._log_file is not None:
+            # Write a line-safe representation (avoid numpy scalars)
+            try:
+                import json
+                log_line = {
+                    't': time.time(),
+                    'step': int(self.current_step),
+                    'reward': float(total_reward),
+                    'terminated': bool(terminated),
+                    'truncated': bool(truncated),
+                    'equity': float(current_equity),
+                    'fills': fill_info
+                }
+                self._log_file.write(json.dumps(log_line) + "\n")
+                self._log_file.flush()
+            except Exception:
+                # do not crash env because of logging
+                traceback.print_exc()
+
+        return obs, total_reward, terminated, truncated, info
+
+    def reset(self, seed: Union[int, None] = None, options: dict = None):
+        """
+        Gymnasium-style reset -> (obs, info)
+        Reinitialize environment state and return initial observation.
+        """
+        if seed is not None:
+            self.rng = np.random.RandomState(seed)
+            # propagate seed to price processes too
+            for asset in self.asset_list:
+                self.price_processes[asset] = PriceProcess(self.config, self.rng)
+
+        # reset LOBs and seed liquidity
+        for asset in self.asset_list:
+            self.lobs[asset] = LimitOrderBook(depth=self.config.lob_depth,
+                                              mid_price=self.config.init_price + self.rng.rand() * 10 - 5)
+            self.lobs[asset].seed_liquidity(self.config.avg_volume, self.rng)
+            self.price_processes[asset] = PriceProcess(self.config, self.rng)
+            self.current_prices[asset] = self.lobs[asset].mid
+
+        # reset agent state
+        self.agent_state = AgentState(cash=10000.0)
+        self.current_step = 0
+        self._prev_equity = None
+
+        # Build and return initial observation
+        obs = self.build_observation()
+        info = {}
+        return obs, info
+
+    def close(self):
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None

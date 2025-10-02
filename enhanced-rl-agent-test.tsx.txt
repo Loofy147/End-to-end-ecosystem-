@@ -1,0 +1,1411 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Play, Pause, RotateCcw, Settings, Target, TrendingUp, Zap, Brain, AlertTriangle, BarChart3, Eye, Cpu } from 'lucide-react';
+
+// Enhanced Relational State Representation Agent with Testing Framework
+class EnhancedRelationalAgent {
+  constructor(config = {}) {
+    this.config = {
+      learningRate: 0.001,
+      epsilon: 0.1,
+      epsilonDecay: 0.995,
+      gamma: 0.99,
+      memorySize: 10000,
+      batchSize: 32,
+      targetUpdateFreq: 100,
+      maxSubgoals: 8,
+      baseSubgoalSpacing: 50,
+      movementHistorySize: 20,
+      adaptivePhases: true,
+      ...config
+    };
+    
+    this.memory = [];
+    this.step = 0;
+    this.subgoals = [];
+    this.currentSubgoalIndex = 0;
+    this.performanceHistory = [];
+    this.movementHistory = [];
+    this.initialPosition = [50, 50];
+    this.targetPosition = [350, 350];
+    this.testMetrics = {
+      actionDistribution: [0, 0, 0, 0],
+      stateVectorTests: [],
+      rewardHistory: [],
+      phaseTransitions: [],
+      explorationHistory: []
+    };
+    
+    // Fixed neural network architecture
+    this.weights = this.initializeWeights();
+    this.targetWeights = { ...this.weights };
+  }
+
+  initializeWeights() {
+    return {
+      hidden1: Array(32).fill(0).map(() => Array(24).fill(0).map(() => (Math.random() - 0.5) * 0.1)),
+      hidden2: Array(24).fill(0).map(() => Array(16).fill(0).map(() => (Math.random() - 0.5) * 0.1)),
+      output: Array(16).fill(0).map(() => Array(4).fill(0).map(() => (Math.random() - 0.5) * 0.1))
+    };
+  }
+
+  euclideanDistance(pos1, pos2) {
+    return Math.sqrt((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2);
+  }
+
+  computeDirection(from, to) {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    return Math.atan2(dy, dx);
+  }
+
+  // Enhanced state representation with validation
+  computeRelationalState(currentPos, targetPos, environment) {
+    const state = {};
+    
+    this.targetPosition = targetPos;
+    
+    // 1. Enhanced Progress and Remaining Ratios
+    const totalDistance = this.euclideanDistance(this.initialPosition, targetPos);
+    const currentDistance = this.euclideanDistance(currentPos, targetPos);
+    const startDistance = this.euclideanDistance(this.initialPosition, currentPos);
+    
+    state.progressRatio = Math.max(0, Math.min(1, startDistance / totalDistance));
+    state.remainingRatio = currentDistance / totalDistance;
+    state.completionRatio = 1 - state.remainingRatio;
+    
+    // 2. Multi-scale Gap Analysis
+    state.linearGapRatio = currentDistance / totalDistance;
+    state.logGapRatio = Math.log(Math.max(1, currentDistance)) / Math.log(Math.max(1, totalDistance));
+    state.sqrtGapRatio = Math.sqrt(currentDistance) / Math.sqrt(totalDistance);
+    
+    // 3. Time Analysis
+    const timeElapsed = this.step;
+    const optimalTime = Math.ceil(totalDistance / 5);
+    const estimatedRemaining = Math.ceil(currentDistance / 5);
+    
+    state.timeProgressRatio = Math.min(1, timeElapsed / optimalTime);
+    state.timeEfficiencyRatio = optimalTime / Math.max(1, timeElapsed);
+    state.remainingTimeRatio = estimatedRemaining / Math.max(1, optimalTime);
+    
+    // 4. Enhanced Constraint Features
+    state.constraintPressure = this.computeConstraintPressure(currentPos, environment);
+    state.forbiddenProximity = this.computeForbiddenProximity(currentPos, environment);
+    state.trapPressure = this.computeTrapPressure(currentPos, environment);
+    state.escapeRoutes = this.computeEscapeRoutes(currentPos, environment);
+    
+    // 5. Adaptive Phase Identification
+    const phaseData = this.identifyAdaptivePhase(state.progressRatio, state.constraintPressure);
+    state.currentPhase = phaseData.phase;
+    state.phaseProgress = phaseData.progress;
+    state.phaseConfidence = phaseData.confidence;
+    
+    // Track phase transitions for testing
+    if (this.lastPhase && this.lastPhase !== state.currentPhase) {
+      this.testMetrics.phaseTransitions.push({
+        from: this.lastPhase,
+        to: state.currentPhase,
+        step: this.step,
+        progress: state.progressRatio
+      });
+    }
+    this.lastPhase = state.currentPhase;
+    
+    // 6. Efficiency Metrics
+    const theoreticalMinSteps = Math.ceil(totalDistance / 5);
+    state.theoreticalMinSteps = theoreticalMinSteps;
+    state.actualSteps = this.step;
+    state.efficiencyRatio = Math.min(1, theoreticalMinSteps / Math.max(1, this.step));
+    state.wasteRatio = Math.max(0, (this.step - theoreticalMinSteps) / Math.max(1, theoreticalMinSteps));
+    
+    // 7. Hierarchical Goal Features
+    const subgoalFeatures = this.computeEnhancedSubgoalFeatures(currentPos, targetPos);
+    Object.assign(state, subgoalFeatures);
+    
+    // 8. Movement Analysis
+    state.directionToTarget = this.computeDirection(currentPos, targetPos);
+    state.movementConsistency = this.computeMovementConsistency();
+    state.pathEfficiency = this.computePathEfficiency();
+    state.velocityRatio = this.computeVelocityRatio();
+    
+    // 9. Strategic Features
+    state.explorationPressure = this.computeExplorationPressure();
+    state.convergenceIndicator = this.computeConvergenceIndicator();
+    
+    // Test state vector dimensions
+    const stateVector = this.stateToVector(state);
+    this.testMetrics.stateVectorTests.push({
+      step: this.step,
+      vectorLength: stateVector.length,
+      validDimensions: stateVector.length === 32,
+      hasNaN: stateVector.some(x => isNaN(x)),
+      hasInfinity: stateVector.some(x => !isFinite(x))
+    });
+    
+    return state;
+  }
+
+  computeConstraintPressure(pos, environment) {
+    let pressure = 0;
+    const obstacles = environment.obstacles || [];
+    
+    obstacles.forEach(obstacle => {
+      const dist = this.euclideanDistance(pos, obstacle.center);
+      const safeDistance = obstacle.radius + 10;
+      
+      if (dist < safeDistance) {
+        const normalizedDist = (dist - obstacle.radius) / 10;
+        pressure += Math.exp(-normalizedDist * 2);
+      }
+    });
+    
+    return Math.tanh(pressure);
+  }
+
+  computeForbiddenProximity(pos, environment) {
+    const obstacles = environment.obstacles || [];
+    if (obstacles.length === 0) return 0;
+    
+    let minDist = Infinity;
+    obstacles.forEach(obstacle => {
+      const dist = Math.max(0, this.euclideanDistance(pos, obstacle.center) - obstacle.radius);
+      minDist = Math.min(minDist, dist);
+    });
+    
+    return minDist === Infinity ? 0 : Math.exp(-minDist / 50);
+  }
+
+  computeTrapPressure(pos, environment) {
+    const checkRadius = 25;
+    const directions = Array.from({length: 8}, (_, i) => {
+      const angle = (i * 2 * Math.PI) / 8;
+      return [Math.cos(angle), Math.sin(angle)];
+    });
+    
+    let blockedDirections = 0;
+    
+    directions.forEach(dir => {
+      const checkPos = [
+        pos[0] + dir[0] * checkRadius, 
+        pos[1] + dir[1] * checkRadius
+      ];
+      
+      if (this.isBlocked(checkPos, environment)) {
+        blockedDirections++;
+      }
+    });
+    
+    return blockedDirections / directions.length;
+  }
+
+  computeEscapeRoutes(pos, environment) {
+    const directions = 16;
+    let freeDirections = 0;
+    
+    for (let i = 0; i < directions; i++) {
+      const angle = (i * 2 * Math.PI) / directions;
+      const checkPos = [
+        pos[0] + Math.cos(angle) * 30,
+        pos[1] + Math.sin(angle) * 30
+      ];
+      
+      if (!this.isBlocked(checkPos, environment)) {
+        freeDirections++;
+      }
+    }
+    
+    return freeDirections / directions;
+  }
+
+  isBlocked(pos, environment) {
+    if (pos[0] < 0 || pos[0] > 400 || pos[1] < 0 || pos[1] > 400) return true;
+    
+    const obstacles = environment.obstacles || [];
+    return obstacles.some(obstacle => 
+      this.euclideanDistance(pos, obstacle.center) < obstacle.radius
+    );
+  }
+
+  identifyAdaptivePhase(progressRatio, constraintPressure) {
+    let earlyThreshold = 0.25;
+    let endThreshold = 0.75;
+    
+    if (constraintPressure > 0.5) {
+      earlyThreshold += 0.1;
+      endThreshold += 0.1;
+    }
+    
+    const complexity = this.computeEnvironmentComplexity();
+    if (complexity > 0.5) {
+      earlyThreshold += 0.05;
+      endThreshold -= 0.05;
+    }
+    
+    let phase, progress, confidence;
+    
+    if (progressRatio < earlyThreshold) {
+      phase = 'early';
+      progress = progressRatio / earlyThreshold;
+      confidence = 1 - constraintPressure * 0.3;
+    } else if (progressRatio < endThreshold) {
+      phase = 'mid';
+      progress = (progressRatio - earlyThreshold) / (endThreshold - earlyThreshold);
+      confidence = 0.8 + (0.2 * (1 - Math.abs(progress - 0.5) * 2));
+    } else {
+      phase = 'end';
+      progress = (progressRatio - endThreshold) / (1 - endThreshold);
+      confidence = 1 - (1 - progressRatio) * 0.5;
+    }
+    
+    return { phase, progress, confidence: Math.max(0.3, Math.min(1, confidence)) };
+  }
+
+  computeEnvironmentComplexity() {
+    const totalArea = 400 * 400;
+    const obstacleArea = this.environment?.obstacles?.reduce((sum, obs) => 
+      sum + Math.PI * obs.radius * obs.radius, 0) || 0;
+    
+    return Math.min(1, obstacleArea / (totalArea * 0.3));
+  }
+
+  decomposeGoal(startPos, targetPos, environment) {
+    this.initialPosition = startPos;
+    this.targetPosition = targetPos;
+    this.environment = environment;
+    
+    const totalDistance = this.euclideanDistance(startPos, targetPos);
+    const complexity = this.computeEnvironmentComplexity();
+    
+    const adaptiveSpacing = this.config.baseSubgoalSpacing * (1 - complexity * 0.5);
+    const numSubgoals = Math.min(
+      this.config.maxSubgoals, 
+      Math.max(1, Math.floor(totalDistance / adaptiveSpacing))
+    );
+    
+    const subgoals = [];
+    for (let i = 1; i <= numSubgoals; i++) {
+      const ratio = i / numSubgoals;
+      let subgoalPos = [
+        startPos[0] + (targetPos[0] - startPos[0]) * ratio,
+        startPos[1] + (targetPos[1] - startPos[1]) * ratio
+      ];
+      
+      subgoalPos = this.findSafeSubgoalPosition(subgoalPos, environment, startPos, targetPos);
+      
+      subgoals.push({
+        position: subgoalPos,
+        priority: 1.0 - (i - 1) / numSubgoals,
+        completed: false,
+        attempts: 0,
+        originalRatio: ratio,
+        safetyMargin: this.computeSafetyMargin(subgoalPos, environment)
+      });
+    }
+    
+    this.subgoals = subgoals;
+    this.currentSubgoalIndex = 0;
+    return subgoals;
+  }
+
+  findSafeSubgoalPosition(originalPos, environment, startPos, targetPos) {
+    const obstacles = environment.obstacles || [];
+    let safePos = [...originalPos];
+    
+    const minDist = Math.min(...obstacles.map(obs => 
+      this.euclideanDistance(originalPos, obs.center) - obs.radius
+    ));
+    
+    if (minDist >= 15) return safePos;
+    
+    const searchRadius = 30;
+    const candidates = [];
+    
+    for (let angle = 0; angle < 2 * Math.PI; angle += Math.PI / 8) {
+      for (let radius = 15; radius <= searchRadius; radius += 10) {
+        const candidate = [
+          originalPos[0] + Math.cos(angle) * radius,
+          originalPos[1] + Math.sin(angle) * radius
+        ];
+        
+        if (this.isPositionSafe(candidate, environment, 15)) {
+          const pathDistance = this.euclideanDistance(startPos, candidate) + 
+                               this.euclideanDistance(candidate, targetPos);
+          const directDistance = this.euclideanDistance(startPos, targetPos);
+          const detourRatio = pathDistance / directDistance;
+          
+          candidates.push({
+            position: candidate,
+            detourRatio: detourRatio,
+            safetyMargin: this.computeSafetyMargin(candidate, environment)
+          });
+        }
+      }
+    }
+    
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => 
+        (a.detourRatio * 0.7 + (1 - a.safetyMargin) * 0.3) - 
+        (b.detourRatio * 0.7 + (1 - b.safetyMargin) * 0.3)
+      );
+      safePos = candidates[0].position;
+    }
+    
+    return safePos;
+  }
+
+  isPositionSafe(pos, environment, margin = 10) {
+    if (pos[0] < margin || pos[0] > 400 - margin || 
+        pos[1] < margin || pos[1] > 400 - margin) return false;
+    
+    const obstacles = environment.obstacles || [];
+    return obstacles.every(obs => 
+      this.euclideanDistance(pos, obs.center) >= obs.radius + margin
+    );
+  }
+
+  computeSafetyMargin(pos, environment) {
+    const obstacles = environment.obstacles || [];
+    if (obstacles.length === 0) return 1;
+    
+    const minDist = Math.min(...obstacles.map(obs => 
+      this.euclideanDistance(pos, obs.center) - obs.radius
+    ));
+    
+    return Math.min(1, Math.max(0, minDist / 50));
+  }
+
+  getCurrentTarget() {
+    if (this.subgoals.length === 0 || this.currentSubgoalIndex >= this.subgoals.length) {
+      return null;
+    }
+    return this.subgoals[this.currentSubgoalIndex];
+  }
+
+  updateSubgoalProgress(currentPos) {
+    const currentTarget = this.getCurrentTarget();
+    if (!currentTarget) return false;
+    
+    const distance = this.euclideanDistance(currentPos, currentTarget.position);
+    if (distance < 8.0) {
+      currentTarget.completed = true;
+      this.currentSubgoalIndex++;
+      return true;
+    }
+    
+    if (currentTarget.attempts > 20) {
+      this.replanSubgoal(currentTarget, currentPos);
+    }
+    
+    return false;
+  }
+
+  replanSubgoal(subgoal, currentPos) {
+    const newPos = this.findSafeSubgoalPosition(
+      subgoal.position, 
+      this.environment, 
+      currentPos, 
+      this.targetPosition
+    );
+    
+    subgoal.position = newPos;
+    subgoal.attempts = 0;
+    subgoal.replanned = true;
+  }
+
+  computeEnhancedSubgoalFeatures(currentPos, finalTarget) {
+    const currentTarget = this.getCurrentTarget();
+    const features = {
+      hasActiveSubgoal: currentTarget !== null,
+      subgoalProgress: 0,
+      subgoalPriority: 0,
+      subgoalsCompleted: this.currentSubgoalIndex,
+      totalSubgoals: this.subgoals.length,
+      subgoalCompletionRatio: this.subgoals.length > 0 ? this.currentSubgoalIndex / this.subgoals.length : 0,
+      subgoalDensity: this.subgoals.length / Math.max(1, this.euclideanDistance(this.initialPosition, finalTarget) / 50),
+      averageSubgoalSafety: 0
+    };
+    
+    if (currentTarget) {
+      const distToSubgoal = this.euclideanDistance(currentPos, currentTarget.position);
+      const initialDistToSubgoal = this.euclideanDistance(this.initialPosition, currentTarget.position);
+      features.subgoalProgress = Math.max(0, 1 - distToSubgoal / Math.max(1, initialDistToSubgoal));
+      features.subgoalPriority = currentTarget.priority;
+      features.subgoalSafetyMargin = currentTarget.safetyMargin || 0;
+      features.subgoalAttempts = Math.min(1, currentTarget.attempts / 20);
+    }
+    
+    if (this.subgoals.length > 0) {
+      features.averageSubgoalSafety = this.subgoals.reduce((sum, sg) => 
+        sum + (sg.safetyMargin || 0), 0) / this.subgoals.length;
+    }
+    
+    return features;
+  }
+
+  recordMovement(pos) {
+    this.movementHistory.push({
+      position: [...pos],
+      timestamp: this.step
+    });
+    
+    if (this.movementHistory.length > this.config.movementHistorySize) {
+      this.movementHistory.shift();
+    }
+  }
+
+  computeMovementConsistency() {
+    if (this.movementHistory.length < 3) return 1.0;
+    
+    const recent = this.movementHistory.slice(-10);
+    const directions = [];
+    
+    for (let i = 1; i < recent.length; i++) {
+      const dir = this.computeDirection(recent[i-1].position, recent[i].position);
+      directions.push(dir);
+    }
+    
+    if (directions.length < 2) return 1.0;
+    
+    const meanDir = directions.reduce((sum, dir) => sum + dir, 0) / directions.length;
+    const variance = directions.reduce((sum, dir) => sum + Math.pow(dir - meanDir, 2), 0) / directions.length;
+    
+    return Math.exp(-variance / 2);
+  }
+
+  computePathEfficiency() {
+    if (this.movementHistory.length < 2) return 1.0;
+    
+    const start = this.movementHistory[0].position;
+    const current = this.movementHistory[this.movementHistory.length - 1].position;
+    
+    let actualPath = 0;
+    for (let i = 1; i < this.movementHistory.length; i++) {
+      actualPath += this.euclideanDistance(
+        this.movementHistory[i-1].position,
+        this.movementHistory[i].position
+      );
+    }
+    
+    const directPath = this.euclideanDistance(start, current);
+    return directPath > 0 ? Math.min(1, directPath / actualPath) : 1.0;
+  }
+
+  computeVelocityRatio() {
+    if (this.movementHistory.length < 5) return 0.5;
+    
+    const recent = this.movementHistory.slice(-5);
+    let totalDistance = 0;
+    
+    for (let i = 1; i < recent.length; i++) {
+      totalDistance += this.euclideanDistance(
+        recent[i-1].position,
+        recent[i].position
+      );
+    }
+    
+    const timeSpan = recent[recent.length - 1].timestamp - recent[0].timestamp;
+    const avgVelocity = totalDistance / Math.max(1, timeSpan);
+    
+    return Math.min(1, avgVelocity / 5);
+  }
+
+  computeExplorationPressure() {
+    return Math.max(0, this.config.epsilon - 0.05);
+  }
+
+  computeConvergenceIndicator() {
+    if (this.performanceHistory.length < 10) return 0;
+    
+    const recent = this.performanceHistory.slice(-10);
+    const slope = this.calculateSlope(recent);
+    
+    return Math.tanh(slope * 10);
+  }
+
+  calculateSlope(values) {
+    const n = values.length;
+    const xSum = (n * (n - 1)) / 2;
+    const ySum = values.reduce((sum, val) => sum + val, 0);
+    const xySum = values.reduce((sum, val, idx) => sum + val * idx, 0);
+    const xSqSum = (n * (n - 1) * (2 * n - 1)) / 6;
+    
+    return (n * xySum - xSum * ySum) / (n * xSqSum - xSum * xSum);
+  }
+
+  stateToVector(state) {
+    return [
+      // Progress and completion (4 features)
+      state.progressRatio || 0,
+      state.remainingRatio || 0,
+      state.completionRatio || 0,
+      state.timeProgressRatio || 0,
+      
+      // Multi-scale gaps (3 features) 
+      state.linearGapRatio || 0,
+      state.logGapRatio || 0,
+      state.sqrtGapRatio || 0,
+      
+      // Time analysis (3 features)
+      state.timeEfficiencyRatio || 0,
+      state.remainingTimeRatio || 0,
+      state.velocityRatio || 0,
+      
+      // Constraints and environment (4 features)
+      state.constraintPressure || 0,
+      state.forbiddenProximity || 0,
+      state.trapPressure || 0,
+      state.escapeRoutes || 0,
+      
+      // Phase information (4 features)
+      state.currentPhase === 'early' ? 1 : 0,
+      state.currentPhase === 'mid' ? 1 : 0,
+      state.currentPhase === 'end' ? 1 : 0,
+      state.phaseConfidence || 0,
+      
+      // Efficiency metrics (2 features)
+      state.efficiencyRatio || 0,
+      state.wasteRatio || 0,
+      
+      // Subgoal features (4 features)
+      state.hasActiveSubgoal ? 1 : 0,
+      state.subgoalProgress || 0,
+      state.subgoalCompletionRatio || 0,
+      state.averageSubgoalSafety || 0,
+      
+      // Movement and direction (4 features)
+      Math.cos(state.directionToTarget || 0),
+      Math.sin(state.directionToTarget || 0),
+      state.movementConsistency || 0,
+      state.pathEfficiency || 0,
+      
+      // Strategic features (2 features)
+      state.explorationPressure || 0,
+      state.convergenceIndicator || 0
+    ].slice(0, 32);
+  }
+
+  forwardPass(input) {
+    if (input.length !== 32) {
+      console.warn(`Expected 32 features, got ${input.length}`);
+      return [0.25, 0.25, 0.25, 0.25];
+    }
+    
+    // Layer 1: 32 -> 24
+    let layer1 = this.matrixMultiply([input], this.weights.hidden1)[0];
+    layer1 = layer1.map(x => Math.max(0, x));
+    
+    // Layer 2: 24 -> 16  
+    let layer2 = this.matrixMultiply([layer1], this.weights.hidden2)[0];
+    layer2 = layer2.map(x => Math.max(0, x));
+    
+    // Output layer: 16 -> 4
+    let output = this.matrixMultiply([layer2], this.weights.output)[0];
+    return output;
+  }
+
+  matrixMultiply(a, b) {
+    if (!a || !b || a.length === 0 || b.length === 0) return [];
+    if (a[0].length !== b.length) return [];
+    
+    return a.map(row =>
+      b[0].map((_, colIndex) =>
+        row.reduce((sum, cell, rowIndex) => sum + cell * b[rowIndex][colIndex], 0)
+      )
+    );
+  }
+
+  selectAction(state, environment) {
+    const isExploring = Math.random() < this.config.epsilon;
+    this.testMetrics.explorationHistory.push({
+      step: this.step,
+      exploring: isExploring,
+      epsilon: this.config.epsilon
+    });
+    
+    if (isExploring) {
+      const action = Math.floor(Math.random() * 4);
+      this.testMetrics.actionDistribution[action]++;
+      return action;
+    }
+    
+    const stateVector = this.stateToVector(state);
+    const qValues = this.forwardPass(stateVector);
+    
+    if (state.phaseConfidence < 0.7) {
+      const bonus = (1 - state.phaseConfidence) * 0.1;
+      for (let i = 0; i < qValues.length; i++) {
+        qValues[i] += (Math.random() - 0.5) * bonus;
+      }
+    }
+    
+    const action = qValues.indexOf(Math.max(...qValues));
+    this.testMetrics.actionDistribution[action]++;
+    return action;
+  }
+
+  remember(state, action, reward, nextState, done) {
+    this.memory.push({ 
+      state: this.stateToVector(state), 
+      action, 
+      reward, 
+      nextState: this.stateToVector(nextState), 
+      done 
+    });
+    
+    this.testMetrics.rewardHistory.push({
+      step: this.step,
+      reward: reward,
+      action: action,
+      done: done
+    });
+    
+    if (this.memory.length > this.config.memorySize) {
+      this.memory.shift();
+    }
+  }
+
+  train() {
+    if (this.memory.length < this.config.batchSize) return;
+    
+    const recentPerformance = this.performanceHistory.slice(-10);
+    const avgPerformance = recentPerformance.length > 0 ? 
+      recentPerformance.reduce((a, b) => a + b, 0) / recentPerformance.length : 0;
+    
+    const performanceBonus = avgPerformance > 0 ? 0.999 : 0.995;
+    this.config.epsilon = Math.max(0.01, this.config.epsilon * performanceBonus);
+    
+    if (this.step % this.config.targetUpdateFreq === 0) {
+      this.targetWeights = JSON.parse(JSON.stringify(this.weights));
+    }
+    
+    this.step++;
+  }
+
+  updatePerformance(reward, efficiency, state) {
+    const performanceScore = reward * efficiency * (state.phaseConfidence || 1);
+    this.performanceHistory.push(performanceScore);
+    
+    if (this.performanceHistory.length > 100) {
+      this.performanceHistory.shift();
+    }
+  }
+
+  getPerformanceMetrics() {
+    if (this.performanceHistory.length === 0) return null;
+    
+    const recent = this.performanceHistory.slice(-20);
+    const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+    const trend = recent.length > 10 ? 
+      this.calculateSlope(recent.slice(-10)) * 100 : 0;
+    
+    return {
+      averagePerformance: avg,
+      trend: trend,
+      epsilon: this.config.epsilon,
+      memorySize: this.memory.length,
+      convergence: this.computeConvergenceIndicator(),
+      movementEfficiency: this.computePathEfficiency()
+    };
+  }
+
+  getTestResults() {
+    const recent = this.testMetrics.stateVectorTests.slice(-20);
+    const recentRewards = this.testMetrics.rewardHistory.slice(-20);
+    const totalActions = this.testMetrics.actionDistribution.reduce((a, b) => a + b, 0);
+    
+    return {
+      stateVectorHealth: {
+        totalTests: this.testMetrics.stateVectorTests.length,
+        validDimensionsRate: recent.filter(t => t.validDimensions).length / Math.max(1, recent.length),
+        nanDetectionRate: recent.filter(t => t.hasNaN).length / Math.max(1, recent.length),
+        infinityDetectionRate: recent.filter(t => t.hasInfinity).length / Math.max(1, recent.length)
+      },
+      actionDistribution: this.testMetrics.actionDistribution.map((count, i) => ({
+        action: ['Up', 'Down', 'Left', 'Right'][i],
+        count: count,
+        percentage: totalActions > 0 ? (count / totalActions * 100).toFixed(1) : 0
+      })),
+      phaseTransitions: this.testMetrics.phaseTransitions,
+      explorationRate: this.testMetrics.explorationHistory.slice(-20).filter(e => e.exploring).length / 20,
+      averageReward: recentRewards.length > 0 ? 
+        recentRewards.reduce((sum, r) => sum + r.reward, 0) / recentRewards.length : 0,
+      memoryUtilization: this.memory.length / this.config.memorySize,
+      subgoalEffectiveness: {
+        totalSubgoals: this.subgoals.length,
+        completedSubgoals: this.subgoals.filter(s => s.completed).length,
+        replannedSubgoals: this.subgoals.filter(s => s.replanned).length,
+        averageSafety: this.subgoals.length > 0 ? 
+          this.subgoals.reduce((sum, s) => sum + (s.safetyMargin || 0), 0) / this.subgoals.length : 0
+      }
+    };
+  }
+
+  getDiagnostics() {
+    const currentTarget = this.getCurrentTarget();
+    
+    return {
+      subgoalsCompleted: this.currentSubgoalIndex,
+      totalSubgoals: this.subgoals.length,
+      currentSubgoalAttempts: currentTarget?.attempts || 0,
+      avgSubgoalSafety: this.subgoals.length > 0 ? 
+        this.subgoals.reduce((sum, sg) => sum + (sg.safetyMargin || 0), 0) / this.subgoals.length : 0,
+      movementHistorySize: this.movementHistory.length,
+      replanCount: this.subgoals.filter(sg => sg.replanned).length,
+      networkHealth: {
+        weightsInitialized: this.weights.hidden1.length === 32,
+        targetNetworkSynced: JSON.stringify(this.weights) === JSON.stringify(this.targetWeights),
+        memoryFull: this.memory.length >= this.config.batchSize
+      }
+    };
+  }
+
+  // Testing framework methods
+  runStateVectorTest() {
+    const testState = {
+      progressRatio: 0.5,
+      remainingRatio: 0.5,
+      completionRatio: 0.5,
+      timeProgressRatio: 0.3,
+      linearGapRatio: 0.4,
+      logGapRatio: 0.35,
+      sqrtGapRatio: 0.45,
+      timeEfficiencyRatio: 0.8,
+      remainingTimeRatio: 0.6,
+      velocityRatio: 0.7,
+      constraintPressure: 0.2,
+      forbiddenProximity: 0.1,
+      trapPressure: 0.05,
+      escapeRoutes: 0.9,
+      currentPhase: 'mid',
+      phaseConfidence: 0.85,
+      efficiencyRatio: 0.75,
+      wasteRatio: 0.25,
+      hasActiveSubgoal: true,
+      subgoalProgress: 0.3,
+      subgoalCompletionRatio: 0.4,
+      averageSubgoalSafety: 0.8,
+      directionToTarget: Math.PI / 4,
+      movementConsistency: 0.9,
+      pathEfficiency: 0.85,
+      explorationPressure: 0.1,
+      convergenceIndicator: 0.2
+    };
+    
+    const vector = this.stateToVector(testState);
+    const qValues = this.forwardPass(vector);
+    
+    return {
+      vectorLength: vector.length,
+      expectedLength: 32,
+      vectorValid: vector.length === 32,
+      hasNaN: vector.some(x => isNaN(x)),
+      hasInfinity: vector.some(x => !isFinite(x)),
+      qValuesLength: qValues.length,
+      qValuesValid: qValues.length === 4,
+      sampleVector: vector.slice(0, 10), // First 10 elements for inspection
+      sampleQValues: qValues
+    };
+  }
+
+  testRewardFunction(currentPos, targetPos, state) {
+    const distanceToTarget = this.euclideanDistance(currentPos, targetPos);
+    const progressReward = (state.progressRatio || 0) * 10;
+    const efficiencyReward = (state.efficiencyRatio || 0) * 5;
+    const safetyPenalty = (state.constraintPressure || 0) * -2;
+    const subgoalReward = (state.subgoalProgress || 0) * 3;
+    const baseStepPenalty = -0.1;
+    
+    const totalReward = progressReward + efficiencyReward + safetyPenalty + subgoalReward + baseStepPenalty;
+    
+    return {
+      components: {
+        progress: progressReward,
+        efficiency: efficiencyReward,
+        safety: safetyPenalty,
+        subgoal: subgoalReward,
+        stepPenalty: baseStepPenalty
+      },
+      totalReward: totalReward,
+      distanceToTarget: distanceToTarget,
+      isTerminal: distanceToTarget < 10
+    };
+  }
+}
+
+// React Component for Enhanced Testing and Visualization
+const EnhancedRelationalRLDemo = () => {
+  const [agent, setAgent] = useState(null);
+  const [environment, setEnvironment] = useState({
+    bounds: [400, 400],
+    obstacles: [
+      { center: [120, 80], radius: 25 },
+      { center: [180, 180], radius: 30 },
+      { center: [280, 140], radius: 20 },
+      { center: [320, 280], radius: 35 },
+      { center: [150, 320], radius: 22 }
+    ]
+  });
+  const [agentPos, setAgentPos] = useState([50, 50]);
+  const [targetPos, setTargetPos] = useState([350, 350]);
+  const [isRunning, setIsRunning] = useState(false);
+  const [currentState, setCurrentState] = useState(null);
+  const [subgoals, setSubgoals] = useState([]);
+  const [performance, setPerformance] = useState(null);
+  const [diagnostics, setDiagnostics] = useState(null);
+  const [testResults, setTestResults] = useState(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [showTests, setShowTests] = useState(false);
+  const [autoTest, setAutoTest] = useState(true);
+  const intervalRef = useRef(null);
+
+  // Initialize enhanced agent with testing
+  useEffect(() => {
+    const newAgent = new EnhancedRelationalAgent({
+      learningRate: 0.001,
+      epsilon: 0.15,
+      maxSubgoals: 6,
+      baseSubgoalSpacing: 60
+    });
+    setAgent(newAgent);
+    
+    const initialSubgoals = newAgent.decomposeGoal([50, 50], [350, 350], environment);
+    setSubgoals(initialSubgoals);
+    
+    // Run initial tests
+    const initialTest = newAgent.runStateVectorTest();
+    setTestResults(newAgent.getTestResults());
+    console.log('Initial State Vector Test:', initialTest);
+  }, []);
+
+  // Enhanced simulation step with testing
+  const simulationStep = useCallback(() => {
+    if (!agent) return;
+
+    const state = agent.computeRelationalState(agentPos, targetPos, environment);
+    setCurrentState(state);
+
+    const action = agent.selectAction(state, environment);
+    const actions = [
+      [0, -5], // Up
+      [0, 5],  // Down  
+      [-5, 0], // Left
+      [5, 0]   // Right
+    ];
+    
+    let newPos = [
+      Math.max(5, Math.min(395, agentPos[0] + actions[action][0])),
+      Math.max(5, Math.min(395, agentPos[1] + actions[action][1]))
+    ];
+    
+    const wouldCollide = environment.obstacles.some(obs => 
+      agent.euclideanDistance(newPos, obs.center) < obs.radius + 2
+    );
+    
+    if (!wouldCollide) {
+      setAgentPos(newPos);
+      agent.recordMovement(newPos);
+      
+      const subgoalCompleted = agent.updateSubgoalProgress(newPos);
+      if (subgoalCompleted) {
+        setSubgoals([...agent.subgoals]);
+      }
+      
+      // Test reward function
+      const rewardTest = agent.testRewardFunction(newPos, targetPos, state);
+      const totalReward = rewardTest.totalReward;
+      
+      const nextState = agent.computeRelationalState(newPos, targetPos, environment);
+      agent.remember(state, action, totalReward, nextState, rewardTest.isTerminal);
+      agent.train();
+      
+      agent.updatePerformance(totalReward, state.efficiencyRatio || 1, state);
+      setPerformance(agent.getPerformanceMetrics());
+      setDiagnostics(agent.getDiagnostics());
+      
+      // Update test results periodically
+      if (autoTest && agent.step % 10 === 0) {
+        setTestResults(agent.getTestResults());
+      }
+      
+      // Goal reached
+      if (rewardTest.isTerminal) {
+        setIsRunning(false);
+        console.log('Goal reached! Final test results:', agent.getTestResults());
+      }
+    }
+  }, [agent, agentPos, targetPos, environment, autoTest]);
+
+  useEffect(() => {
+    if (isRunning && agent) {
+      intervalRef.current = setInterval(simulationStep, 150);
+    } else {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    }
+    
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, [isRunning, simulationStep]);
+
+  const reset = () => {
+    setIsRunning(false);
+    setAgentPos([50, 50]);
+    if (agent) {
+      agent.step = 0;
+      agent.memory = [];
+      agent.performanceHistory = [];
+      agent.movementHistory = [];
+      agent.config.epsilon = 0.15;
+      agent.currentSubgoalIndex = 0;
+      agent.testMetrics = {
+        actionDistribution: [0, 0, 0, 0],
+        stateVectorTests: [],
+        rewardHistory: [],
+        phaseTransitions: [],
+        explorationHistory: []
+      };
+      const newSubgoals = agent.decomposeGoal([50, 50], targetPos, environment);
+      setSubgoals(newSubgoals);
+    }
+    setCurrentState(null);
+    setPerformance(null);
+    setDiagnostics(null);
+    setTestResults(null);
+  };
+
+  const runManualTest = () => {
+    if (!agent) return;
+    const testResult = agent.runStateVectorTest();
+    console.log('Manual Test Result:', testResult);
+    setTestResults(agent.getTestResults());
+  };
+
+  const createTestScenario = (scenarioType) => {
+    let newEnvironment;
+    let newTarget;
+    
+    switch (scenarioType) {
+      case 'simple':
+        newEnvironment = { bounds: [400, 400], obstacles: [] };
+        newTarget = [350, 350];
+        break;
+      case 'maze':
+        newEnvironment = {
+          bounds: [400, 400],
+          obstacles: [
+            { center: [100, 100], radius: 30 },
+            { center: [200, 100], radius: 30 },
+            { center: [300, 100], radius: 30 },
+            { center: [100, 200], radius: 30 },
+            { center: [300, 200], radius: 30 },
+            { center: [100, 300], radius: 30 },
+            { center: [200, 300], radius: 30 },
+            { center: [300, 300], radius: 30 }
+          ]
+        };
+        newTarget = [350, 350];
+        break;
+      case 'dense':
+        newEnvironment = {
+          bounds: [400, 400],
+          obstacles: Array.from({ length: 12 }, (_, i) => ({
+            center: [50 + (i % 4) * 90 + Math.random() * 20, 50 + Math.floor(i / 4) * 90 + Math.random() * 20],
+            radius: 20 + Math.random() * 15
+          }))
+        };
+        newTarget = [380, 380];
+        break;
+      default:
+        return;
+    }
+    
+    setEnvironment(newEnvironment);
+    setTargetPos(newTarget);
+    setAgentPos([50, 50]);
+    
+    if (agent) {
+      agent.decomposeGoal([50, 50], newTarget, newEnvironment);
+      setSubgoals([...agent.subgoals]);
+    }
+  };
+
+  return (
+    <div className="w-full max-w-7xl mx-auto p-6 bg-gray-900 text-white">
+      <div className="mb-6">
+        <h1 className="text-3xl font-bold mb-2 flex items-center gap-2">
+          <Brain className="text-blue-400" />
+          Enhanced RL Agent - Testing & Analysis
+        </h1>
+        <p className="text-gray-300 mb-4">
+          Advanced testing framework for the Enhanced Relational State RL Agent with comprehensive diagnostics,
+          performance analysis, and automated testing capabilities.
+        </p>
+        
+        {/* Enhanced Status Indicators */}
+        <div className="flex flex-wrap gap-4 text-sm mb-4">
+          <div className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${performance?.trend > 0 ? 'bg-green-500' : 'bg-red-500'}`}></div>
+            <span>Performance: {performance?.trend > 0 ? 'Improving' : 'Declining'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${currentState?.efficiencyRatio > 0.7 ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+            <span>Efficiency: {((currentState?.efficiencyRatio || 0) * 100).toFixed(0)}%</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${testResults?.stateVectorHealth.validDimensionsRate > 0.95 ? 'bg-green-500' : 'bg-red-500'}`}></div>
+            <span>State Vector: {testResults ? (testResults.stateVectorHealth.validDimensionsRate * 100).toFixed(0) : 0}% Valid</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${diagnostics?.networkHealth.memoryFull ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+            <span>Memory: {diagnostics?.networkHealth.memoryFull ? 'Active' : 'Warming Up'}</span>
+          </div>
+        </div>
+
+        {/* Test Scenario Controls */}
+        <div className="flex flex-wrap gap-2 mb-4">
+          <button
+            onClick={() => createTestScenario('simple')}
+            className="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-sm"
+          >
+            Simple Path
+          </button>
+          <button
+            onClick={() => createTestScenario('maze')}
+            className="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 rounded text-sm"
+          >
+            Maze Challenge
+          </button>
+          <button
+            onClick={() => createTestScenario('dense')}
+            className="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm"
+          >
+            Dense Obstacles
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Enhanced Visualization */}
+        <div className="lg:col-span-2">
+          <div className="bg-gray-800 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold flex items-center gap-2">
+                <Target className="text-green-400" />
+                Testing Environment
+              </h2>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setIsRunning(!isRunning)}
+                  className={`px-4 py-2 rounded-lg flex items-center gap-2 ${
+                    isRunning ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'
+                  }`}
+                >
+                  {isRunning ? <Pause size={16} /> : <Play size={16} />}
+                  {isRunning ? 'Pause' : 'Start'}
+                </button>
+                <button
+                  onClick={reset}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg flex items-center gap-2"
+                >
+                  <RotateCcw size={16} />
+                  Reset
+                </button>
+                <button
+                  onClick={() => setShowDiagnostics(!showDiagnostics)}
+                  className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg flex items-center gap-2"
+                >
+                  <AlertTriangle size={16} />
+                  Debug
+                </button>
+                <button
+                  onClick={() => setShowTests(!showTests)}
+                  className="px-4 py-2 bg-orange-600 hover:bg-orange-700 rounded-lg flex items-center gap-2"
+                >
+                  <BarChart3 size={16} />
+                  Tests
+                </button>
+              </div>
+            </div>
+            
+            <svg width="400" height="400" className="border border-gray-600 bg-gray-700">
+              <defs>
+                <pattern id="smallGrid" width="10" height="10" patternUnits="userSpaceOnUse">
+                  <path d="M 10 0 L 0 0 0 10" fill="none" stroke="#374151" strokeWidth="0.5"/>
+                </pattern>
+                <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+                  <rect width="50" height="50" fill="url(#smallGrid)"/>
+                  <path d="M 50 0 L 0 0 0 50" fill="none" stroke="#4B5563" strokeWidth="1"/>
+                </pattern>
+              </defs>
+              <rect width="400" height="400" fill="url(#grid)" />
+              
+              {/* Movement Trail with Gradient */}
+              {agent?.movementHistory?.slice(-15).map((move, i) => (
+                <circle
+                  key={i}
+                  cx={move.position[0]}
+                  cy={move.position[1]}
+                  r={2 + i * 0.2}
+                  fill="#8b5cf6"
+                  opacity={0.2 + (i * 0.05)}
+                />
+              ))}
+              
+              {/* Obstacles with Enhanced Safety Visualization */}
+              {environment.obstacles.map((obs, i) => (
+                <g key={i}>
+                  {/* Danger zone */}
+                  <circle
+                    cx={obs.center[0]}
+                    cy={obs.center[1]}
+                    r={obs.radius + 15}
+                    fill="#ef4444"
+                    opacity="0.05"
+                  />
+                  {/* Safety zone */}
+                  <circle
+                    cx={obs.center[0]}
+                    cy={obs.center[1]}
+                    r={obs.radius + 10}
+                    fill="none"
+                    stroke="#ef4444"
+                    strokeWidth="1"
+                    strokeDasharray="3,3"
+                    opacity="0.4"
+                  />
+                  {/* Obstacle */}
+                  <circle
+                    cx={obs.center[0]}
+                    cy={obs.center[1]}
+                    r={obs.radius}
+                    fill="#ef4444"
+                    stroke="#dc2626"
+                    strokeWidth="2"
+                  />
+                </g>
+              ))}
+              
+              {/* Enhanced Subgoals */}
+              {subgoals.map((subgoal, i) => (
+                <g key={i}>
+                  <circle
+                    cx={subgoal.position[0]}
+                    cy={subgoal.position[1]}
+                    r="12"
+                    fill="none"
+                    stroke={subgoal.safetyMargin > 0.5 ? "#10b981" : "#f59e0b"}
+                    strokeWidth="1"
+                    opacity="0.5"
+                  />
+                  <circle
+                    cx={subgoal.position[0]}
+                    cy={subgoal.position[1]}
+                    r="8"
+                    fill={subgoal.completed ? "#10b981" : subgoal.replanned ? "#f59e0b" : "#3b82f6"}
+                    stroke={i === agent?.currentSubgoalIndex ? "#fbbf24" : "#1e40af"}
+                    strokeWidth={i === agent?.currentSubgoalIndex ? "3" : "2"}
+                  />
+                  <text
+                    x={subgoal.position[0]}
+                    y={subgoal.position[1] + 4}
+                    textAnchor="middle"
+                    fontSize="10"
+                    fill="white"
+                    fontWeight="bold"
+                  >
+                    {i + 1}
+                  </text>
+                </g>
+              ))}
+              
+              {/* Target with Completion Zone */}
+              <circle
+                cx={targetPos[0]}
+                cy={targetPos[1]}
+                r="20"
+                fill="#10b981"
+                opacity="0.2"
+              />
+              <circle
+                cx={targetPos[0]}
+                cy={targetPos[1]}
+                r="15"
+                fill="#10b981"
+                stroke="#059669"
+                strokeWidth="3"
+              />
+              
+              {/* Agent with Enhanced Visualization */}
+              <g>
+                {/* Exploration radius indicator */}
+                {currentState?.explorationPressure > 0.05 && (
+                  <circle
+                    cx={agentPos[0]}
+                    cy={agentPos[1]}
+                    r={20}
+                    fill="none"
+                    stroke="#8b5cf6"
+                    strokeWidth="1"
+                    strokeDasharray="2,2"
+                    opacity="0.3"
+                  />
+                )}
+                
+                {/* Constraint pressure visualization */}
+                {currentState && currentState.constraintPressure > 0.1 && (
+                  <circle
+                    cx={agentPos[0]}
+                    cy={agentPos[1]}
+                    r={15 + currentState.constraintPressure * 10}
+                    fill="none"
+                    stroke="#ef4444"
+                    strokeWidth="2"
+                    opacity={currentState.constraintPressure}
+                  />
+                )}
+                
+                <circle
+                  cx={agentPos[0]}
+                  cy={agentPos[1]}
+                  r="12"
+                  fill="#8b5cf6"
+                  stroke="#7c3aed"
+                  strokeWidth="3"
+                />
+                
+                {/* Direction indicator */}
+                {currentState && (
+                  <line
+                    x1={agentPos[0]}
+                    y1={agentPos[1]}
+                    x2={agentPos[0] + Math.cos(currentState.directionToTarget || 0) * 25}
+                    y2={agentPos[1] + Math.sin(currentState.directionToTarget || 0) * 25}
+                    stroke="#8b5cf6"
+                    strokeWidth="3"
+                    markerEnd="url(#arrow)"
+                  />
+                )}
+              </g>
+            </svg>
+            
+            {/* Real-time Metrics Display */}
+            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+              <div className="bg-gray-700 rounded p-2 text-center">
+                <div className="text-gray-400">Steps</div>
+                <div className="text-xl font-bold">{agent?.step || 0}</div>
+              </div>
+              <div className="bg-gray-700 rounded p-2 text-center">
+                <div className="text-gray-400">Distance</div>
+                <div className="text-xl font-bold">
+                  {currentState ? agent.euclideanDistance(agentPos, targetPos).toFixed(0) : 0}
+                </div>
+              </div>
+              <div className="bg-gray-700 rounded p-2 text-center">
+                <div className="text-gray-400">Efficiency</div>
+                <div className="text-xl font-bold">
+                  {currentState ? (currentState.efficiencyRatio * 100).toFixed(0) : 0}%
+                </div>
+              </div>
+              <div className="bg-gray-700 rounded p-2 text-center">
+                <div className="text-gray-400">Phase</div>
+                <div className={`text-lg font-bold ${
+                  currentState?.currentPhase === 'early' ? 'text-blue-400' :
+                  currentState?.currentPhase === 'mid' ? 'text-yellow-400' : 'text-red-400'
+                }`}>
+                  {currentState?.currentPhase || 'N/A'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Enhanced Information Panels */}
+        <div className="space-y-4">
+          {/* Testing Controls */}
+          <div className="bg-gray-800 rounded-lg p-4">
+            <h3 className="text-lg font-semibold mb-3 flex items-center gap-2">
+              <Cpu className="text-orange-400" />
+              Testing Controls
+            </h3>
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="autoTest"
+                  checked={autoTest}
+                  onChange={(e) => setAutoTest(e.target.checked)}
+                  className="rounded"
+                />
+                <label htmlFor="autoTest" className="text-sm">Auto-test every 10 steps</label>
+              </div>
+              <button
+                onClick={runManualTest}
+                className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm"
+              >
+                Run Manual Test
+              </button>
+              <div className="text-xs text-gray-400">
+                Tests run: {testResults?.stateVectorHealth.totalTests || 0}
+              </div>
+            </div>
+          </div>
+
+          {/* Test Results Panel */}
+          {showTests && testResults && (
+            <div className="bg-gray-800 rounded-lg p-4 border border-orange-500">
+              <h3 className="text-lg font-semibold mb-3 flex items-center gap-2">
+                <BarChart3 className="text-orange-400" />
+                Test Results
+              </h3>
+              
+              {/* State Vector Health */}
+              <div className="mb-4">
+                <h4 className="font-semibold text-green-400 mb-2">State Vector Health</h4>
+                <div className="space-y-1 text-sm">
+                  <div className="flex justify-between">
+                    <span>Valid Dimensions:</span>
+                    <span className="text-green-400">
+                      {(testResults.stateVectorHealth.validDimensionsRate * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>NaN Detection:</span>
+                    <span className={testResults.stateVectorHealth.nanDetectionRate > 0 ? 'text-red-400' : 'text-green-400'}>
+                      {(testResults.stateVectorHealth.nanDetectionRate * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Infinity Detection:</span>
+                    <span className={testResults.stateVectorHealth.infinityDetectionRate > 0 ? 'text-red-400' : 'text-green-400'}>
+                      {(testResults.stateVectorHealth.infinityDetectionRate * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Distribution */}
+              <div className="mb-4">
+                <h4 className="font-semibold text-blue-400 mb-2">Action Distribution</h4>
+                <div className="space-y-1 text-sm">
+                  {testResults.actionDistribution.map((action, i) => (
+                    <div key={i} className="flex justify-between">
+                      <span>{action.action}:</span>
+                      <span>{action.percentage}% ({action.count})</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Performance Metrics */}
+              <div className="mb-4">
+                <h4 className="font-semibold text-purple-400 mb-2">Performance</h4>
+                <div className="space-y-1 text-sm">
+                  <div className="flex justify-between">
+                    <span>Avg Reward:</span>
+                    <span>{testResults.averageReward.toFixed(3)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Exploration

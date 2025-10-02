@@ -1,0 +1,61 @@
+def _check_test(self, func, inp, expect_type):
+    try:
+        if expect_type == "len_exact":
+            res = func(inp)
+            return isinstance(res, dict) and 'total' in res and res['total'] == len(inp)
+        elif expect_type == "total_nonneg":
+            res = func(inp)
+            return isinstance(res, dict) and 'total' in res and isinstance(res['total'], int) and res['total'] >= 0
+        elif expect_type == "raises":
+            try:
+                func(inp)
+                return False
+            except Exception:
+                return True
+        else:
+            res = func(inp)
+            return isinstance(res, dict) and 'total' in res
+    except Exception:
+        return expect_type == "raises"
+
+def evaluate(self, code: str) -> Dict[str, Any]:
+    metrics = {'syntax_ok': False, 'cyclomatic':0, 'exec_time':None, 'test_coverage':0.0, 'security_issues':[], 'score':0.0, 'per_test':{}}
+    metrics['syntax_ok'] = safe_compile(code)
+    if not metrics['syntax_ok']:
+        return metrics
+    try:
+        tree = ast.parse(code)
+        v = CyclomaticComplexityVisitor(); v.visit(tree); metrics['cyclomatic'] = max(1,1+v.count)
+    except Exception:
+        metrics['cyclomatic']=0
+    metrics['security_issues'] = detect_security_issues(code)
+    exec_env={}
+    try:
+        exec(code, exec_env)
+    except Exception:
+        return metrics
+    func = exec_env.get('process_interactions') or exec_env.get('process_interaction')
+    total_tests = len(PROCESS_TESTS)
+    passed = 0; total_time=0.0; per_test={}
+    if func and callable(func):
+        for name, inp, expect_type in PROCESS_TESTS:
+            start=time.time()
+            ok=False
+            try:
+                ok = self._check_test(func, inp, expect_type)
+            except Exception:
+                ok=False
+            took=time.time()-start; total_time+=took; per_test[name]=ok
+            if ok: passed+=1
+    else:
+        for name,_,_ in PROCESS_TESTS: per_test[name]=False
+        passed=0; total_time=0.0
+    metrics['exec_time']=total_time; metrics['per_test']=per_test; metrics['test_coverage']=passed/total_tests
+    score=0.0
+    score += self.coverage_w * metrics['test_coverage']
+    cyc = metrics['cyclomatic']; cyc_penalty = min(self.cyc_w, (cyc-1)*0.03); score += max(0.0, self.cyc_w - cyc_penalty)
+    if metrics['exec_time'] is not None:
+        exec_penalty = min(self.exec_w, metrics['exec_time']/(self.timeout*20+1e-9)); score += max(0.0, self.exec_w - exec_penalty)
+    sec = len(metrics['security_issues']); score -= self.sec_penalty * sec
+    metrics['score']=max(0.0, min(1.0, score))
+    return metrics

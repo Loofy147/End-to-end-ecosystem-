@@ -1,0 +1,396 @@
+# attention_es_large.py
+# نسخة جاهزة للتشغيل على Colab / جهاز قوي
+import numpy as np, pandas as pd, matplotlib.pyplot as plt, time, os
+np.random.seed(123)
+
+# ---------- تعديل سريع للمعلمات (اضبط هنا) ----------
+N = 800                # حجم النظام الكبير المطلوب (ابدأ بـ 200-800 على Colab Pro)
+T = 800                # عدد الخطوات الزمنية
+alpha = 0.34
+init_eta = 0.06
+init_lambda = 0.012
+noise_sigma = 0.03
+energy_cost_per_weight = 1.0
+init_gate_topk = 16
+intervene_every = 25
+es_population = 12
+probe_steps = 6
+audit_strength = 0.5
+malicious_frac = 0.05
+w_S = 1.0
+w_energy = 0.0045
+# -------------------------------------------------------
+
+# 
+# Function to compute eigenvector centrality-style score (principal eigenvector of |W|)
+def centrality_from_A(A):
+    M = np.abs(A)
+    # add small epsilon to avoid zero matrix issues
+    A_prime = M + 1e-8
+    # Calculate eigenvalues and eigenvectors
+    vals, vecs = np.linalg.eig(A_prime)
+    # Find the index of the largest real eigenvalue
+    idx = np.argmax(np.real(vals))
+    # Get the corresponding eigenvector
+    v = np.real(vecs[:, idx])
+    # Normalize the eigenvector
+    if np.allclose(v,0):
+        return np.ones(len(v))/len(v)
+    v = np.abs(v)
+    v = v / np.max(v) # Normalize to max 1
+    return v
+
+
+# Function to compute eigenvector centrality-style score (principal eigenvector of |W|)
+def centrality_from_A(A):
+    M = np.abs(A)
+    # add small epsilon to avoid zero matrix issues
+    A_prime = M + 1e-8
+    # Calculate eigenvalues and eigenvectors
+    vals, vecs = np.linalg.eig(A_prime)
+    # Find the index of the largest real eigenvalue
+    idx = np.argmax(np.real(vals))
+    # Get the corresponding eigenvector
+    v = np.real(vecs[:, idx])
+    # Normalize the eigenvector
+    if np.allclose(v,0):
+        return np.ones(len(v))/len(v)
+    v = np.abs(v)
+    v = v / np.max(v) # Normalize to max 1
+    return v
+
+
+# Function to compute eigenvector centrality-style score (principal eigenvector of |W|)
+def centrality_from_A(A):
+    M = np.abs(A)
+    # add small epsilon to avoid zero matrix issues
+    A_prime = M + 1e-8
+    # Calculate eigenvalues and eigenvectors
+    vals, vecs = np.linalg.eig(A_prime)
+    # Find the index of the largest real eigenvalue
+    idx = np.argmax(np.real(vals))
+    # Get the corresponding eigenvector
+    v = np.real(vecs[:, idx])
+    # Normalize the eigenvector
+    if np.allclose(v,0):
+        return np.ones(len(v))/len(v)
+    v = np.abs(v)
+    v = v / np.max(v) # Normalize to max 1
+    return v
+
+
+# Function to compute eigenvector centrality-style score (principal eigenvector of |W|)
+def centrality_from_A(A):
+    M = np.abs(A)
+    # add small epsilon to avoid zero matrix issues
+    A_prime = M + 1e-8
+    # Calculate eigenvalues and eigenvectors
+    vals, vecs = np.linalg.eig(A_prime)
+    # Find the index of the largest real eigenvalue
+    idx = np.argmax(np.real(vals))
+    # Get the corresponding eigenvector
+    v = np.real(vecs[:, idx])
+    # Normalize the eigenvector
+    if np.allclose(v,0):
+        return np.ones(len(v))/len(v)
+    v = np.abs(v)
+    v = v / np.max(v) # Normalize to max 1
+    return v
+
+---------- دوال مساعدة (مؤثّرة على الأداء؛ حافظ عليها مُوجزة) ----------
+eps = 1e-12
+def aggregate_inputs(A, b):
+    return (A.T.dot(b)) / (A.sum(axis=0) + eps)
+
+
+    # --- Conceptual Insights: Awareness / State Update Mechanisms (from Arabic files) ---
+    # The update_states function determines how node states evolve based on inputs and noise.
+    # Ideas about 'awareness' or new state update mechanisms could be explored here.
+    # --- End Conceptual Insights Comment ---
+
+def update_states(b, I, alpha, sigma):
+    noise = np.random.normal(0, sigma, size=b.shape)
+    return np.tanh((1-alpha)*b + alpha*I + noise)
+
+def compute_S(b): return max(-1.0, 1.0 - np.var(b))
+def energy_of_A(A): return energy_cost_per_weight * A.sum()
+
+
+# --- Conceptual Insights: Attention Mechanisms (from Arabic files) ---
+# The apply_gating function embodies a form of attention mechanism by selecting top-k connections.
+# Concepts from attention theory could inspire alternative gating or weighting strategies.
+# --- End Conceptual Insights Comment ---
+
+def apply_gating(A, topk):
+    # حفاظًا على الأداء نستخدم argpartition لكل صف
+    if topk >= A.shape[1]: return A.copy()
+    A2 = np.zeros_like(A)
+    for i in range(A.shape[0]):
+        row = A[i]
+        if row.sum() <= 0: continue
+        k = min(topk, row.size)
+        idxs = np.argpartition(-row, k-1)[:k]
+        A2[i, idxs] = row[idxs]
+    return A2
+# -------------------------------------------------------
+
+# 
+# --- Scenario Definitions ---
+scenarios = [
+    {'name': 'Base Case', 'params': {}}, # Use default parameters
+    {'name': 'High Eta', 'params': {'init_eta': 0.1}},
+    {'name': 'Low Lambda', 'params': {'init_lambda': 0.005}},
+    {'name': 'High Gate TopK', 'params': {'init_gate_topk': 30.0}},
+    {'name': 'High Energy Cost', 'params': {'w_energy': 0.01}},
+]
+# --- End Scenario Definitions ---
+
+
+# --- Scenario Experimentation Loop ---
+scenario_results = {} # To store results from each scenario
+
+for scenario in scenarios:
+    print(f"\n--- Running Scenario: {scenario['name']} ---")
+
+    # Apply scenario-specific parameter overrides
+    scenario_params = ctrl.copy() # Start with default ctrl params
+    # Add other base parameters you might want to override in scenarios
+    scenario_base_params = {
+        'N': N, 'T': T, 'alpha': alpha, 'noise_sigma': noise_sigma,
+        'energy_cost_per_weight': energy_cost_per_weight, 'audit_strength': audit_strength,
+        'malicious_frac': malicious_frac, 'w_S': w_S, 'w_energy': w_energy,
+        'intervene_every': intervene_every, 'es_population': es_population, 'probe_steps': probe_steps
+    }
+    current_params = {**scenario_base_params, **scenario_params, **scenario['params']} # Merge defaults, initial ctrl, and scenario overrides
+
+    # --- Re-Initialization for Scenario ---
+    # Copy the initialization code here, adapting it to use current_params
+    N_scen = int(current_params['N'])
+    T_scen = int(current_params['T'])
+    alpha_scen = current_params['alpha']
+    noise_sigma_scen = current_params['noise_sigma']
+    energy_cost_per_weight_scen = current_params['energy_cost_per_weight']
+    audit_strength_scen = current_params['audit_strength']
+    malicious_frac_scen = current_params['malicious_frac']
+    w_S_scen = current_params['w_S']
+    w_energy_scen = current_params['w_energy']
+    intervene_every_scen = int(current_params['intervene_every'])
+    es_population_scen = int(current_params['es_population'])
+    probe_steps_scen = int(current_params['probe_steps'])
+
+    b = np.random.uniform(-1, 1, size=N_scen)
+    A = np.abs(np.random.normal(loc=0.018, scale=0.006, size=(N_scen, N_scen)))
+    np.fill_diagonal(A, 0.0)
+
+    # Adding cluster structure (copy from original init)
+    num_clusters_scen = max(4, N_scen//150)
+    cluster_assign_scen = np.random.randint(0, num_clusters_scen, size=N_scen)
+    cluster_eq_scen = (cluster_assign_scen[:, None] == cluster_assign_scen[None, :]).astype(float)
+    A += 0.028 * cluster_eq_scen
+    A = np.maximum(A, 0.0)
+    np.fill_diagonal(A, 0.0) # Ensure diagonal zero after cluster addition
+
+    malicious_idx = np.random.choice(np.arange(N_scen), size=max(1,int(N_scen*malicious_frac_scen)), replace=False)
+    malicious_count = len(malicious_idx) # Track malicious count
+
+    # Initialize ctrl parameters for the scenario, potentially overridden
+    ctrl = {
+        'eta': current_params.get('init_eta', init_eta),
+        'lambda': current_params.get('init_lambda', init_lambda),
+        'gate_topk': current_params.get('init_gate_topk', init_gate_topk)
+    }
+
+    es_sigma = {'eta': 0.02, 'lambda': 0.006, 'gate_topk': 3.0} # ES sigmas can be fixed or part of params
+
+    records = []
+    scenario_start_time = time.time()
+    # --- End Re-Initialization ---
+
+    # --- Main Loop (adapted to use scenario parameters and calculate composite score/centrality) ---
+    for t in range(T_scen):
+        A_gated = apply_gating(A, int(round(ctrl['gate_topk'])))
+
+        # Calculate Eigenvector Centrality for the current gated matrix A
+        current_centrality = centrality_from_A(A_gated)
+        avg_centrality = np.mean(current_centrality) # System-level centrality metric
+
+        I = aggregate_inputs(A_gated, b)
+        # هجوم خبيث دوري (اختياري)
+        if t % 30 == 0 and t>0:
+            # Ensure indices are within bounds if N_scen changed
+            mal_influence = (A_gated.T[:, malicious_idx].sum(axis=1) * 0.16)
+            # Ensure mean(b[malicious_idx]) handles cases where malicious_idx might be empty if N_scen is very small
+            mean_b_malicious = np.mean(b[malicious_idx]) if malicious_idx.size > 0 else 0.0
+            I = I + mal_influence * (mean_b_malicious * -0.36)
+
+        b_new = update_states(b, I, alpha_scen, noise_sigma_scen)
+        local_gain = np.tanh(np.abs(b_new - b))
+        sim_mat = 1.0 - np.abs(b[:, None] - b[None, :])
+        sim_mat = np.clip(sim_mat, 0.0, 1.0)
+        reward_mat = sim_mat * local_gain[None, :]
+        A_update = ctrl['eta'] * reward_mat - ctrl['lambda'] * A_gated
+        if t % 30 == 0 and t>0:
+             # Ensure indices are within bounds if N_scen changed
+            if malicious_idx.size > 0:
+                A_update[malicious_idx, :] -= audit_strength_scen * np.abs(A_update[malicious_idx, :])
+        A = A_gated + A_update
+        A = np.maximum(A, 0.0)
+        np.fill_diagonal(A, 0.0)
+        energy = energy_of_A(A); S_val = compute_S(b_new)
+
+        # Calculate system-level Composite Score
+        # Using simple placeholder values and current S, energy, and avg_centrality
+        composite_score = system_baseline * (system_benefit - system_risk) + centrality_weight * avg_centrality
+        # You could integrate S and energy into benefit/risk or use a different formula
+        # Example: composite_score = (w_S_scen * S_val - w_energy_scen * energy) + centrality_weight * avg_centrality
+
+        
+    # --- Conceptual Insights: Future AI Dynamics / Risks/Benefits (from تحليل الذكاء الاصطناعي .txt & Arabic files) ---
+    # The utility function weights cohesion (S) and energy cost.
+    # Insights into future AI dynamics, centralization risks, or other benefits/costs
+    # could be incorporated into a more complex utility or composite score calculation.
+    # --- End Conceptual Insights Comment ---
+
+    utility = w_S_scen * S_val - w_energy_scen * energy # Keep original utility for comparison
+
+        records.append({
+            't': t,
+            'S': S_val,
+            'energy': energy,
+            'utility': utility,
+            'avg_A': A.mean(),
+            'avg_centrality': avg_centrality, # Record average centrality
+            'composite_score': composite_score, # Record composite score
+            'eta': ctrl['eta'],
+            'lambda': ctrl['lambda'],
+            'gate_topk': ctrl['gate_topk'],
+            'malicious_count': malicious_count # Record malicious count (fixed per scenario run)
+        })
+        # ---------- ES adaptive controller (تجربة قصيرة لعدة مرشحين) ----------
+        if (t+1) % intervene_every_scen == 0 and t>0:
+            cand_params=[]; cand_scores=[]
+            for k in range(es_population_scen):
+                cand={'eta': max(0.0, ctrl['eta'] + np.random.normal(0, es_sigma['eta'])),
+                      'lambda': max(1e-6, ctrl['lambda'] + np.random.normal(0, es_sigma['lambda'])),
+                      'gate_topk': max(1.0, ctrl['gate_topk'] + np.random.normal(0, es_sigma['gate_topk']))}
+                # probe rollout (قصير)
+                A_probe = A.copy(); b_probe = b_new.copy(); probe_score = 0.0
+                for p in range(probe_steps_scen):
+                    A_p_g = apply_gating(A_probe, int(round(cand['gate_topk'])))
+                    # --- Potential Improvement: Structured observation building process (from hard.txt) ---
+                    # An 'observation' could be built here using recent metrics, ctrl, state stats
+                    # to inform the selection or scoring of candidates.
+                    # --- End Potential Improvement Comment ---
+
+                    I_p = aggregate_inputs(A_p_g, b_probe)
+                    if (t + p) % 30 == 0:
+                        # Ensure indices are within bounds
+                        mal_influence_p = (A_p_g.T[:, malicious_idx].sum(axis=1) * 0.16)
+                        mean_b_malicious_p = np.mean(b_probe[malicious_idx]) if malicious_idx.size > 0 else 0.0
+                        I_p = I_p + mal_influence_p * (mean_b_malicious_p * -0.36)
+
+                    b_pnew = update_states(b_probe, I_p, alpha_scen, noise_sigma_scen)
+                    local_gain_p = np.tanh(np.abs(b_pnew - b_probe))
+                    sim_mat_p = 1.0 - np.abs(b_probe[:, None] - b_probe[None, :])
+                    sim_mat_p = np.clip(sim_mat_p, 0.0, 1.0)
+                    reward_mat_p = sim_mat_p * local_gain_p[None, :]
+                    A_update_p = cand['eta'] * reward_mat_p - cand['lambda'] * A_p_g
+                    if (t + p) % 30 == 0:
+                         # Ensure indices are within bounds
+                        if malicious_idx.size > 0:
+                            A_update_p[malicious_idx, :] -= audit_strength_scen * np.abs(A_update_p[malicious_idx, :])
+                    A_probe = np.maximum(A_p_g + A_update_p, 0.0); np.fill_diagonal(A_probe, 0.0)
+                    energy_p = energy_of_A(A_probe); S_p = compute_S(b_pnew)
+                    # Use original utility for probe score or a new composite probe score
+                    probe_score += (w_S_scen * S_p - w_energy_scen * energy_p)
+                    b_probe = b_pnew
+            best_idx = int(np.argmax(cand_scores)); best_cand = cand_params[best_idx]
+            move_frac = 0.5
+            ctrl['eta'] = ctrl['eta']*(1-move_frac) + best_cand['eta']*move_frac
+            ctrl['lambda'] = ctrl['lambda']*(1-move_frac) + best_cand['lambda']*move_frac
+            ctrl['gate_topk'] = ctrl['gate_topk']*(1-move_frac) + best_cand['gate_topk']*move_frac
+        b = b_new.copy()
+    # --- End Main Loop ---
+
+    # --- Saving and Plotting (adapted for scenarios) ---
+    df = pd.DataFrame(records)
+    scenario_results[scenario['name']] = df # Store DataFrame for comparison later
+
+    # Optional: Save scenario-specific CSV
+    fname = f"attention_es_large_results_{scenario['name'].replace(' ', '_').lower()}.csv"
+    df.to_csv(fname, index=False)
+    print(f"Saved metrics for scenario '{scenario['name']}' to {fname}")
+
+    # Optional: Plot for current scenario
+    # plt.figure(figsize=(10,3)); plt.plot(df['t'], df['S']); plt.title(f"Scenario: {scenario['name']} - S (cohesion)"); plt.show()
+    # plt.figure(figsize=(10,3)); plt.plot(df['t'], df['utility']); plt.title(f"Scenario: {scenario['name']} - Utility"); plt.show()
+    # plt.figure(figsize=(10,3)); plt.plot(df['composite_score']); plt.title(f"Scenario: {scenario['name']} - Composite Score"); plt.show() # Corrected plot call
+    # --- End Saving and Plotting ---
+
+# --- Plotting Comparison Across Scenarios ---
+print("\n--- Plotting Comparison Across Scenarios ---")
+
+# Plot S comparison
+plt.figure(figsize=(12, 6))
+for name, df_res in scenario_results.items():
+    plt.plot(df_res['t'], df_res['S'], label=name)
+plt.title('S (Cohesion) Comparison Across Scenarios')
+plt.xlabel('Time Step')
+plt.ylabel('S')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Plot Utility comparison
+plt.figure(figsize=(12, 6))
+for name, df_res in scenario_results.items():
+    plt.plot(df_res['t'], df_res['utility'], label=name)
+plt.title('Utility Comparison Across Scenarios')
+plt.xlabel('Time Step')
+plt.ylabel('Utility')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Plot Composite Score comparison (if calculated)
+if 'composite_score' in next(iter(scenario_results.values())).columns:
+    plt.figure(figsize=(12, 6))
+    for name, df_res in scenario_results.items():
+        plt.plot(df_res['t'], df_res['composite_score'], label=name)
+    plt.title('Composite Score Comparison Across Scenarios')
+    plt.xlabel('Time Step')
+    plt.ylabel('Composite Score')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# Plot Control Parameters comparison (e.g., eta, lambda) for the first scenario
+# Assuming ES adapts params within each scenario run
+first_scenario_name = next(iter(scenario_results.keys()))
+df_first_scenario = scenario_results[first_scenario_name]
+plt.figure(figsize=(12, 6))
+plt.plot(df_first_scenario['t'], df_first_scenario['eta'], label=f"{first_scenario_name} - eta")
+plt.plot(df_first_scenario['t'], df_first_scenario['lambda'], label=f"{first_scenario_name} - lambda")
+# Add other ctrl parameters if needed
+plt.title(f'Control Parameters over Time ({first_scenario_name} Scenario)')
+plt.xlabel('Time Step')
+plt.ylabel('Parameter Value')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# --- End Scenario Experimentation Loop ---
+
+df = pd.DataFrame(records)
+fname = 'attention_es_large_results.csv'
+df.to_csv(fname, index=False)
+print("Saved metrics to", fname)
+plt.figure(figsize=(10,3)); plt.plot(df['t'], df['S']); plt.title('S (cohesion)'); plt.show()
+plt.figure(figsize=(10,3)); plt.plot(df['t'], df['energy']); plt.title('Energy'); plt.show()
+plt.figure(figsize=(10,3)); plt.plot(df['t'], df['utility']); plt.title('Utility'); plt.show()
+plt.figure(figsize=(10,3)); plt.plot(df['t'], df['eta'], label='eta'); plt.plot(df['t'], df['lambda'], label='lambda'); plt.plot(df['t'], df['gate_topk'], label='gate_topk'); plt.legend(); plt.show()
